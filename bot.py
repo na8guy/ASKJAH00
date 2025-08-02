@@ -11,7 +11,7 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
-    WebhookServer,
+   
 )
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
@@ -1566,12 +1566,8 @@ def main():
                 return jsonify({'error': 'Processing failed'}), 500
 
         logger.info(f"Starting Flask app on port {PORT}")
-        webhook_server = WebhookServer('0.0.0.0', PORT, app)
-        loop.run_until_complete(application.run_webhook(
-            webhook_server=webhook_server,
-            webhook_path='/webhook/telegram',
-            close_loop=False
-        ))
+        app.run(host='0.0.0.0', port=PORT)
+        
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")
         raise
