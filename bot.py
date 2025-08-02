@@ -79,8 +79,15 @@ if not all([TELEGRAM_TOKEN, WEBHOOK_URL, MONGO_URI, MASTER_KEY, SOLANA_RPC, ETH_
 # MongoDB setup
 try:
     logger.debug("Connecting to MongoDB")
-    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    mongo_client.admin.command('ping')
+    mongo_client = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=30000,  # Increased connection timeout
+        socketTimeoutMS=30000,    # Increased socket timeout
+        replicaSet='atlas-14a9v5-shard-0'  # Add your replica set name
+    )
+    # Verify connection with ismaster command
+    mongo_client.admin.command('ismaster')
     logger.debug("MongoDB connection successful")
     db = mongo_client.get_database('trading_bot')
     users_collection = db.users
@@ -88,6 +95,18 @@ try:
 except ConnectionFailure as e:
     logger.error(f"Failed to connect to MongoDB: {str(e)}")
     raise
+
+
+def mongo_with_retry():
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            mongo_client.admin.command('ismaster')
+            return mongo_client
+        except ConnectionFailure as e:
+            logger.warning(f"MongoDB connection attempt {attempt+1} failed: {str(e)}")
+            time.sleep(2 ** attempt)  # Exponential backoff
+    raise ConnectionFailure("Failed to connect to MongoDB after retries")
 
 # Master key validation
 try:
@@ -397,6 +416,9 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='HTML'
     )
     logger.info(f"Subscription request initiated for user {user_id}, payment address: {payment_address}")
+
+
+    
 
 async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
@@ -1475,6 +1497,31 @@ def payment_webhook():  # Remove async
     except Exception as e:
         logger.error(f"Payment webhook error: {str(e)}")
         return jsonify({'error': 'Payment not processed'}), 400
+
+
+@app.route('/network-test')
+def network_test():
+    try:
+        # Test MongoDB connection
+        mongo_client.admin.command('ismaster')
+        
+        # Test Solana connection
+        solana_client.get_block_height()
+        
+        # Test Ethereum connection
+        w3_eth.eth.block_number
+        
+        return jsonify({
+            'status': 'success',
+            'mongo': 'connected',
+            'solana': 'connected',
+            'ethereum': 'connected'
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 async def setup_webhook():
     try:
