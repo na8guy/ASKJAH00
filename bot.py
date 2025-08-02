@@ -76,26 +76,50 @@ if not all([TELEGRAM_TOKEN, WEBHOOK_URL, MONGO_URI, MASTER_KEY, SOLANA_RPC, ETH_
     ))
     raise ValueError("Missing required environment variables")
 
+    # Add this function above the MongoDB connection block
+def connect_mongodb_with_retry():
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            logger.debug(f"Attempting MongoDB connection (try {attempt+1}/{max_retries})")
+            client = MongoClient(
+                MONGO_URI,
+                serverSelectionTimeoutMS=10000,
+                connectTimeoutMS=30000,
+                socketTimeoutMS=30000
+            )
+            client.server_info()  # Test connection
+            logger.debug("MongoDB connection successful")
+            return client
+        except Exception as e:
+            logger.warning(f"Connection attempt {attempt+1} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                raise
+
 # MongoDB setup
 try:
     logger.debug("Connecting to MongoDB")
+    # Use the standard connection without replicaSet parameter
     mongo_client = MongoClient(
         MONGO_URI,
-        serverSelectionTimeoutMS=5000,
-        connectTimeoutMS=30000,  # Increased connection timeout
-        socketTimeoutMS=30000,    # Increased socket timeout
-        replicaSet='atlas-14a9v5-shard-0'  # Add your replica set name
+        serverSelectionTimeoutMS=10000,  # Increase to 10 seconds
+        connectTimeoutMS=30000,
+        socketTimeoutMS=30000
     )
-    # Verify connection with ismaster command
-    mongo_client.admin.command('ismaster')
+    
+    # Verify connection with a simple command
+    mongo_client.server_info()
     logger.debug("MongoDB connection successful")
     db = mongo_client.get_database('trading_bot')
     users_collection = db.users
     users_collection.create_index('user_id', unique=True)
-except ConnectionFailure as e:
+except Exception as e:
     logger.error(f"Failed to connect to MongoDB: {str(e)}")
+    # Add detailed diagnostics
+    logger.error(f"MONGO_URI: {MONGO_URI.split('@')[0]}@...")  # Log without password
     raise
-
 
 def mongo_with_retry():
     max_retries = 5
@@ -107,6 +131,23 @@ def mongo_with_retry():
             logger.warning(f"MongoDB connection attempt {attempt+1} failed: {str(e)}")
             time.sleep(2 ** attempt)  # Exponential backoff
     raise ConnectionFailure("Failed to connect to MongoDB after retries")
+
+
+try:
+    logger.debug("Connecting to MongoDB with retries")
+    mongo_client = connect_mongodb_with_retry()
+    logger.debug("MongoDB connection verified")
+    db = mongo_client.get_database('trading_bot')
+    users_collection = db.users
+    users_collection.create_index('user_id', unique=True)
+except Exception as e:
+    logger.critical(f"Critical MongoDB connection failure: {str(e)}")
+    # Add detailed error information
+    if "ServerSelectionTimeoutError" in str(e):
+        logger.critical("This usually indicates network issues or incorrect connection parameters")
+    elif "Authentication failed" in str(e):
+        logger.critical("Verify database username and password")
+    raise
 
 # Master key validation
 try:
@@ -1499,30 +1540,37 @@ def payment_webhook():  # Remove async
         return jsonify({'error': 'Payment not processed'}), 400
 
 
-@app.route('/network-test')
-def network_test():
+@app.route('/network-diag')
+def network_diagnostics():
+    import socket
+    import dns.resolver
+    
+    diag_info = {
+        'mongo_host': 'cluster0.yee2yfq.mongodb.net',
+        'solana_host': SOLANA_RPC.split('//')[1].split('/')[0],
+        'eth_host': ETH_RPC.split('//')[1].split('/')[0],
+        'bsc_host': BSC_RPC.split('//')[1].split('/')[0]
+    }
+    
+    results = {}
+    
+    # Test DNS resolution
     try:
-        # Test MongoDB connection
-        mongo_client.admin.command('ismaster')
-        
-        # Test Solana connection
-        solana_client.get_block_height()
-        
-        # Test Ethereum connection
-        w3_eth.eth.block_number
-        
-        return jsonify({
-            'status': 'success',
-            'mongo': 'connected',
-            'solana': 'connected',
-            'ethereum': 'connected'
-        }), 200
+        results['mongo_dns'] = str(dns.resolver.resolve(diag_info['mongo_host'], 'SRV'))
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
+        results['mongo_dns'] = f"DNS Error: {str(e)}"
+    
+    # Test port connectivity
+    for service, host in diag_info.items():
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(5)
+                s.connect((host, 27017 if 'mongo' in service else 443))
+                results[f"{service}_port"] = "Open"
+        except Exception as e:
+            results[f"{service}_port"] = f"Connection Error: {str(e)}"
+    
+    return jsonify(results)
 async def setup_webhook():
     try:
         application = Application.builder().token(TELEGRAM_TOKEN).build()
