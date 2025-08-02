@@ -373,7 +373,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        usdt_amount = 5.0
+        usdt_amount = 1.0
         usdt_amount_wei = int(usdt_amount * 10**6)
         user_key = derive_user_key(user_id)
         account = Account.create(user_key)
