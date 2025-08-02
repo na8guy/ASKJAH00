@@ -1,4 +1,4 @@
-python-telegram-bot[webhooks,job-queue]>=21.0
+python-telegram-bot[job-queue]>=21.0
 pymongo>=4.6.1
 cryptography>=42.0.5
 base58>=2.1.1
@@ -9,3 +9,4 @@ requests>=2.31.0
 web3>=6.15.1
 python-dotenv>=1.0.1
 solders>=0.20.0
+python-telegram-bot[webhooks]
