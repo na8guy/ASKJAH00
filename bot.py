@@ -3,7 +3,7 @@ import logging
 import requests
 import httpx
 import base64
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
