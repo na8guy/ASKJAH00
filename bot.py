@@ -36,10 +36,10 @@ try:
     from flask import Flask, request, jsonify
 except ImportError:
     raise ImportError("Missing 'flask' package. Install it with: pip install flask")
-try:
-    from binance.client import Client as BinanceClient
-except ImportError:
-    raise ImportError("Missing 'python-binance' package. Install it with: pip install python-binance")
+#try:
+   # from binance.client import Client as BinanceClient
+#except ImportError:
+    #raise ImportError("Missing 'python-binance' package. Install it with: pip install python-binance")
 from datetime import datetime, timedelta
 import time
 import os
