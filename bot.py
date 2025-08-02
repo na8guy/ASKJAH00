@@ -36,10 +36,6 @@ try:
     from flask import Flask, request, jsonify
 except ImportError:
     raise ImportError("Missing 'flask' package. Install it with: pip install flask")
-#try:
-   # from binance.client import Client as BinanceClient
-#except ImportError:
-    #raise ImportError("Missing 'python-binance' package. Install it with: pip install python-binance")
 from datetime import datetime, timedelta
 import time
 import os
@@ -137,9 +133,6 @@ USDT_ABI = [
 ]
 usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
 
-# Binance client for USDT price
-#binance_client = BinanceClient()
-
 # DexScreener API endpoints
 DEXSCREENER_PROFILE_API = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
@@ -158,7 +151,7 @@ def derive_user_key(user_id: int) -> bytes:
         iterations=100000,
     )
     key = kdf.derive(master_key)
-    print(f"Derived key length: {len(key)}")  # Should be 32
+    logger.debug(f"Derived key length for user {user_id}: {len(key)}")
     return key
 
 def encrypt_data(data: str, key: bytes) -> dict:
@@ -380,10 +373,8 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # Set a fixed subscription cost of 5 USDT
         usdt_amount = 5.0
-        usdt_amount_wei = int(usdt_amount * 10**6)  # Convert to USDT smallest unit (6 decimals)
-
+        usdt_amount_wei = int(usdt_amount * 10**6)
         user_key = derive_user_key(user_id)
         account = Account.create(user_key)
         payment_address = account.address
@@ -477,7 +468,6 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
         )
         logger.error("JobQueue is not initialized.")
         return ConversationHandler.END
-    context.job_queue.run_repeating(update_token_info, interval=10, first=5, user_id=user_id)
     return ConversationHandler.END
 
 async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -615,7 +605,6 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 logger.error("JobQueue is not initialized.")
                 return ConversationHandler.END
-            context.job_queue.run_repeating(update_token_info, interval=10, first=5, user_id=user_id)
             return ConversationHandler.END
         except Exception as e:
             message = await update.message.reply_text(
@@ -705,7 +694,6 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 )
                 logger.error("JobQueue is not initialized.")
                 return ConversationHandler.END
-            context.job_queue.run_repeating(update_token_info, interval=10, first=5, user_id=user_id)
             return ConversationHandler.END
         except Exception as e:
             message = await update.message.reply_text(
@@ -760,7 +748,6 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             logger.error("JobQueue is not initialized.")
             return ConversationHandler.END
-        context.job_queue.run_repeating(update_token_info, interval=10, first=5, user_id=user_id)
         return ConversationHandler.END
     except Exception as e:
         await query.message.reply_text(f"Error importing wallet: {str(e)}. Please start over with /set_wallet.")
@@ -1320,8 +1307,72 @@ async def fetch_latest_token():
                 'dexscreener_url': dexscreener_url
             }
         except Exception as e:
-            logger.error(f"Error fetching token: {str(e)}")
+            logger.error(f"Error fetching token: {str(e)}", exc_info=True)
             return None
+
+async def periodic_token_check(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic task to check for new Solana tokens every 5 seconds and notify users."""
+    try:
+        logger.debug("Running periodic token check")
+        token = await fetch_latest_token()
+        if not token:
+            logger.debug("No new token data available")
+            return
+
+        users = users_collection.find({'subscription_status': 'active'})
+        async with httpx.AsyncClient() as client:
+            for user in users:
+                user_id = user['user_id']
+                posted_tokens = user.get('posted_tokens', [])
+                if token['contract_address'] in posted_tokens:
+                    continue
+                if time.time() - user.get('last_api_call', 0) < 1:
+                    continue
+
+                is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
+                warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
+                social_links = "\n".join([f"{k.capitalize()}: {v}" for k, v in token['socials'].items()])
+                message = (
+                    f"<b>ASKJAH GEM Solana Token</b>\n"
+                    f"Name: {token['name']} ({token['symbol']})\n\n"
+                    f"Contract: {token['contract_address']}\n\n"
+                    f"Price: ${token['price_usd']:.6f}\n"
+                    f"Market Cap: ${token['market_cap']:,.2f}\n\n"
+                    f"Liquidity: ${token['liquidity']:,.2f}\n\n"
+                    f"24h Volume: ${token['volume']:,.2f}\n\n"
+                    f"Website: {token['website']}\n\n"
+                    f"Socials:\n{social_links or 'N/A'}\n\n"
+                    f"Image: <a href='{token['image']}'>View Image</a>\n\n"
+                    f"DexScreener: <a href='{token['dexscreener_url']}'>View on DexScreener</a>\n"
+                    f"{warning}"
+                )
+                keyboard = [
+                    [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
+                    [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=message,
+                        parse_mode='HTML',
+                        reply_markup=reply_markup
+                    )
+                    users_collection.update_one(
+                        {'user_id': user_id},
+                        {
+                            '$set': {'last_api_call': time.time()},
+                            '$addToSet': {'posted_tokens': token['contract_address']}
+                        }
+                    )
+                    logger.debug(f"Sent token info to user {user_id}: {token['name']}")
+                    if user['trading_mode'] == 'automatic':
+                        await auto_trade(context, user_id=user_id, token=token)
+                except Exception as e:
+                    logger.error(f"Error sending token info to user {user_id}: {str(e)}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Error in periodic token check: {str(e)}", exc_info=True)
 
 async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.user_id
@@ -1483,336 +1534,301 @@ async def execute_trade(user_id, contract_address, amount, action, chain):
             if submit_result.get('code') != 0:
                 logger.error(f"Failed to submit transaction for user {user_id}: {submit_result.get('msg')}")
                 return False
-            
-            tx_hash = submit_result['data']['hash']
-            logger.debug(f"Transaction hash for user {user_id}: {tx_hash}")
-            
-            max_attempts = 60
-            for attempt in range(max_attempts):
-                status_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_transaction_status"
-                status_params = {
-                    'hash': tx_hash,
-                    'last_valid_height': last_valid_block_height
-                }
-                status_response = await client.get(status_url, params=status_params)
-                status_response.raise_for_status()
-                status = status_response.json()
-                
-                if status.get('code') != 0:
-                    logger.error(f"Failed to check transaction status for user {user_id}: {status.get('msg')}")
-                    return False
-                
-                if status['data']['success']:
-                    logger.info(f"Transaction {tx_hash} successful for user {user_id}")
-                    return True
-                elif status['data']['expired']:
-                    logger.error(f"Transaction {tx_hash} expired for user {user_id}")
-                    return False
-                
-                await asyncio.sleep(1)
-            
-            logger.error(f"Transaction {tx_hash} timed out after {max_attempts} seconds for user {user_id}")
-            return False
-    
+
+            logger.debug(f"Trade {action} successful for user {user_id}: {amount} SOL of {contract_address}")
+            return True
     except Exception as e:
         logger.error(f"Error executing {action} trade for user {user_id}: {str(e)}", exc_info=True)
         return False
 
-async def execute_transfer(user_id, recipient, token_contract, amount, chain):
+async def execute_transfer(user_id, recipient: Pubkey, token_contract, amount, chain):
+    logger.debug(f"Executing transfer for user {user_id}: {amount} SOL worth of {token_contract} to {recipient} on {chain}")
     if chain != 'solana':
         logger.error(f"Transfer not supported for {chain} yet")
         return False
-    logger.info(f"Transferring {amount} SOL worth of {token_contract} to {recipient} ({chain})")
-    return True
-
-async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int, token: dict):
+    
     user = users_collection.find_one({'user_id': user_id})
-    if not await check_subscription(user_id):
-        return
-    if token['contract_address'] in user['portfolio']:
-        buy_price = user['portfolio'][token['contract_address']]['buy_price']
-        current_price = token['price_usd']
-        price_change = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0
-        
-        if price_change >= user['sell_percentage']:
-            success = await execute_trade(user_id, token['contract_address'], 
-                                       user['portfolio'][token['contract_address']]['amount'], 'sell', 'solana')
-            if success:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"Sold {token['name']} at {price_change:.2f}% profit!"
-                )
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
-                )
-        elif price_change <= -user['loss_percentage']:
-            success = await execute_trade(user_id, token['contract_address'], 
-                                       user['portfolio'][token['contract_address']]['amount'], 'sell', 'solana')
-            if success:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"Sold {token['name']} at {price_change:.2f}% loss to stop further losses."
-                )
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
-                )
-    else:
-        balance = await check_balance(user_id, 'solana')
-        buy_amount = user['auto_buy_amount']
-        if balance >= buy_amount and not (token['liquidity'] < 1000 or token['volume'] < 1000):
-            success = await execute_trade(user_id, token['contract_address'], buy_amount, 'buy', 'solana')
-            if success:
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$set': {f'portfolio.{token["contract_address"]}': {
-                        'name': token['name'],
-                        'symbol': token['symbol'],
-                        'amount': buy_amount,
-                        'buy_price': token['price_usd']
-                    }}}
-                )
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"Automatically bought {buy_amount} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
-                )
-
-# Flask app for webhook
-app = Flask(__name__)
-
-@app.route('/webhook/usdt', methods=['POST'])
-def usdt_webhook():
-    data = request.json
-    if not data or 'user_id' not in data or 'amount' not in data:
-        return jsonify({'status': 'error', 'message': 'Invalid data'}), 400
+    if not user:
+        logger.error(f"No user found for user_id {user_id}")
+        return False
     
-    user_id = data['user_id']
-    amount = float(data['amount'])
-    
-    if not users_collection.find_one({'user_id': user_id}):
-        return jsonify({'status': 'error', 'message': 'User not found'}), 404
-    
-    users_collection.update_one(
-        {'user_id': user_id},
-        {'$inc': {'usdt_balance': amount}}
-    )
-    
-    return jsonify({'status': 'success', 'message': f'Added {amount} USDT to user {user_id}'}), 200
-
-def usdt_webhook():
-    """Handle USDT payment webhook for subscription activation."""
     try:
+        decrypted_user = await decrypt_user_wallet(user_id, user)
+        solana_private_key = decrypted_user['solana']['private_key']
+        if not solana_private_key or solana_private_key == "[Decryption Failed]":
+            logger.error(f"Failed to decrypt Solana private key for user {user_id}")
+            return False
+        keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
+        
+        lamports = int(amount * 1_000_000_000)  # Convert SOL to lamports
+        transfer_instruction = transfer(
+            TransferParams(
+                from_pubkey=keypair.pubkey(),
+                to_pubkey=recipient,
+                lamports=lamports
+            )
+        )
+        
+        recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
+        transaction = Transaction.new([transfer_instruction], keypair, recent_blockhash)
+        
+        async with httpx.AsyncClient() as client:
+            submit_url = f"{GMGN_API_HOST}/txproxy/v1/send_transaction"
+            signed_tx = base64.b64encode(transaction.serialize()).decode('utf-8')
+            payload = {
+                'chain': 'sol',
+                'signedTx': signed_tx
+            }
+            logger.debug(f"Submitting transfer transaction for user {user_id}: {submit_url}")
+            response = await client.post(submit_url, json=payload)
+            response.raise_for_status()
+            result = response.json()
+            
+            if result.get('code') != 0:
+                logger.error(f"Failed to submit transfer for user {user_id}: {result.get('msg')}")
+                return False
+            
+            logger.debug(f"Transfer successful for user {user_id}: {amount} SOL to {recipient}")
+            return True
+    except Exception as e:
+        logger.error(f"Error executing transfer for user {user_id}: {str(e)}", exc_info=True)
+        return False
+
+async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id=None, token=None):
+    if user_id is None or token is None:
+        logger.error("Missing user_id or token in auto_trade")
+        return
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user or user['trading_mode'] != 'automatic':
+        return
+    
+    try:
+        current_price = token['price_usd']
+        portfolio = user.get('portfolio', {})
+        token_contract = token['contract_address']
+        
+        if token_contract not in portfolio:
+            balance = await check_balance(user_id, 'solana')
+            if balance >= user['auto_buy_amount']:
+                success = await execute_trade(user_id, token_contract, user['auto_buy_amount'], 'buy', 'solana')
+                if success:
+                    users_collection.update_one(
+                        {'user_id': user_id},
+                        {'$set': {f'portfolio.{token_contract}': {
+                            'name': token['name'],
+                            'symbol': token['symbol'],
+                            'amount': user['auto_buy_amount'],
+                            'buy_price': current_price
+                        }}}
+                    )
+                    logger.debug(f"Auto-buy successful for user {user_id}: {user['auto_buy_amount']} SOL of {token['name']}")
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"Auto-bought {user['auto_buy_amount']} SOL worth of {token['name']} at ${current_price:.6f}."
+                    )
+        else:
+            token_data = portfolio[token_contract]
+            buy_price = token_data['buy_price']
+            price_change = ((current_price - buy_price) / buy_price) * 100
+            
+            if price_change >= user['sell_percentage'] or price_change <= -user['loss_percentage']:
+                amount = token_data['amount']
+                action = 'sell'
+                success = await execute_trade(user_id, token_contract, amount, action, 'solana')
+                if success:
+                    if amount >= token_data['amount']:
+                        users_collection.update_one(
+                            {'user_id': user_id},
+                            {'$unset': {f'portfolio.{token_contract}': ""}}
+                        )
+                    else:
+                        users_collection.update_one(
+                            {'user_id': user_id},
+                            {'$set': {f'portfolio.{token_contract}.amount': token_data['amount'] - amount}}
+                        )
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"Auto-sold {amount} SOL worth of {token['name']} at ${current_price:.6f} "
+                             f"(Profit/Loss: {price_change:.2f}%)."
+                    )
+                    logger.debug(f"Auto-sell successful for user {user_id}: {amount} SOL of {token['name']}")
+    except Exception as e:
+        logger.error(f"Error in auto_trade for user {user_id}: {str(e)}", exc_info=True)
+
+async def check_subscriptions(context: ContextTypes.DEFAULT_TYPE):
+    users = users_collection.find({'subscription_status': 'active'})
+    for user in users:
+        user_id = user['user_id']
+        if not await check_subscription(user_id):
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="Your subscription has expired. Use /subscribe to renew."
+            )
+
+def setup_webhook():
+    app = Flask(__name__)
+
+    @app.route('/webhook', methods=['POST'])
+    async def webhook():
         data = request.get_json()
-        if not data:
-            logger.error("No data received in webhook")
-            return jsonify({'status': 'error', 'message': 'No data provided'}), 400
-
-        # Process Ethereum transaction webhook (e.g., from a block explorer or custom node)
-        tx_hash = data.get('hash')
-        from_address = data.get('from')
-        to_address = data.get('to')
-        value = data.get('value')  # In wei
-        contract_address = data.get('contract_address')
-
-        logger.debug(f"Webhook received: tx_hash={tx_hash}, from={from_address}, to={to_address}, value={value}")
-
-        if contract_address != USDT_CONTRACT_ADDRESS:
-            logger.debug(f"Ignoring non-USDT transaction: {contract_address}")
-            return jsonify({'status': 'success', 'message': 'Non-USDT transaction ignored'}), 200
-
-        if to_address.lower() != BOT_USDT_ADDRESS.lower():
-            logger.debug(f"Ignoring transaction not sent to bot wallet: {to_address}")
-            return jsonify({'status': 'success', 'message': 'Transaction not to bot wallet'}), 200
-
-        # Find user by payment address
-        user = users_collection.find_one({'payment_address': from_address})
+        logger.debug(f"Received webhook: {data}")
+        
+        if not data or 'hash' not in data or 'from' not in data:
+            logger.error("Invalid webhook data received")
+            return jsonify({'status': 'error', 'message': 'Invalid data'}), 400
+        
+        tx_hash = data['hash']
+        sender = data['from']
+        user = users_collection.find_one({'payment_address': sender})
+        
         if not user:
-            logger.error(f"No user found for payment address: {from_address}")
-            return jsonify({'status': 'error', 'message': 'No user found'}), 404
-
+            logger.debug(f"No user found for payment address {sender}")
+            return jsonify({'status': 'success'}), 200
+        
+        user_id = user['user_id']
         expected_amount = user.get('expected_amount')
         payment_deadline = user.get('payment_deadline')
-        if not expected_amount or not payment_deadline:
-            logger.error(f"No payment pending for user {user['user_id']}")
-            return jsonify({'status': 'error', 'message': 'No payment pending'}), 400
-
         if isinstance(payment_deadline, str):
             payment_deadline = datetime.fromisoformat(payment_deadline)
+        
+        if not expected_amount or not payment_deadline:
+            logger.debug(f"No pending payment for user {user_id}")
+            return jsonify({'status': 'success'}), 200
+        
         if datetime.now() > payment_deadline:
-            logger.error(f"Payment deadline expired for user {user['user_id']}")
+            logger.debug(f"Payment deadline expired for user {user_id}")
             users_collection.update_one(
-                {'user_id': user['user_id']},
-                {'$unset': {'payment_address': "", 'expected_amount': "", 'payment_deadline': ""}}
+                {'user_id': user_id},
+                {'$set': {'payment_address': None, 'expected_amount': None, 'payment_deadline': None}}
             )
-            return jsonify({'status': 'error', 'message': 'Payment deadline expired'}), 400
-
-        if int(value) < expected_amount:
-            logger.error(f"Insufficient payment from user {user['user_id']}: got {value}, expected {expected_amount}")
-            return jsonify({'status': 'error', 'message': 'Insufficient payment amount'}), 400
-
-        # Verify transaction on-chain
+            return jsonify({'status': 'success'}), 200
+        
         try:
             receipt = w3_eth.eth.get_transaction_receipt(tx_hash)
-            if receipt.status != 1:
-                logger.error(f"Transaction {tx_hash} failed for user {user['user_id']}")
-                return jsonify({'status': 'error', 'message': 'Transaction failed'}), 400
+            if receipt['status'] != 1:
+                logger.debug(f"Transaction {tx_hash} failed for user {user_id}")
+                return jsonify({'status': 'success'}), 200
+            
+            for log in receipt['logs']:
+                if log['address'].lower() == USDT_CONTRACT_ADDRESS.lower():
+                    amount = int(log['data'], 16) / 10**6
+                    if amount >= 5.0 and log['topics'][2].hex().endswith(sender[2:].lower()):
+                        expiry = datetime.now() + timedelta(days=7)
+                        users_collection.update_one(
+                            {'user_id': user_id},
+                            {
+                                '$set': {
+                                    'subscription_status': 'active',
+                                    'subscription_expiry': expiry.isoformat(),
+                                    'payment_address': None,
+                                    'expected_amount': None,
+                                    'payment_deadline': None
+                                }
+                            }
+                        )
+                        bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text=f"Subscription activated! Valid until {expiry.strftime('%Y-%m-%d %H:%M:%S')}."
+                        )
+                        logger.debug(f"Subscription activated for user {user_id}")
+                        break
         except Exception as e:
-            logger.error(f"Error verifying transaction {tx_hash}: {str(e)}")
-            return jsonify({'status': 'error', 'message': 'Transaction verification failed'}), 500
-
-        # Activate subscription
-        subscription_expiry = datetime.now() + timedelta(days=7)
-        users_collection.update_one(
-            {'user_id': user['user_id']},
-            {
-                '$set': {
-                    'subscription_status': 'active',
-                    'subscription_expiry': subscription_expiry.isoformat()
-                },
-                '$unset': {
-                    'payment_address': "",
-                    'expected_amount': "",
-                    'payment_deadline': ""
-                }
-            }
-        )
-        logger.info(f"Subscription activated for user {user['user_id']} until {subscription_expiry}")
-        return jsonify({'status': 'success', 'message': 'Subscription activated'}), 200
-
-    except Exception as e:
-        logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-async def subscription_check(context: ContextTypes.DEFAULT_TYPE):
-    """Periodic job to check and update subscription statuses."""
-    users = users_collection.find({'subscription_status': 'active'})
-    current_time = datetime.now()
-    for user in users:
-        expiry = user.get('subscription_expiry')
-        if isinstance(expiry, str):
-            expiry = datetime.fromisoformat(expiry)
-        if expiry and current_time >= expiry:
-            logger.info(f"Subscription expired for user {user['user_id']}")
-            users_collection.update_one(
-                {'user_id': user['user_id']},
-                {'$set': {'subscription_status': 'inactive', 'subscription_expiry': None}}
-            )
-            await context.bot.send_message(
-                chat_id=user['user_id'],
-                text="Your subscription has expired. Please renew using /subscribe."
-            )
+            logger.error(f"Error processing webhook for user {user_id}: {str(e)}", exc_info=True)
+        
+        return jsonify({'status': 'success'}), 200
+    
+    return app
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel the current conversation."""
     await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
 
 def main():
-    """Main function to start the bot and Flask webhook."""
-    bot_token = os.getenv("BOT_TOKEN")
-    if not bot_token:
-        logger.error("BOT_TOKEN not found in .env file")
-        raise ValueError("BOT_TOKEN not found in .env file")
-
-    application = Application.builder().token(bot_token).build()
-
-    # Conversation handler for setting trading mode
-    set_mode_conv = ConversationHandler(
-        entry_points=[CommandHandler('setmode', set_mode)],
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN not found in .env file")
+        raise ValueError("TELEGRAM_TOKEN not found in .env file")
+    
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    if application.job_queue is None:
+        logger.error("JobQueue is not initialized. Ensure 'python-telegram-bot[job-queue]' is installed.")
+        raise ValueError("JobQueue is not initialized")
+    
+    application.job_queue.run_repeating(periodic_token_check, interval=5, first=5)
+    application.job_queue.run_repeating(check_subscriptions, interval=3600, first=60)
+    
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('generate_wallet', generate_wallet),
+            CommandHandler('set_wallet', set_wallet),
+            CommandHandler('setmode', set_mode),
+            CommandHandler('trade', trade),
+            CommandHandler('transfer', transfer)
+        ],
         states={
-            SET_TRADING_MODE: [CallbackQueryHandler(mode_callback)],
+            CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet, pattern='^(confirm_new_wallet|cancel_new_wallet)$')],
+            SET_WALLET_METHOD: [CallbackQueryHandler(set_wallet_method, pattern='^(mnemonic|private_key)$')],
+            INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_mnemonic)],
+            INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_private_key)],
+            CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet, pattern='^(confirm_set_wallet|cancel_set_wallet)$')],
+            SET_TRADING_MODE: [CallbackQueryHandler(mode_callback, pattern='^(manual|automatic)$')],
             SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_auto_buy_amount)],
             SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_sell_percentage)],
             SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_loss_percentage)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-
-    # Conversation handler for generating a new wallet
-    generate_wallet_conv = ConversationHandler(
-        entry_points=[CommandHandler('generate_wallet', generate_wallet)],
-        states={
-            CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-
-    # Conversation handler for setting/importing a wallet
-    set_wallet_conv = ConversationHandler(
-        entry_points=[CommandHandler('set_wallet', set_wallet)],
-        states={
-            SET_WALLET_METHOD: [CallbackQueryHandler(set_wallet_method)],
-            INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_mnemonic)],
-            INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_private_key)],
-            CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-
-    # Conversation handler for trading
-    trade_conv = ConversationHandler(
-        entry_points=[CommandHandler('trade', trade)],
-        states={
-            SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action)],
+            SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action, pattern='^(buy|sell)_')],
             BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
             SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
-            CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-
-    # Conversation handler for transferring tokens
-    transfer_conv = ConversationHandler(
-        entry_points=[CommandHandler('transfer', transfer)],
-        states={
+            CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade, pattern='^(confirm_trade|cancel_trade)$')],
             TRANSFER_TOKEN: [CallbackQueryHandler(transfer_token)],
             TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_amount)],
-            TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_address)],
+            TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_address)]
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
-
-    # Add handlers to the application
-    application.add_handler(set_mode_conv)
-    application.add_handler(generate_wallet_conv)
-    application.add_handler(set_wallet_conv)
-    application.add_handler(trade_conv)
-    application.add_handler(transfer_conv)
-    application.add_handler(CommandHandler('subscribe', subscribe))
-    application.add_handler(CommandHandler('balance', balance))
-    application.add_handler(CommandHandler('reset_tokens', reset_tokens))
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('cancel', cancel))
-
-    # Set bot commands for the menu
-    commands = [
-        BotCommand('start', 'Start the bot and create/view wallet'),
-        BotCommand('subscribe', 'Subscribe to access trading features ($5/week via USDT)'),
-        BotCommand('setmode', 'Set trading mode (manual or automatic)'),
-        BotCommand('generate_wallet', 'Generate a new wallet'),
-        BotCommand('set_wallet', 'Import an existing wallet'),
-        BotCommand('trade', 'Trade Solana tokens manually'),
-        BotCommand('balance', 'Check wallet balance and holdings'),
-        BotCommand('transfer', 'Transfer Solana tokens'),
-        BotCommand('reset_tokens', 'Reset posted tokens list'),
-        BotCommand('cancel', 'Cancel current operation')
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("subscribe", subscribe))
+    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(CommandHandler("reset_tokens", reset_tokens))
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(select_token_action, pattern='^(buy|sell)_'))
+    
+    bot_commands = [
+        BotCommand("start", "Start the bot and create/import a wallet"),
+        BotCommand("subscribe", "Subscribe to use trading features"),
+        BotCommand("generate_wallet", "Generate a new wallet"),
+        BotCommand("set_wallet", "Import an existing wallet"),
+        BotCommand("setmode", "Set trading mode (manual/automatic)"),
+        BotCommand("trade", "Trade Solana tokens manually"),
+        BotCommand("balance", "Check wallet balance and holdings"),
+        BotCommand("transfer", "Transfer Solana tokens"),
+        BotCommand("reset_tokens", "Reset posted tokens to receive all new tokens"),
+        BotCommand("cancel", "Cancel current operation")
     ]
-    application.bot.set_my_commands(commands)
-
-    # Start periodic subscription check
-    application.job_queue.run_repeating(subscription_check, interval=3600, first=10)
-
-    # Start Flask app in a separate thread
-    def run_flask():
-        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
-    # Start the bot
-    logger.info("Starting bot polling")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.bot.set_my_commands(bot_commands)
+    
+    port = int(os.getenv("PORT", 8443))
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if webhook_url:
+        logger.info(f"Starting webhook on port {port} with URL {webhook_url}")
+        application.run_webhook(
+            listen='0.0.0.0',
+            port=port,
+            url_path='/webhook',
+            webhook_url=f"{webhook_url}/webhook",
+            drop_pending_updates=True
+        )
+    else:
+        logger.info("Starting polling with timeout=30")
+        application.run_polling(timeout=30, drop_pending_updates=True)
 
 if __name__ == '__main__':
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if webhook_url:
+        flask_app = setup_webhook()
+        threading.Thread(target=flask_app.run, kwargs={'host': '0.0.0.0', 'port': int(os.getenv("PORT", 8443))}).start()
     main()
+            
