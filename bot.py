@@ -1429,7 +1429,7 @@ def health_check():
     return jsonify({'status': 'ok'}), 200
 
 @app.route('/webhook', methods=['POST'])
-async def payment_webhook():
+def payment_webhook():  # Remove async
     logger.debug("Payment webhook received")
     data = request.get_json()
     if not data:
@@ -1460,9 +1460,13 @@ async def payment_webhook():
                             }
                         }
                     )
-                    await application.bot.send_message(
-                        chat_id=user['user_id'],
-                        text=f"Payment confirmed! Subscription active until {expiry.strftime('%Y-%m-%d %H:%M:%S')}."
+                    # Use asyncio to run async function in background
+                    asyncio.run_coroutine_threadsafe(
+                        application.bot.send_message(
+                            chat_id=user['user_id'],
+                            text=f"Payment confirmed! Subscription active until {expiry.strftime('%Y-%m-%d %H:%M:%S')}."
+                        ),
+                        application.loop
                     )
                     logger.info(f"Payment confirmed for user {user['user_id']}: {amount} USDT")
                     return jsonify({'status': 'success'}), 200
