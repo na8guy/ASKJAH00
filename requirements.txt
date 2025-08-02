@@ -1,6 +1,6 @@
 requests>=2.28.0
 httpx>=0.23.0
-python-telegram-bot[job-queue]>=21.0
+python-telegram-bot[webhooks,job-queue]
 solana>=0.30.0
 solders>=0.10.0
 base58>=2.1.0
