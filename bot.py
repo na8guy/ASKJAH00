@@ -312,6 +312,25 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
         'payment_deadline': None
     }
 
+async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = users_collection.find_one({'user_id': user_id})
+    
+    if not user:
+        await update.message.reply_text("No user data found.")
+        return
+        
+    status = (
+        f"🔧 *Trade System Status*\n\n"
+        f"🔄 Auto-fetch: {'✅ Enabled' if user.get('last_token_check') else '❌ Disabled'}\n"
+        f"⏱️ Last check: {datetime.fromtimestamp(user.get('last_token_check', 0)).strftime('%Y-%m-%d %H:%M') if user.get('last_token_check') else 'Never'}\n"
+        f"📋 Tokens seen: {len(user.get('posted_tokens', []))}\n"
+        f"💼 Active trades: {len(user.get('portfolio', {}))}\n\n"
+        f"Use /fetch_tokens to manually check for new tokens."
+    )
+    
+    await update.message.reply_text(status, parse_mode='Markdown')    
+
 async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
     user_key = derive_user_key(user_id)
     decrypted_user = user.copy()
@@ -337,7 +356,13 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     user = users_collection.find_one({'user_id': user_id})
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {'chat_id': chat_id}},
+        upsert=True
+    )
     if not user:
         mnemo = Mnemonic("english")
         mnemonic = mnemo.generate(strength=256)
@@ -503,11 +528,49 @@ async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     # Schedule the token update job
     context.job_queue.run_repeating(
         update_token_info,
-        interval=30,
+        interval=6,
         first=5,
         user_id=user_id,
         name=f"token_updates_{user_id}"
     )
+
+
+def format_token_message(token):
+    # Extract social links
+    socials = token.get('socials', {})
+    social_links = ""
+    for platform, url in socials.items():
+        platform_icon = {
+            'telegram': '📢',
+            'twitter': '🐦',
+            'website': '🌐',
+            'discord': '💬'
+        }.get(platform.lower(), '🔗')
+        social_links += f"{platform_icon} [{platform.capitalize()}]({url})\n"
+    
+    # Format market data
+    market_data = (
+        f"💵 *Price:* ${token.get('price_usd', 0):.6f}\n"
+        f"📊 *Market Cap:* ${token.get('market_cap', 0):,.2f}\n"
+        f"💧 *Liquidity:* ${token.get('liquidity', 0):,.2f}\n"
+        f"📈 *24h Volume:* ${token.get('volume', 0):,.2f}\n"
+    )
+    
+    # Create warning if needed
+    is_suspicious = token.get('liquidity', 0) < 1000 or token.get('volume', 0) < 1000
+    warning = "🚨 *Low liquidity/volume! Trade with caution!*" if is_suspicious else ""
+    
+    # Build final message
+    return (
+        f"🚀 *{token.get('name', 'New Token')} ({token.get('symbol', 'TOKEN')})*\n\n"
+        f"{market_data}\n"
+        f"🔗 *Contract:* `{token.get('contract_address', '')}`\n\n"
+        f"🔗 *Links:*\n{social_links}\n"
+        f"{warning}\n"
+        f"[📊 View Chart]({token.get('dexscreener_url', '')}) | "
+        f"[🖼️ View Image]({token.get('image', '')})"
+    )
+
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -547,6 +610,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Start token updates after setting up payment
         await start_token_updates(context, user_id)
+        logger.info(f"Started token updates for user {user_id}")
         
         await update.message.reply_text(
             f"To subscribe ($5/week), send {usdt_amount:.6f} USDT to:\n"
@@ -1086,6 +1150,8 @@ async def select_token_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     user_id = query.from_user.id
     logger.debug(f"select_token_action called for user {user_id} with data: {query.data}")
+
+    await query.edit_message_text(text="⏳ Processing your request...")
     
     if not await check_subscription(user_id):
         logger.debug(f"User {user_id} blocked due to inactive subscription")
@@ -1141,9 +1207,9 @@ async def select_token_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     context.user_data['trade_action'] = action
     if action == 'buy':
-        logger.debug(f"User {user_id} selected buy for {token['name']}")
-        await query.message.reply_text(
-            f"Selected token: {token['name']} ({token['symbol']})\nEnter amount to buy in SOL:"
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"Selected token: {token['name']} ({token['symbol']})\nEnter amount to buy in SOL:"
         )
         return BUY_AMOUNT
     else:
@@ -1417,61 +1483,50 @@ async def transfer_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def fetch_latest_token():
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            logger.debug("Fetching token profile from DexScreener")
-            response = await client.get(
-                DEXSCREENER_PROFILE_API, 
-                params={'chainId': 'solana'},
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
+            # Fetch token profile
+            response = await client.get(DEXSCREENER_PROFILE_API, params={'chainId': 'solana'})
             response.raise_for_status()
             data = response.json()
             
-            if not isinstance(data, list):
-                logger.error(f"Invalid profile response: {type(data)}")
-                return None
-            
-            # Find Solana tokens
+            # Process token data
             solana_tokens = [t for t in data if isinstance(t, dict) and t.get('chainId') == 'solana']
             if not solana_tokens:
-                logger.warning("No Solana tokens found in profile response")
                 return None
             
             token = solana_tokens[0]
             token_address = token.get('tokenAddress', '')
-            if not token_address:
-                logger.warning("Token address missing")
-                return None
             
             # Fetch token details
-            logger.debug(f"Fetching details for token: {token_address}")
             token_url = DEXSCREENER_TOKEN_API.format(token_address=token_address)
-            token_response = await client.get(token_url, headers={'User-Agent': 'Mozilla/5.0'})
+            token_response = await client.get(token_url)
             token_response.raise_for_status()
             token_data = token_response.json()
             
-            if not token_data or not isinstance(token_data, list) or not token_data[0]:
-                logger.error(f"Invalid token response: {token_data}")
+            if not token_data or not token_data[0]:
                 return None
-            
+                
             pair_data = token_data[0]
+            
+            # Get accurate name from pair data
+            name = pair_data.get('name', token.get('description', 'Unknown').split()[0])
+            symbol = pair_data.get('symbol', token.get('url', '').split('/')[-1].upper())
+            
             return {
-                'name': pair_data.get('name', token.get('description', 'Unknown').split()[0]),
-                'symbol': pair_data.get('symbol', token.get('url', '').split('/')[-1].upper()),
+                'name': name,
+                'symbol': symbol,
                 'contract_address': token_address,
                 'price_usd': float(pair_data.get('priceUsd', 0)),
                 'market_cap': float(pair_data.get('marketCap', 0)),
                 'liquidity': float(pair_data.get('liquidity', {}).get('usd', 0)),
                 'volume': float(pair_data.get('volume', {}).get('h24', 0)),
-                'website': next((link['url'] for link in token.get('links', []) if link.get('label') == 'Website'), 'N/A'),
+                'website': next((link['url'] for link in token.get('links', []) if link.get('label') == 'Website'), ''),
                 'socials': {link['type']: link['url'] for link in token.get('links', []) if link.get('type')},
+                'image': token.get('icon', ''),
                 'dexscreener_url': f"https://dexscreener.com/solana/{token_address}"
             }
-            
-        except httpx.HTTPError as e:
-            logger.error(f"HTTP error fetching token: {str(e)}")
         except Exception as e:
-            logger.error(f"Unexpected error fetching token: {str(e)}", exc_info=True)
-        return None
+            logger.error(f"Token fetch error: {str(e)}")
+            return None
 
 async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.user_id
@@ -1517,43 +1572,33 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Format token info
-        is_suspicious = token.get('liquidity', 0) < 1000 or token.get('volume', 0) < 1000
-        warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
-        
-        socials = token.get('socials', {})
-        social_links = "\n".join([f"{k.capitalize()}: {v}" for k, v in socials.items()]) if socials else "N/A"
-        
-        message = (
-            f"<b>New Solana Token Detected</b>\n"
-            f"Name: {token.get('name', 'Unknown')} ({token.get('symbol', '?')})\n"
-            f"Contract: {token['contract_address']}\n"
-            f"Price: ${token.get('price_usd', 0):.6f}\n"
-            f"Market Cap: ${token.get('market_cap', 0):,.2f}\n"
-            f"Liquidity: ${token.get('liquidity', 0):,.2f}\n"
-            f"24h Volume: ${token.get('volume', 0):,.2f}\n"
-            f"Website: {token.get('website', 'N/A')}\n"
-            f"Socials:\n{social_links}\n"
-            f"{warning}\n"
-            f"DexScreener: <a href='{token.get('dexscreener_url', '')}'>View Chart</a>"
-        )
+        message = format_token_message(token)
         
         keyboard = [
-            [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
-            [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
-        ]
+             [InlineKeyboardButton("💰 Buy", callback_data=f"buy_{token['contract_address']}"),
+             InlineKeyboardButton("💸 Sell", callback_data=f"sell_{token['contract_address']}")]
+      ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         # Send message with error handling
         try:
-            await context.bot.send_message(
+            if token.get('image'):
+             await context.bot.send_photo(
+                chat_id=user_id,
+                photo=token['image'],
+                caption=message,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+            else:
+             await context.bot.send_message(
                 chat_id=user_id,
                 text=message,
-                parse_mode='HTML',
-                reply_markup=reply_markup,
-                disable_web_page_preview=True
+                parse_mode='Markdown',
+                reply_markup=reply_markup
             )
         except Exception as e:
-            logger.error(f"Error sending message to user {user_id}: {str(e)}")
+         logger.error(f"Error sending token info: {str(e)}")
         
         # Update global and user token records
         try:
@@ -1821,6 +1866,7 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("subscribe", subscribe))
     application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
+    application.add_handler(CommandHandler("trade_status", trade_status))
     application.add_handler(CommandHandler("debug", debug))
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("generate_wallet", generate_wallet)],
@@ -1919,6 +1965,7 @@ async def setup_bot():
         BotCommand("balance", "Check wallet balance"),
         BotCommand("transfer", "Transfer Solana tokens"),
         BotCommand("cancel", "Cancel current operation"),
+        BotCommand("trade_status", "Check trade system status"),
         BotCommand("debug", "Show debug information")
     ]
     await application.bot.set_my_commands(commands)
