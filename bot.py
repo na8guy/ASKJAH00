@@ -4,16 +4,7 @@ import requests
 import httpx
 import base64
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-    WebhookServer,  # Add WebhookServer
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
 from solders.keypair import Keypair
@@ -1690,24 +1681,103 @@ def usdt_webhook():
         logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+
+async def periodic_token_check(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic job to check for new tokens"""
+    logger.debug("Running periodic token check")
+    token = await fetch_latest_token()
+    if not token:
+        logger.debug("No new token found")
+        return
+    
+    # Get all subscribed users
+    users = users_collection.find({'subscription_status': 'active'})
+    for user in users:
+        user_id = user['user_id']
+        
+        # Skip if token was already posted
+        if token['contract_address'] in user.get('posted_tokens', []):
+            continue
+        
+        # Rate limit API calls
+        if time.time() - user.get('last_api_call', 0) < 1:
+            continue
+        
+        try:
+            is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
+            warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
+            
+            message = (
+                f"<b>New Solana Token Alert</b>\n"
+                f"Name: {token['name']} ({token['symbol']})\n"
+                f"Contract: {token['contract_address']}\n"
+                f"Price: ${token['price_usd']:.6f}\n"
+                f"Market Cap: ${token['market_cap']:,.2f}\n"
+                f"Liquidity: ${token['liquidity']:,.2f}\n"
+                f"24h Volume: ${token['volume']:,.2f}\n"
+                f"{warning}"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
+                [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            
+            # Update user's last API call and posted tokens
+            users_collection.update_one(
+                {'user_id': user_id},
+                {
+                    '$set': {'last_api_call': time.time()},
+                    '$addToSet': {'posted_tokens': token['contract_address']}
+                }
+            )
+            
+            # Trigger auto-trade if enabled
+            if user['trading_mode'] == 'automatic':
+                await auto_trade(context, user_id=user_id, token=token)
+                
+        except Exception as e:
+            logger.error(f"Error sending token to user {user_id}: {str(e)}")
+
+
 async def subscription_check(context: ContextTypes.DEFAULT_TYPE):
-    """Periodic job to check and update subscription statuses."""
+    """Periodic job to check and update subscription statuses"""
+    logger.debug("Running subscription check")
     users = users_collection.find({'subscription_status': 'active'})
     current_time = datetime.now()
+    
     for user in users:
+        user_id = user['user_id']
         expiry = user.get('subscription_expiry')
+        
+        if not expiry:
+            continue
+            
         if isinstance(expiry, str):
             expiry = datetime.fromisoformat(expiry)
-        if expiry and current_time >= expiry:
-            logger.info(f"Subscription expired for user {user['user_id']}")
+            
+        if current_time >= expiry:
+            logger.info(f"Subscription expired for user {user_id}")
             users_collection.update_one(
-                {'user_id': user['user_id']},
+                {'user_id': user_id},
                 {'$set': {'subscription_status': 'inactive', 'subscription_expiry': None}}
             )
-            await context.bot.send_message(
-                chat_id=user['user_id'],
-                text="Your subscription has expired. Please renew using /subscribe."
-            )
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="Your subscription has expired. Please renew using /subscribe."
+                )
+            except Exception as e:
+                logger.error(f"Error sending expiration notice to user {user_id}: {str(e)}")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel the current conversation."""
@@ -1716,144 +1786,108 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 def main():
     """Main function to start the bot and Flask webhook."""
-    bot_token = os.getenv("BOT_TOKEN")
+    bot_token = os.getenv("BOT_TOKEN")  # Changed from BOT_TOKEN to TELEGRAM_TOKEN
     if not bot_token:
         logger.error("BOT_TOKEN not found in .env file")
         raise ValueError("BOT_TOKEN not found in .env file")
 
-    webhook_url = os.getenv("WEBHOOK_URL")
-    if not webhook_url:
-        logger.error("WEBHOOK_URL not found in .env file")
-        raise ValueError("WEBHOOK_URL not found in .env file")
+    # Create and configure the bot application
+    application = Application.builder().token(bot_token).build()
 
-    port = int(os.getenv("PORT", 10000))  # Default to 10000 for Render
+    # Add command handlers
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('subscribe', subscribe))
+    application.add_handler(CommandHandler('balance', balance))
+    application.add_handler(CommandHandler('reset_tokens', reset_tokens))
+    application.add_handler(CommandHandler('cancel', cancel))
 
-    try:
-        application = Application.builder().token(bot_token).build()
+    # Add conversation handlers
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('setmode', set_mode)],
+        states={
+            SET_TRADING_MODE: [CallbackQueryHandler(mode_callback)],
+            SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_auto_buy_amount)],
+            SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_sell_percentage)],
+            SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_loss_percentage)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
 
-        # Conversation handler for setting trading mode
-        set_mode_conv = ConversationHandler(
-            entry_points=[CommandHandler('setmode', set_mode)],
-            states={
-                SET_TRADING_MODE: [CallbackQueryHandler(mode_callback)],
-                SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_auto_buy_amount)],
-                SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_sell_percentage)],
-                SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_loss_percentage)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)]
-        )
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('generate_wallet', generate_wallet)],
+        states={
+            CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
 
-        # Conversation handler for generating a new wallet
-        generate_wallet_conv = ConversationHandler(
-            entry_points=[CommandHandler('generate_wallet', generate_wallet)],
-            states={
-                CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)]
-        )
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('set_wallet', set_wallet)],
+        states={
+            SET_WALLET_METHOD: [CallbackQueryHandler(set_wallet_method)],
+            INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_mnemonic)],
+            INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_private_key)],
+            CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
 
-        # Conversation handler for setting/importing a wallet
-        set_wallet_conv = ConversationHandler(
-            entry_points=[CommandHandler('set_wallet', set_wallet)],
-            states={
-                SET_WALLET_METHOD: [CallbackQueryHandler(set_wallet_method)],
-                INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_mnemonic)],
-                INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_private_key)],
-                CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)]
-        )
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('trade', trade)],
+        states={
+            SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action)],
+            BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
+            SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
+            CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
 
-        # Conversation handler for trading
-        trade_conv = ConversationHandler(
-            entry_points=[CommandHandler('trade', trade)],
-            states={
-                SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action)],
-                BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
-                SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
-                CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)]
-        )
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('transfer', transfer)],
+        states={
+            TRANSFER_TOKEN: [CallbackQueryHandler(transfer_token)],
+            TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_amount)],
+            TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_address)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
 
-        # Conversation handler for transferring tokens
-        transfer_conv = ConversationHandler(
-            entry_points=[CommandHandler('transfer', transfer)],
-            states={
-                TRANSFER_TOKEN: [CallbackQueryHandler(transfer_token)],
-                TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_amount)],
-                TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_address)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)]
-        )
+    # Set bot commands for the menu
+    commands = [
+        BotCommand('start', 'Start the bot and create/view wallet'),
+        BotCommand('subscribe', 'Subscribe to access trading features ($5/week via USDT)'),
+        BotCommand('setmode', 'Set trading mode (manual or automatic)'),
+        BotCommand('generate_wallet', 'Generate a new wallet'),
+        BotCommand('set_wallet', 'Import an existing wallet'),
+        BotCommand('trade', 'Trade Solana tokens manually'),
+        BotCommand('balance', 'Check wallet balance and holdings'),
+        BotCommand('transfer', 'Transfer Solana tokens'),
+        BotCommand('reset_tokens', 'Reset posted tokens list'),
+        BotCommand('cancel', 'Cancel current operation')
+    ]
+    
+    # Start periodic jobs
+    application.job_queue.run_repeating(subscription_check, interval=3600, first=10)
+    application.job_queue.run_repeating(periodic_token_check, interval=10, first=5)
 
-        # Add handlers to the application
-        application.add_handler(set_mode_conv)
-        application.add_handler(generate_wallet_conv)
-        application.add_handler(set_wallet_conv)
-        application.add_handler(trade_conv)
-        application.add_handler(transfer_conv)
-        application.add_handler(CommandHandler('subscribe', subscribe))
-        application.add_handler(CommandHandler('balance', balance))
-        application.add_handler(CommandHandler('reset_tokens', reset_tokens))
-        application.add_handler(CommandHandler('start', start))
-        application.add_handler(CommandHandler('cancel', cancel))
+    # Start Flask in a separate process
+    from multiprocessing import Process
+    flask_process = Process(target=run_flask_app)
+    flask_process.daemon = True
+    flask_process.start()
+    logger.info("Started Flask app in separate process")
 
-        # Set bot commands for the menu
-        commands = [
-            BotCommand('start', 'Start the bot and create/view wallet'),
-            BotCommand('subscribe', 'Subscribe to access trading features ($5/week via USDT)'),
-            BotCommand('setmode', 'Set trading mode (manual or automatic)'),
-            BotCommand('generate_wallet', 'Generate a new wallet'),
-            BotCommand('set_wallet', 'Import an existing wallet'),
-            BotCommand('trade', 'Trade Solana tokens manually'),
-            BotCommand('balance', 'Check wallet balance and holdings'),
-            BotCommand('transfer', 'Transfer Solana tokens'),
-            BotCommand('reset_tokens', 'Reset posted tokens list'),
-            BotCommand('cancel', 'Cancel current operation')
-        ]
-        application.bot.set_my_commands(commands)
+    # Start the bot
+    logger.info("Starting bot polling")
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
 
-        # Start periodic subscription check
-        application.job_queue.run_repeating(subscription_check, interval=3600, first=10)
-
-        # Add Telegram webhook endpoint
-        @app.route('/webhook/telegram', methods=['POST'])
-        async def telegram_webhook():
-            logger.debug(f"Received webhook request: {request.get_json()}")
-            try:
-                update = Update.de_json(request.get_json(), application.bot)
-                if not update:
-                    logger.error("Invalid Telegram update received")
-                    return jsonify({'error': 'Invalid update'}), 400
-                await application.process_update(update)
-                logger.debug("Telegram update processed successfully")
-                return jsonify({'status': 'ok'}), 200
-            except Exception as e:
-                logger.error(f"Error processing Telegram update: {str(e)}")
-                return jsonify({'error': 'Processing failed'}), 500
-
-        # Add health check endpoint
-        @app.route('/')
-        def health():
-            return jsonify({'status': 'ok'})
-
-        logger.info(f"Starting Flask app with WebhookServer on port {port}")
-        webhook_server = WebhookServer('0.0.0.0', port, app)
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(
-            application.run_webhook(
-                webhook_server=webhook_server,
-                webhook_path='/webhook/telegram',
-                webhook_url=f"{webhook_url}/webhook/telegram",
-                close_loop=False
-            )
-        )
-        return app  # Return Flask app for gunicorn
-
-    except Exception as e:
-        logger.error(f"Error in main: {str(e)}")
-        raise
+def run_flask_app():
+    """Run the Flask app in a separate process"""
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
 if __name__ == '__main__':
     main()
