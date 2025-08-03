@@ -1665,8 +1665,7 @@ def main():
                 return jsonify({'error': 'Processing failed'}), 500
 
         logger.info(f"Starting Flask app with gunicorn on port {PORT}")
-        # Gunicorn will be started via Render's start command, so no app.run()
-        return app  # Return the Flask app for gunicorn
+        return app  # Return Flask app for gunicorn
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")
         raise
