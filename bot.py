@@ -48,7 +48,20 @@ import os
 from dotenv import load_dotenv
 from web3 import Web3
 from eth_account import Account
+import structlog
 
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.stdlib.add_log_level,
+        structlog.processors.JSONRenderer()
+    ],
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
+)
+logger = structlog.get_logger()
 # Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -74,24 +87,7 @@ async def root():
 async def health_check():
     return JSONResponse(content={'status': 'ok'})
 
-# Telegram webhook endpoint
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    try:
-        update_data = await request.json()
-        update = Update.de_json(update_data, application.bot)
-        if update:
-            await application.update_queue.put(update)
-        return JSONResponse(content={'status': 'ok'})
-    except Exception as e:
-        logger.error(f"Webhook error: {str(e)}")
-        return JSONResponse(content={'error': str(e)}, status_code=500)
 
-@app.on_event("startup")
-async def startup_event():
-    logger.info("FastAPI application starting up...")
-    logger.info(f"Environment variables: PORT={os.getenv('PORT')}, WEBHOOK_URL={os.getenv('WEBHOOK_URL')}")
-    logger.info("Gunicorn should be running with 'gunicorn bot:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT'")
 
 GMGN_API_HOST = 'https://gmgn.ai'
 
@@ -1753,11 +1749,73 @@ def setup_handlers(application: Application):
     ))
     application.add_error_handler(error_handler)
 
+
+
+# Telegram webhook endpoint
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        update_data = await request.json()
+        logger.info(
+            "Received webhook update",
+            update_id=update_data.get("update_id"),
+            request_headers=dict(request.headers),
+            request_body=update_data
+        )
+        update = Update.de_json(update_data, application.bot)
+        if not update:
+            logger.error("Failed to parse Telegram update", update_data=update_data)
+            raise HTTPException(status_code=400, detail="Invalid Telegram update")
+        await application.update_queue.put(update)
+        logger.info("Update queued successfully", update_id=update.get("update_id"))
+        return JSONResponse(content={"status": "ok"})
+    except Exception as e:
+        logger.error("Webhook processing error", error=str(e), exc_info=True)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+@app.get("/debug")
+async def debug_info():
+    try:
+        webhook_info = await application.bot.get_webhook_info()
+        logger.info("Fetched webhook info", webhook_info=webhook_info.to_dict())
+        return JSONResponse(content={
+            "status": "ok",
+            "webhook_info": webhook_info.to_dict(),
+            "application_initialized": application is not None,
+            "environment": {
+                "TELEGRAM_TOKEN": bool(os.getenv("TELEGRAM_TOKEN")),
+                "WEBHOOK_URL": os.getenv("WEBHOOK_URL"),
+                "PORT": os.getenv("PORT")
+            }
+        })
+    except Exception as e:
+        logger.error("Debug endpoint error", error=str(e), exc_info=True)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+@app.on_event("startup")
+async def verify_webhook():
+    try:
+        webhook_info = await application.bot.get_webhook_info()
+        logger.info("Current webhook info", webhook_info=webhook_info.to_dict())
+        expected_url = os.getenv("WEBHOOK_URL")
+        if webhook_info.url != expected_url:
+            logger.warning(
+                "Webhook URL mismatch",
+                current_url=webhook_info.url,
+                expected_url=expected_url
+            )
+            await application.bot.set_webhook(url=expected_url)
+            logger.info("Webhook reset successfully", url=expected_url)
+        else:
+            logger.info("Webhook URL is correctly set", url=webhook_info.url)
+    except Exception as e:
+        logger.error("Failed to verify webhook on startup", error=str(e), exc_info=True)
+
 async def main():
     global application
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_TOKEN not found in .env file")
+        logger.error("Missing TELEGRAM_TOKEN in environment variables")
         raise ValueError("TELEGRAM_TOKEN not found in .env file")
     
     application = (
@@ -1772,19 +1830,22 @@ async def main():
     await application.initialize()
     webhook_url = os.getenv("WEBHOOK_URL")
     if not webhook_url:
-        logger.error("WEBHOOK_URL not found in .env file")
+        logger.error("Missing WEBHOOK_URL in environment variables")
         raise ValueError("WEBHOOK_URL not found in .env file")
+    
+    logger.info("Initializing application", webhook_url=webhook_url)
     await application.bot.set_webhook(url=webhook_url)
-    logger.info(f"Webhook set to {webhook_url}")
+    logger.info("Webhook set successfully", url=webhook_url)
     
     # Run FastAPI app with uvicorn
     config = uvicorn.Config(
-        app=fastapi_app,
+        app=app,
         host="0.0.0.0",
         port=int(os.getenv("PORT", 5000)),
         log_level="info"
     )
     server = uvicorn.Server(config)
+    logger.info("Starting Uvicorn server", port=os.getenv("PORT", 5000))
     await server.serve()
 
 if __name__ == '__main__':

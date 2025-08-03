@@ -12,3 +12,4 @@ solders
 web3
 python-dotenv
 gunicorn
+structlog
