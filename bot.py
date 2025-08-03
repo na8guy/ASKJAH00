@@ -20,7 +20,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
+from datetime import datetime, timedelta
+from solders.pubkey import Pubkey
 # Solana imports
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
@@ -332,6 +333,50 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
     
     return decrypted_user
 
+async def fetch_latest_token() -> dict:
+    """Fetches the latest token from DexScreener API"""
+    try:
+        async with httpx.AsyncClient() as client:
+            # Get the latest token profile
+            response = await client.get(DEXSCREENER_PROFILE_API)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Find the most recent token
+            if not data or 'data' not in data or not data['data']:
+                return None
+                
+            latest_token = max(
+                data['data'], 
+                key=lambda x: datetime.strptime(x['createdAt'], '%Y-%m-%dT%H:%M:%S.%fZ')
+            )
+            
+            # Get detailed token information
+            token_address = latest_token['address']
+            token_url = DEXSCREENER_TOKEN_API.format(token_address=token_address)
+            token_response = await client.get(token_url)
+            token_response.raise_for_status()
+            token_data = token_response.json()
+            
+            if not token_data or 'data' not in token_data or not token_data['data']:
+                return None
+                
+            token_info = token_data['data'][0]
+            
+            return {
+                'contract_address': token_address,
+                'name': token_info['name'],
+                'symbol': token_info['symbol'],
+                'price_usd': float(token_info['price']),
+                'market_cap': float(token_info['marketCap']),
+                'liquidity': float(token_info['liquidity']),
+                'volume': float(token_info['volume']),
+                'dexscreener_url': f"https://dexscreener.com/solana/{token_address}"
+            }
+    except Exception as e:
+        logger.error(f"Error fetching latest token: {str(e)}")
+        return None
+
 async def get_subscription_status_message(user: dict) -> str:
     if user.get('subscription_status') != 'active':
         return "❌ No active subscription. Use /subscribe to start."
@@ -347,6 +392,34 @@ async def get_subscription_status_message(user: dict) -> str:
         return "❌ Subscription expired. Use /subscribe to renew."
     
     return f"✅ Subscription active until {expiry.strftime('%Y-%m-%d %H:%M:%S')}."
+
+async def check_balance(user_id: int, chain: str) -> float:
+    """Check the native token balance for a specific blockchain chain"""
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        return 0.0
+    
+    try:
+        if chain == 'solana':
+            public_key = user['solana']['public_key']
+            balance = await solana_client.get_balance(Pubkey.from_string(public_key))
+            return balance.value / 10**9  # Convert lamports to SOL
+        
+        elif chain == 'eth':
+            address = user['eth']['address']
+            balance_wei = w3_eth.eth.get_balance(Web3.to_checksum_address(address))
+            return w3_eth.from_wei(balance_wei, 'ether')
+        
+        elif chain == 'bsc':
+            address = user['bsc']['address']
+            balance_wei = w3_bsc.eth.get_balance(Web3.to_checksum_address(address))
+            return w3_bsc.from_wei(balance_wei, 'ether')
+        
+        else:
+            return 0.0
+    except Exception as e:
+        logger.error(f"Error getting {chain} balance for user {user_id}: {str(e)}")
+        return 0.0
 
 # ======================
 # TELEGRAM COMMAND HANDLERS
