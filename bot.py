@@ -1860,10 +1860,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 def main():
     """Main function to start the bot and Flask webhook."""
-    bot_token = os.getenv("TELEGRAM_TOKEN")
+    bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
-        logger.error("TELEGRAM_TOKEN not found in .env file")
-        raise ValueError("TELEGRAM_TOKEN not found in .env file")
+        logger.error("BOT_TOKEN not found in .env file")
+        raise ValueError("BOT_TOKEN not found in .env file")
     
     webhook_url = os.getenv("WEBHOOK_URL")
     if not webhook_url:
