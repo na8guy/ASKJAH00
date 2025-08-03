@@ -48,6 +48,11 @@ from flask import Flask, request, jsonify
 # Other utilities
 from dotenv import load_dotenv
 from mnemonic import Mnemonic
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+
+# Create a thread pool executor
+executor = ThreadPoolExecutor()
 
 # Set up logging
 logging.basicConfig(
@@ -337,67 +342,40 @@ async def fetch_latest_token() -> dict:
     """Fetches the latest Solana token from DexScreener API"""
     try:
         async with httpx.AsyncClient() as client:
-            # Get latest token profiles with Solana filter
-            profile_params = {
-                "sort": "createdAt",
-                "order": "desc",
-                "limit": 1,
-                "chainId": "solana"
-            }
-            response = await client.get(DEXSCREENER_PROFILE_API, params=profile_params)
+            # Get latest token profiles
+            response = await client.get(
+                "https://api.dexscreener.com/latest/dex/tokens/",
+                params={"limit": 1, "sort": "createdAt", "order": "desc", "chainId": "solana"}
+            )
             response.raise_for_status()
-            profile_data = response.json()
+            data = response.json()
             
             # Validate response
-            if not profile_data or 'data' not in profile_data or not profile_data['data']:
-                logger.warning("No tokens found in profile response")
+            if not data or 'pairs' not in data or not data['pairs']:
+                logger.warning("No tokens found in API response")
                 return None
                 
-            token_profile = profile_data['data'][0]
-            token_address = token_profile.get('tokenAddress')
+            token_data = data['pairs'][0]
+            token_address = token_data.get('baseToken', {}).get('address')
+            
             if not token_address:
-                logger.warning("No token address in profile")
+                logger.warning("No token address found")
                 return None
             
-            # Get detailed token information
-            token_url = DEXSCREENER_TOKEN_API.format(token_address=token_address)
-            token_response = await client.get(token_url)
-            token_response.raise_for_status()
-            token_data = token_response.json()
-            
-            if not token_data or 'data' not in token_data or not token_data['data']:
-                logger.warning("No token data found")
-                return None
-                
-            token_info = token_data['data'][0]
-            
-            # Extract social links
-            social_links = {}
-            for link in token_profile.get('links', []):
-                if 'type' in link and 'url' in link:
-                    social_links[link['type']] = link['url']
-            
-            # Extract website if available
-            website = next(
-                (link['url'] for link in token_profile.get('links', []) 
-                if link.get('label') == 'Website'
-            ), '')
-            
+            # Extract token information
             return {
                 'contract_address': token_address,
-                'name': token_profile.get('description', 'Unknown Token').split()[0],
-                'symbol': token_info.get('symbol', 'UNKNOWN'),
-                'price_usd': float(token_info.get('price', 0.0)),
-                'market_cap': float(token_info.get('marketCap', 0.0)),
-                'liquidity': float(token_info.get('liquidity', {}).get('usd', 0.0)),
-                'volume': float(token_info.get('volume', {}).get('h24', 0.0)),
-                'website': website,
-                'socials': social_links,
-                'dexscreener_url': f"https://dexscreener.com/solana/{token_address}"
+                'name': token_data.get('baseToken', {}).get('name', 'Unknown'),
+                'symbol': token_data.get('baseToken', {}).get('symbol', 'UNKNOWN'),
+                'price_usd': float(token_data.get('priceUsd', 0.0)),
+                'liquidity': float(token_data.get('liquidity', {}).get('usd', 0.0)),
+                'volume': float(token_data.get('volume', {}).get('h24', 0.0)),
+                'dexscreener_url': token_data.get('url', f"https://dexscreener.com/solana/{token_address}")
             }
     except Exception as e:
         logger.error(f"Error fetching token: {str(e)}")
         return None
+    
 async def get_subscription_status_message(user: dict) -> str:
     if user.get('subscription_status') != 'active':
         return "❌ No active subscription. Use /subscribe to start."
@@ -689,14 +667,21 @@ def index():
 @app.route('/telegram_webhook', methods=['POST'])
 def telegram_webhook():
     global telegram_application
-    
     if not telegram_application:
         logger.error("Telegram application not initialized")
         return "Service Unavailable", 503
         
     try:
+        # Get the update from the request
         update = Update.de_json(request.get_json(), telegram_application.bot)
-        telegram_application.process_update(update)
+        
+        # Process the update in a separate thread
+        def process_update():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(telegram_application.process_update(update))
+        
+        executor.submit(process_update)
         return "OK", 200
     except Exception as e:
         logger.error(f"Error processing update: {str(e)}")
@@ -759,13 +744,73 @@ def main():
     telegram_app.add_handler(CommandHandler('start', start))
     telegram_app.add_handler(CommandHandler('subscribe', subscribe))
     telegram_app.add_handler(CommandHandler('balance', balance))
-    # Add more handlers as needed...
-    
+    telegram_app.add_handler(CommandHandler('reset_tokens', reset_tokens))
+    telegram_app.add_handler(CommandHandler('cancel', cancel))
+
+    # Add conversation handlers
+    telegram_app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('setmode', set_mode)],
+        states={
+            SET_TRADING_MODE: [CallbackQueryHandler(mode_callback)],
+            SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_auto_buy_amount)],
+            SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_sell_percentage)],
+            SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_loss_percentage)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
+
+    telegram_app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('generate_wallet', generate_wallet)],
+        states={
+            CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
+
+    telegram_app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('set_wallet', set_wallet)],
+        states={
+            SET_WALLET_METHOD: [CallbackQueryHandler(set_wallet_method)],
+            INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_mnemonic)],
+            INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_private_key)],
+            CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
+
+    telegram_app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('trade', trade)],
+        states={
+            SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action)],
+            BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
+            SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
+            CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
+
+    telegram_app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('transfer', transfer)],
+        states={
+            TRANSFER_TOKEN: [CallbackQueryHandler(transfer_token)],
+            TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_amount)],
+            TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_address)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    ))
+
     # Set bot commands
     commands = [
         BotCommand('start', 'Start the bot'),
         BotCommand('subscribe', 'Subscribe to premium features'),
         BotCommand('balance', 'Check your balances'),
+        BotCommand('setmode', 'Set trading mode'),
+        BotCommand('generate_wallet', 'Generate a new wallet'),
+        BotCommand('set_wallet', 'Import an existing wallet'),
+        BotCommand('trade', 'Trade tokens manually'),
+        BotCommand('transfer', 'Transfer tokens'),
+        BotCommand('reset_tokens', 'Reset posted tokens list'),
+        BotCommand('cancel', 'Cancel current operation')
     ]
     telegram_app.bot.set_my_commands(commands)
     
