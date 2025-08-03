@@ -4,7 +4,16 @@ import requests
 import httpx
 import base64
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+    WebhookServer,  # Add WebhookServer
+)
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
 from solders.keypair import Keypair
@@ -1712,104 +1721,139 @@ def main():
         logger.error("BOT_TOKEN not found in .env file")
         raise ValueError("BOT_TOKEN not found in .env file")
 
-    application = Application.builder().token(bot_token).build()
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if not webhook_url:
+        logger.error("WEBHOOK_URL not found in .env file")
+        raise ValueError("WEBHOOK_URL not found in .env file")
 
-    # Conversation handler for setting trading mode
-    set_mode_conv = ConversationHandler(
-        entry_points=[CommandHandler('setmode', set_mode)],
-        states={
-            SET_TRADING_MODE: [CallbackQueryHandler(mode_callback)],
-            SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_auto_buy_amount)],
-            SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_sell_percentage)],
-            SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_loss_percentage)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
+    port = int(os.getenv("PORT", 10000))  # Default to 10000 for Render
 
-    # Conversation handler for generating a new wallet
-    generate_wallet_conv = ConversationHandler(
-        entry_points=[CommandHandler('generate_wallet', generate_wallet)],
-        states={
-            CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
+    try:
+        application = Application.builder().token(bot_token).build()
 
-    # Conversation handler for setting/importing a wallet
-    set_wallet_conv = ConversationHandler(
-        entry_points=[CommandHandler('set_wallet', set_wallet)],
-        states={
-            SET_WALLET_METHOD: [CallbackQueryHandler(set_wallet_method)],
-            INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_mnemonic)],
-            INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_private_key)],
-            CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
+        # Conversation handler for setting trading mode
+        set_mode_conv = ConversationHandler(
+            entry_points=[CommandHandler('setmode', set_mode)],
+            states={
+                SET_TRADING_MODE: [CallbackQueryHandler(mode_callback)],
+                SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_auto_buy_amount)],
+                SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_sell_percentage)],
+                SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_loss_percentage)],
+            },
+            fallbacks=[CommandHandler('cancel', cancel)]
+        )
 
-    # Conversation handler for trading
-    trade_conv = ConversationHandler(
-        entry_points=[CommandHandler('trade', trade)],
-        states={
-            SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action)],
-            BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
-            SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
-            CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
+        # Conversation handler for generating a new wallet
+        generate_wallet_conv = ConversationHandler(
+            entry_points=[CommandHandler('generate_wallet', generate_wallet)],
+            states={
+                CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet)],
+            },
+            fallbacks=[CommandHandler('cancel', cancel)]
+        )
 
-    # Conversation handler for transferring tokens
-    transfer_conv = ConversationHandler(
-        entry_points=[CommandHandler('transfer', transfer)],
-        states={
-            TRANSFER_TOKEN: [CallbackQueryHandler(transfer_token)],
-            TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_amount)],
-            TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_address)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
+        # Conversation handler for setting/importing a wallet
+        set_wallet_conv = ConversationHandler(
+            entry_points=[CommandHandler('set_wallet', set_wallet)],
+            states={
+                SET_WALLET_METHOD: [CallbackQueryHandler(set_wallet_method)],
+                INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_mnemonic)],
+                INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_private_key)],
+                CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet)],
+            },
+            fallbacks=[CommandHandler('cancel', cancel)]
+        )
 
-    # Add handlers to the application
-    application.add_handler(set_mode_conv)
-    application.add_handler(generate_wallet_conv)
-    application.add_handler(set_wallet_conv)
-    application.add_handler(trade_conv)
-    application.add_handler(transfer_conv)
-    application.add_handler(CommandHandler('subscribe', subscribe))
-    application.add_handler(CommandHandler('balance', balance))
-    application.add_handler(CommandHandler('reset_tokens', reset_tokens))
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('cancel', cancel))
+        # Conversation handler for trading
+        trade_conv = ConversationHandler(
+            entry_points=[CommandHandler('trade', trade)],
+            states={
+                SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action)],
+                BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
+                SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
+                CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade)],
+            },
+            fallbacks=[CommandHandler('cancel', cancel)]
+        )
 
-    # Set bot commands for the menu
-    commands = [
-        BotCommand('start', 'Start the bot and create/view wallet'),
-        BotCommand('subscribe', 'Subscribe to access trading features ($5/week via USDT)'),
-        BotCommand('setmode', 'Set trading mode (manual or automatic)'),
-        BotCommand('generate_wallet', 'Generate a new wallet'),
-        BotCommand('set_wallet', 'Import an existing wallet'),
-        BotCommand('trade', 'Trade Solana tokens manually'),
-        BotCommand('balance', 'Check wallet balance and holdings'),
-        BotCommand('transfer', 'Transfer Solana tokens'),
-        BotCommand('reset_tokens', 'Reset posted tokens list'),
-        BotCommand('cancel', 'Cancel current operation')
-    ]
-    application.bot.set_my_commands(commands)
+        # Conversation handler for transferring tokens
+        transfer_conv = ConversationHandler(
+            entry_points=[CommandHandler('transfer', transfer)],
+            states={
+                TRANSFER_TOKEN: [CallbackQueryHandler(transfer_token)],
+                TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_amount)],
+                TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_address)],
+            },
+            fallbacks=[CommandHandler('cancel', cancel)]
+        )
 
-    # Start periodic subscription check
-    application.job_queue.run_repeating(subscription_check, interval=3600, first=10)
+        # Add handlers to the application
+        application.add_handler(set_mode_conv)
+        application.add_handler(generate_wallet_conv)
+        application.add_handler(set_wallet_conv)
+        application.add_handler(trade_conv)
+        application.add_handler(transfer_conv)
+        application.add_handler(CommandHandler('subscribe', subscribe))
+        application.add_handler(CommandHandler('balance', balance))
+        application.add_handler(CommandHandler('reset_tokens', reset_tokens))
+        application.add_handler(CommandHandler('start', start))
+        application.add_handler(CommandHandler('cancel', cancel))
 
-    # Start Flask app in a separate thread
-    def run_flask():
-        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+        # Set bot commands for the menu
+        commands = [
+            BotCommand('start', 'Start the bot and create/view wallet'),
+            BotCommand('subscribe', 'Subscribe to access trading features ($5/week via USDT)'),
+            BotCommand('setmode', 'Set trading mode (manual or automatic)'),
+            BotCommand('generate_wallet', 'Generate a new wallet'),
+            BotCommand('set_wallet', 'Import an existing wallet'),
+            BotCommand('trade', 'Trade Solana tokens manually'),
+            BotCommand('balance', 'Check wallet balance and holdings'),
+            BotCommand('transfer', 'Transfer Solana tokens'),
+            BotCommand('reset_tokens', 'Reset posted tokens list'),
+            BotCommand('cancel', 'Cancel current operation')
+        ]
+        application.bot.set_my_commands(commands)
 
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+        # Start periodic subscription check
+        application.job_queue.run_repeating(subscription_check, interval=3600, first=10)
 
-    # Start the bot
-    logger.info("Starting bot polling")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Add Telegram webhook endpoint
+        @app.route('/webhook/telegram', methods=['POST'])
+        async def telegram_webhook():
+            logger.debug(f"Received webhook request: {request.get_json()}")
+            try:
+                update = Update.de_json(request.get_json(), application.bot)
+                if not update:
+                    logger.error("Invalid Telegram update received")
+                    return jsonify({'error': 'Invalid update'}), 400
+                await application.process_update(update)
+                logger.debug("Telegram update processed successfully")
+                return jsonify({'status': 'ok'}), 200
+            except Exception as e:
+                logger.error(f"Error processing Telegram update: {str(e)}")
+                return jsonify({'error': 'Processing failed'}), 500
+
+        # Add health check endpoint
+        @app.route('/')
+        def health():
+            return jsonify({'status': 'ok'})
+
+        logger.info(f"Starting Flask app with WebhookServer on port {port}")
+        webhook_server = WebhookServer('0.0.0.0', port, app)
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            application.run_webhook(
+                webhook_server=webhook_server,
+                webhook_path='/webhook/telegram',
+                webhook_url=f"{webhook_url}/webhook/telegram",
+                close_loop=False
+            )
+        )
+        return app  # Return Flask app for gunicorn
+
+    except Exception as e:
+        logger.error(f"Error in main: {str(e)}")
+        raise
 
 if __name__ == '__main__':
     main()
