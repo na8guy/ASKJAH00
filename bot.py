@@ -355,50 +355,61 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.debug(f"Start command received for user {user_id}")
-    user = users_collection.find_one({'user_id': user_id})
-    if not user:
-        mnemo = Mnemonic("english")
-        mnemonic = mnemo.generate(strength=256)
-        try:
-            user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
-            users_collection.insert_one(user_data)
-            decrypted_user = await decrypt_user_wallet(user_id, user_data)
-            message = await update.message.reply_text(
-                f"Welcome to the Multi-Chain Trading Bot!\n\n"
-                f"A new wallet has been created for you.\n"
-                f"**Mnemonic**: {decrypted_user['mnemonic']}\n"
-                f"**Solana Public Key**: {user_data['solana']['public_key']}\n"
-                f"**ETH/BSC Address**: {user_data['eth']['address'] if user_data['eth'] else 'N/A'}\n\n"
-                f"⚠️ **Security Warning** ⚠️\n"
-                f"1. **Never share your mnemonic or private keys**.\n"
-                f"2. Store them securely offline.\n"
-                f"3. This message will auto-delete in 30 seconds.\n"
-                f"4. Use this wallet only for trading small amounts.\n\n"
-                f"To access trading features, subscribe using /subscribe.",
+    
+    try:
+        user = users_collection.find_one({'user_id': user_id})
+        if not user:
+            # Generate a new wallet
+            mnemo = Mnemonic("english")
+            mnemonic = mnemo.generate(strength=256)
+            try:
+                user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
+                users_collection.insert_one(user_data)
+                decrypted_user = await decrypt_user_wallet(user_id, user_data)
+                
+                # Send wallet details with security warning
+                message = await update.message.reply_text(
+                    f"Welcome to the Multi-Chain Trading Bot!\n\n"
+                    f"A new wallet has been created for you.\n"
+                    f"**Solana Public Key**: {user_data['solana']['public_key']}\n"
+                    f"**ETH/BSC Address**: {user_data['eth']['address'] if user_data['eth'] else 'N/A'}\n\n"
+                    f"⚠️ **Security Warning** ⚠️\n"
+                    f"1. **Never share your mnemonic or private keys**.\n"
+                    f"2. Store them securely offline.\n"
+                    f"3. Use this wallet only for trading small amounts.\n\n"
+                    f"To access trading features, subscribe using /subscribe.",
+                    parse_mode='HTML'
+                )
+                
+                # Send mnemonic in a separate private message
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"🔒 **Your Recovery Phrase** 🔒\n\n{decrypted_user['mnemonic']}\n\n"
+                             f"⚠️ Save this in a secure location. Never share it with anyone.",
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send mnemonic to user {user_id}: {str(e)}")
+                
+                logger.info(f"New wallet created for user {user_id}")
+            except Exception as e:
+                logger.error(f"Error creating wallet for user {user_id}: {str(e)}")
+                await update.message.reply_text(f"Error creating wallet: {str(e)}")
+        else:
+            subscription_message = await get_subscription_status_message(user)
+            await update.message.reply_text(
+                f"Welcome back!\n"
+                f"Solana wallet: {user['solana']['public_key']}\n"
+                f"ETH/BSC wallet: {user['eth']['address'] if user['eth'] else 'N/A'}\n"
+                f"{subscription_message}\n"
+                f"Use /set_wallet to import a different wallet.",
                 parse_mode='HTML'
             )
-            context.job_queue.run_once(
-                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=message.message_id),
-                30,
-                user_id=user_id,
-                name=f"delete_start_message_{user_id}"
-            )
-            logger.info(f"New wallet created for user {user_id}")
-        except Exception as e:
-            logger.error(f"Error creating wallet for user {user_id}: {str(e)}")
-            await update.message.reply_text(f"Error creating wallet: {str(e)}")
-            return
-    else:
-        subscription_message = await get_subscription_status_message(user)
-        await update.message.reply_text(
-            f"Welcome back!\n"
-            f"Solana wallet: {user['solana']['public_key']}\n"
-            f"ETH/BSC wallet: {user['eth']['address'] if user['eth'] else 'N/A'}\n"
-            f"{subscription_message}\n"
-            f"Use /set_wallet to import a different wallet.",
-            parse_mode='HTML'
-        )
-        logger.info(f"User {user_id} returned, subscription status checked")
+            logger.info(f"User {user_id} returned, subscription status checked")
+    except Exception as e:
+        logger.error(f"Error in start command: {str(e)}")
+        await update.message.reply_text(f"Error: {str(e)}")
 
 async def get_subscription_status_message(user: dict) -> str:
     user_id = user['user_id']
@@ -1645,30 +1656,67 @@ async def setup_webhook():
     return application
 
 def main():
+    global application
     try:
-        loop = asyncio.get_event_loop()
-        global application
+        # Create a new event loop for the main thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Create and initialize the application
         application = loop.run_until_complete(setup_webhook())
+        application.initialize()
+        application.start()
+        logger.info("Telegram application initialized and started")
         
         @app.route('/webhook/telegram', methods=['POST'])
-        async def telegram_webhook():
+        def telegram_webhook():  # Remove async from Flask route
             try:
                 update = Update.de_json(request.get_json(), application.bot)
                 if not update:
                     logger.error("Invalid Telegram update received")
                     return jsonify({'error': 'Invalid update'}), 400
-                await application.process_update(update)
+                
+                # Process update in a thread-safe manner
+                loop.run_until_complete(application.process_update(update))
                 logger.debug("Telegram update processed successfully")
                 return jsonify({'status': 'ok'}), 200
             except Exception as e:
                 logger.error(f"Error processing Telegram update: {str(e)}")
                 return jsonify({'error': 'Processing failed'}), 500
 
-        logger.info(f"Starting Flask app with gunicorn on port {PORT}")
-        return app  # Return Flask app for gunicorn
+        @app.route('/status')
+        def status():
+            try:
+                # Test MongoDB connection
+                mongo_client.server_info()
+                mongo_status = "connected"
+                
+                # Test Telegram bot connection
+                bot_info = application.bot.get_me()
+                telegram_status = f"connected as @{bot_info.username}"
+                
+                return jsonify({
+                    'status': 'online',
+                    'mongo': mongo_status,
+                    'telegram': telegram_status,
+                    'timestamp': datetime.now().isoformat()
+                }), 200
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': str(e)
+                }), 500
+
+        logger.info(f"Starting Flask app on port {PORT}")
+        app.run(host='0.0.0.0', port=PORT)
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")
         raise
+    finally:
+        logger.info("Shutting down application")
+        if application:
+            application.stop()
+            application.shutdown()
 
 if __name__ == '__main__':
     main()
