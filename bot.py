@@ -74,6 +74,13 @@ async def webhook():
         logger.error(f"Webhook error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+
+@app.before_first_request
+def log_server_startup():
+    logger.info("Flask application starting up...")
+    logger.info(f"Environment variables: PORT={os.getenv('PORT')}, WEBHOOK_URL={os.getenv('WEBHOOK_URL')}")
+    logger.info("Ensure Render is using 'gunicorn bot:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT' as the start command.")
+
 GMGN_API_HOST = 'https://gmgn.ai'
 
 # MongoDB setup with retry logic
