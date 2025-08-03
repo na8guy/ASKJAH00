@@ -337,20 +337,23 @@ async def fetch_latest_token() -> dict:
     """Fetches the latest Solana token from DexScreener API"""
     try:
         async with httpx.AsyncClient() as client:
-            # Get latest token profiles
-            response = await client.get(
-                DEXSCREENER_PROFILE_API,
-                params={"sort": "createdAt", "order": "desc", "limit": 1, "chainId": "solana"}
-            )
+            # Get latest token profiles with Solana filter
+            profile_params = {
+                "sort": "createdAt",
+                "order": "desc",
+                "limit": 1,
+                "chainId": "solana"
+            }
+            response = await client.get(DEXSCREENER_PROFILE_API, params=profile_params)
             response.raise_for_status()
-            data = response.json()
+            profile_data = response.json()
             
             # Validate response
-            if not data or 'data' not in data or not data['data']:
+            if not profile_data or 'data' not in profile_data or not profile_data['data']:
                 logger.warning("No tokens found in profile response")
                 return None
                 
-            token_profile = data['data'][0]
+            token_profile = profile_data['data'][0]
             token_address = token_profile.get('tokenAddress')
             if not token_address:
                 logger.warning("No token address in profile")
@@ -374,24 +377,27 @@ async def fetch_latest_token() -> dict:
                 if 'type' in link and 'url' in link:
                     social_links[link['type']] = link['url']
             
+            # Extract website if available
+            website = next(
+                (link['url'] for link in token_profile.get('links', []) 
+                if link.get('label') == 'Website'
+            ), '')
+            
             return {
                 'contract_address': token_address,
-                'name': token_info.get('name', token_profile.get('description', 'Unknown')).split()[0],
+                'name': token_profile.get('description', 'Unknown Token').split()[0],
                 'symbol': token_info.get('symbol', 'UNKNOWN'),
                 'price_usd': float(token_info.get('price', 0.0)),
                 'market_cap': float(token_info.get('marketCap', 0.0)),
                 'liquidity': float(token_info.get('liquidity', {}).get('usd', 0.0)),
                 'volume': float(token_info.get('volume', {}).get('h24', 0.0)),
-                'image': token_profile.get('icon', ''),
-                'website': next((link['url'] for link in token_profile.get('links', []) 
-                               if link.get('label') == 'Website'), ''),
+                'website': website,
                 'socials': social_links,
                 'dexscreener_url': f"https://dexscreener.com/solana/{token_address}"
             }
     except Exception as e:
         logger.error(f"Error fetching token: {str(e)}")
         return None
-
 async def get_subscription_status_message(user: dict) -> str:
     if user.get('subscription_status') != 'active':
         return "❌ No active subscription. Use /subscribe to start."
@@ -584,15 +590,9 @@ async def periodic_token_check(context: ContextTypes.DEFAULT_TYPE):
         users = users_collection.find({'subscription_status': 'active'})
         for user in users:
             user_id = user['user_id']
-
-            
             
             # Skip if token already posted
             if token['contract_address'] in user.get('posted_tokens', []):
-                continue
-            
-            # Rate limiting
-            if time.time() - user.get('last_api_call', 0) < 1:
                 continue
             
             # Prepare token info
@@ -601,22 +601,22 @@ async def periodic_token_check(context: ContextTypes.DEFAULT_TYPE):
             
             # Format social links
             social_links = "\n".join(
-            [f"{k.capitalize()}: {v}" for k, v in token.get('socials', {}).items()]
-        ) or "N/A"
-        
-        # Create message
+                [f"- {k.capitalize()}: {v}" for k, v in token.get('socials', {}).items()]
+            ) or "No social links available"
+            
             message = (
-            f"🚀 *New Token Alert* 🚀\n\n"
-            f"*Name:* {token['name']} ({token['symbol']})\n"
-            f"*Contract:* `{token['contract_address']}`\n"
-            f"*Price:* ${token['price_usd']:.6f}\n"
-            f"*Market Cap:* ${token['market_cap']:,.2f}\n"
-            f"*Liquidity:* ${token['liquidity']:,.2f}\n"
-            f"*24h Volume:* ${token['volume']:,.2f}\n"
-            f"*Website:* {token['website'] or 'N/A'}\n"
-            f"*Socials:*\n{social_links}\n\n"
-            f"[View on DexScreener]({token['dexscreener_url']})"
-        )
+                f"🚀 *New Token Alert* 🚀\n\n"
+                f"*Name:* {token['name']} ({token['symbol']})\n"
+                f"*Contract:* `{token['contract_address']}`\n"
+                f"*Price:* ${token['price_usd']:.6f}\n"
+                f"*Market Cap:* ${token['market_cap']:,.2f}\n"
+                f"*Liquidity:* ${token['liquidity']:,.2f}\n"
+                f"*24h Volume:* ${token['volume']:,.2f}\n"
+                f"*Website:* {token['website'] or 'N/A'}\n"
+                f"*Socials:*\n{social_links}\n\n"
+                f"{warning}\n"
+                f"[View on DexScreener]({token['dexscreener_url']})"
+            )
             
             # Create buttons
             keyboard = [
@@ -787,7 +787,7 @@ def main():
     # Assign to global
     telegram_application = telegram_app
     
-    # Start Flask in the main thread (remove threading)
+    # Start Flask in the main thread
     logger.info(f"Starting Flask server on port {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
