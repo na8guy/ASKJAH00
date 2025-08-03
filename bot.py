@@ -36,10 +36,7 @@ try:
     from flask import Flask, request, jsonify
 except ImportError:
     raise ImportError("Missing 'flask' package. Install it with: pip install flask")
-try:
-    from binance.client import Client as BinanceClient
-except ImportError:
-    raise ImportError("Missing 'python-binance' package. Install it with: pip install python-binance")
+
 from datetime import datetime, timedelta
 import time
 import os
@@ -138,7 +135,7 @@ USDT_ABI = [
 usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
 
 # Binance client for USDT price
-binance_client = BinanceClient()
+
 
 # DexScreener API endpoints
 DEXSCREENER_PROFILE_API = "https://api.dexscreener.com/token-profiles/latest/v1"
