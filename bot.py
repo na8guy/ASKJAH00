@@ -1,4 +1,5 @@
 import asyncio
+from email.mime import application
 import logging
 import requests
 import httpx
@@ -1578,6 +1579,13 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int, token: di
 # Flask app for webhook
 app = Flask(__name__)
 
+@app.route('/telegram_webhook', methods=['POST'])
+def telegram_webhook():
+    """Handle Telegram updates via webhook"""
+    update = Update.de_json(request.get_json(), application.bot)
+    application.process_update(update)
+    return '', 200
+
 @app.route('/webhook/usdt', methods=['POST'])
 def usdt_webhook():
     data = request.json
@@ -1748,6 +1756,72 @@ async def periodic_token_check(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error sending token to user {user_id}: {str(e)}")
 
 
+async def periodic_token_check(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic job to check for new tokens"""
+    logger.debug("Running periodic token check")
+    token = await fetch_latest_token()
+    if not token:
+        logger.debug("No new token found")
+        return
+    
+    # Get all subscribed users
+    users = users_collection.find({'subscription_status': 'active'})
+    for user in users:
+        user_id = user['user_id']
+        
+        # Skip if token was already posted
+        if token['contract_address'] in user.get('posted_tokens', []):
+            continue
+        
+        # Rate limit API calls
+        if time.time() - user.get('last_api_call', 0) < 1:
+            continue
+        
+        try:
+            is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
+            warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
+            
+            message = (
+                f"<b>New Solana Token Alert</b>\n"
+                f"Name: {token['name']} ({token['symbol']})\n"
+                f"Contract: {token['contract_address']}\n"
+                f"Price: ${token['price_usd']:.6f}\n"
+                f"Market Cap: ${token['market_cap']:,.2f}\n"
+                f"Liquidity: ${token['liquidity']:,.2f}\n"
+                f"24h Volume: ${token['volume']:,.2f}\n"
+                f"{warning}"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
+                [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            
+            # Update user's last API call and posted tokens
+            users_collection.update_one(
+                {'user_id': user_id},
+                {
+                    '$set': {'last_api_call': time.time()},
+                    '$addToSet': {'posted_tokens': token['contract_address']}
+                }
+            )
+            
+            # Trigger auto-trade if enabled
+            if user['trading_mode'] == 'automatic':
+                await auto_trade(context, user_id=user_id, token=token)
+                
+        except Exception as e:
+            logger.error(f"Error sending token to user {user_id}: {str(e)}")
+
+
 async def subscription_check(context: ContextTypes.DEFAULT_TYPE):
     """Periodic job to check and update subscription statuses"""
     logger.debug("Running subscription check")
@@ -1786,11 +1860,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 def main():
     """Main function to start the bot and Flask webhook."""
-    bot_token = os.getenv("BOT_TOKEN")  # Changed from BOT_TOKEN to TELEGRAM_TOKEN
+    bot_token = os.getenv("TELEGRAM_TOKEN")
     if not bot_token:
-        logger.error("BOT_TOKEN not found in .env file")
-        raise ValueError("BOT_TOKEN not found in .env file")
-
+        logger.error("TELEGRAM_TOKEN not found in .env file")
+        raise ValueError("TELEGRAM_TOKEN not found in .env file")
+    
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if not webhook_url:
+        logger.error("WEBHOOK_URL not found in .env file")
+        raise ValueError("WEBHOOK_URL not found in .env file")
+    
     # Create and configure the bot application
     application = Application.builder().token(bot_token).build()
 
@@ -1866,28 +1945,25 @@ def main():
         BotCommand('reset_tokens', 'Reset posted tokens list'),
         BotCommand('cancel', 'Cancel current operation')
     ]
-    
+    application.bot.set_my_commands(commands)
+
     # Start periodic jobs
     application.job_queue.run_repeating(subscription_check, interval=3600, first=10)
     application.job_queue.run_repeating(periodic_token_check, interval=10, first=5)
 
-    # Start Flask in a separate process
-    from multiprocessing import Process
-    flask_process = Process(target=run_flask_app)
-    flask_process.daemon = True
-    flask_process.start()
-    logger.info("Started Flask app in separate process")
+    # Set up webhook
+    async def set_webhook():
+        await application.bot.set_webhook(
+            url=f"{webhook_url}/telegram_webhook",
+            drop_pending_updates=True
+        )
+        logger.info(f"Webhook set to {webhook_url}/telegram_webhook")
 
-    # Start the bot
-    logger.info("Starting bot polling")
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
+    # Run the webhook setup in the event loop
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(set_webhook())
 
-def run_flask_app():
-    """Run the Flask app in a separate process"""
+    # Start Flask app
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-
 if __name__ == '__main__':
     main()
