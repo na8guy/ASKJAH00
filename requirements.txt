@@ -5,10 +5,10 @@ base58
 mnemonic
 pymongo
 cryptography
-flask
-gunicorn
+fastapi
+uvicorn[standard]
 solana
 solders
 web3
 python-dotenv
-uvicorn
+gunicorn
