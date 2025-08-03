@@ -186,8 +186,9 @@ USDT_ABI = [
 usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
 
 # DexScreener API endpoints
-DEXSCREENER_PROFILE_API = "https://api.dexscreener.com/token-profiles/latest/v1"
-DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
+
+DEXSCREENER_LATEST_API = "https://api.dexscreener.com/token-profiles/latest/v1"
+DEXSCREENER_PAIR_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
 
 # Bot states for conversation
 (SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
@@ -1094,55 +1095,63 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return SELECT_TOKEN_ACTION
 
 async def fetch_token_by_contract(contract_address: str):
-    """Fetch token data by contract address"""
+    """Fetch token data by contract address using pair API"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+    }
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            # Fetch token details directly
-            token_url = DEXSCREENER_TOKEN_API.format(token_address=contract_address)
-            token_response = await client.get(token_url)
-            token_response.raise_for_status()
-            token_data = token_response.json()
+            # Fetch token pair details directly
+            logger.debug(f"Fetching token by contract: {contract_address}")
+            pair_url = DEXSCREENER_PAIR_API.format(token_address=contract_address)
+            pair_response = await client.get(pair_url, headers=headers)
+            logger.debug(f"Pair API status: {pair_response.status_code}")
             
-            if not token_data or not token_data.get('pairs') or not token_data['pairs']:
-                logger.error(f"No token data found for contract: {contract_address}")
+            if pair_response.status_code != 200:
+                logger.error(f"Pair API failed: {pair_response.status_code} - {pair_response.text}")
                 return None
                 
-            pair_data = token_data['pairs'][0]
+            pair_data = pair_response.json()
+            
+            if not pair_data or not pair_data.get('pairs') or not pair_data['pairs']:
+                logger.error(f"No pair data found for contract: {contract_address}")
+                return None
+                
+            pair = pair_data['pairs'][0]
             
             # Extract token information
-            token = {
-                'name': pair_data.get('baseToken', {}).get('name', 'Unknown'),
-                'symbol': pair_data.get('baseToken', {}).get('symbol', 'UNKNOWN'),
+            base_token = pair.get('baseToken', {})
+            token_info = {
+                'name': base_token.get('name', 'Unknown'),
+                'symbol': base_token.get('symbol', 'UNKNOWN'),
                 'contract_address': contract_address,
-                'price_usd': float(pair_data.get('priceUsd', 0)),
-                'market_cap': float(pair_data.get('fdv', 0)),
-                'liquidity': float(pair_data.get('liquidity', {}).get('usd', 0)),
-                'volume': float(pair_data.get('volume', {}).get('h24', 0)),
-                'dexscreener_url': pair_data.get('url', f"https://dexscreener.com/solana/{contract_address}"),
-                'image': pair_data.get('baseToken', {}).get('logoURI', '')
+                'price_usd': float(pair.get('priceUsd', 0)),
+                'market_cap': float(pair.get('fdv', 0)),
+                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
+                'volume': float(pair.get('volume', {}).get('h24', 0)),
+                'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{contract_address}"),
+                'image': base_token.get('logoURI', '')
             }
             
-            # Fetch additional details from profile if available
+            # Try to get social links from profile API
             try:
-                profile_url = f"{DEXSCREENER_PROFILE_API}?tokenAddress={contract_address}"
-                profile_response = await client.get(profile_url)
-                if profile_response.is_success:
+                logger.debug("Trying to fetch profile for social links")
+                profile_url = f"{DEXSCREENER_LATEST_API}?tokenAddress={contract_address}"
+                profile_response = await client.get(profile_url, headers=headers)
+                if profile_response.status_code == 200:
                     profile_data = profile_response.json()
                     if profile_data and isinstance(profile_data, list) and profile_data[0]:
-                        profile = profile_data[0]
-                        token['website'] = next(
-                            (link['url'] for link in profile.get('links', []) 
-                             if link.get('label') == 'Website'), ''
-                        )
-                        token['socials'] = {
+                        token_info['socials'] = {
                             link['type']: link['url'] 
-                            for link in profile.get('links', []) 
+                            for link in profile_data[0].get('links', []) 
                             if link.get('type')
                         }
             except Exception as e:
-                logger.warning(f"Couldn't fetch profile data: {str(e)}")
+                logger.warning(f"Couldn't fetch social links: {str(e)}")
             
-            return token
+            return token_info
+            
         except Exception as e:
             logger.error(f"Error fetching token by contract: {str(e)}")
             return None
@@ -1486,57 +1495,88 @@ async def transfer_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return TRANSFER_ADDRESS
 
 async def fetch_latest_token():
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+    }
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            # First fetch token profiles
-            response = await client.get(DEXSCREENER_PROFILE_API, params={'chainId': 'solana'})
-            response.raise_for_status()
+            # Step 1: Fetch latest token profiles
+            logger.debug("Fetching latest token profiles")
+            response = await client.get(DEXSCREENER_LATEST_API, headers=headers)
+            logger.debug(f"Latest API status: {response.status_code}")
+            
+            if response.status_code != 200:
+                logger.error(f"Latest API failed: {response.status_code} - {response.text}")
+                return None
+                
             data = response.json()
-            
-            # Get the first valid token
-            token = next((t for t in data if isinstance(t, dict) and t.get('chainId') == 'solana'), None)
-            if not token:
+            if not data:
+                logger.error("Empty response from latest API")
                 return None
                 
-            token_address = token.get('tokenAddress', '')
+            # Find Solana tokens
+            solana_tokens = [t for t in data if isinstance(t, dict) and t.get('chainId') == 'solana']
+            if not solana_tokens:
+                logger.error("No Solana tokens found in response")
+                return None
+                
+            token_profile = solana_tokens[0]
+            token_address = token_profile.get('tokenAddress', '')
+            
             if not token_address:
+                logger.error("Token address not found in token data")
                 return None
                 
-            # Now fetch detailed token information
-            token_url = DEXSCREENER_TOKEN_API.format(token_address=token_address)
-            token_response = await client.get(token_url)
-            token_response.raise_for_status()
-            token_data = token_response.json()
+            # Step 2: Fetch token pair details
+            logger.debug(f"Fetching pair details for: {token_address}")
+            pair_url = DEXSCREENER_PAIR_API.format(token_address=token_address)
+            pair_response = await client.get(pair_url, headers=headers)
+            logger.debug(f"Pair API status: {pair_response.status_code}")
             
-            if not token_data or not token_data.get('pairs') or not token_data['pairs']:
+            if pair_response.status_code != 200:
+                logger.error(f"Pair API failed: {pair_response.status_code} - {pair_response.text}")
                 return None
                 
-            pair_data = token_data['pairs'][0]
+            pair_data = pair_response.json()
             
-            # Properly extract token information
-            base_token = pair_data.get('baseToken', {})
-            token = {
+            if not pair_data or not pair_data.get('pairs') or not pair_data['pairs']:
+                logger.error("No pairs data found in token response")
+                return None
+                
+            pair = pair_data['pairs'][0]
+            
+            # Extract token information
+            base_token = pair.get('baseToken', {})
+            token_info = {
                 'name': base_token.get('name', 'Unknown'),
                 'symbol': base_token.get('symbol', 'UNKNOWN'),
                 'contract_address': token_address,
-                'price_usd': float(pair_data.get('priceUsd', 0)),
-                'market_cap': float(pair_data.get('fdv', 0)),
-                'liquidity': float(pair_data.get('liquidity', {}).get('usd', 0)),
-                'volume': float(pair_data.get('volume', {}).get('h24', 0)),
-                'dexscreener_url': pair_data.get('url', f"https://dexscreener.com/solana/{token_address}"),
-                'image': base_token.get('logoURI', '')
+                'price_usd': float(pair.get('priceUsd', 0)),
+                'market_cap': float(pair.get('fdv', 0)),
+                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
+                'volume': float(pair.get('volume', {}).get('h24', 0)),
+                'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{token_address}"),
+                'image': base_token.get('logoURI', ''),
+                'socials': {}
             }
             
-            # Add social links if available
-            socials = {}
-            for link in token.get('links', []):
-                if link.get('type'):
-                    socials[link['type']] = link['url']
-            token['socials'] = socials
+            # Add social links from the profile
+            for link in token_profile.get('links', []):
+                if isinstance(link, dict) and link.get('type'):
+                    token_info['socials'][link['type']] = link['url']
             
-            return token
+            logger.debug(f"Successfully fetched token: {token_info['name']}")
+            return token_info
+            
+        except httpx.ReadTimeout:
+            logger.error("DexScreener API timeout")
+            return None
+        except httpx.ConnectError:
+            logger.error("Connection error to DexScreener API")
+            return None
         except Exception as e:
-            logger.error(f"Token fetch error: {str(e)}")
+            logger.error(f"Unexpected error in fetch_latest_token: {str(e)}", exc_info=True)
             return None
 
 def format_token_message(token):
