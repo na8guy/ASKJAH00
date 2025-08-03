@@ -175,6 +175,11 @@ USDT_ABI = [
 ]
 usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
 
+if 'global_posted_tokens' not in db.list_collection_names():
+    db.create_collection('global_posted_tokens')
+    db.global_posted_tokens.create_index('contract_address', unique=True)
+    db.global_posted_tokens.create_index('timestamp', expireAfterSeconds=86400)  # 24h expiration
+
 # DexScreener API endpoints
 DEXSCREENER_PROFILE_API = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
@@ -381,13 +386,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error in start for user {user_id}: {str(e)}")
             return
 
-    if context.job_queue is None:
-        await update.message.reply_text(
-            "Error: JobQueue is not available. Install 'python-telegram-bot[job-queue]'."
-        )
-        logger.error("JobQueue is not initialized.")
-        return
-    context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
 
 async def get_subscription_status_message(user: dict) -> str:
     if user.get('subscription_status') != 'active':
@@ -447,10 +445,15 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Deadline: {payment_deadline.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Your subscription will activate automatically after payment is confirmed."
         )
+        await start_token_updates(context, user_id)
     except Exception as e:
         logger.error(f"Error creating subscription for user {user_id}: {str(e)}")
         await update.message.reply_text("Error initiating subscription. Please try again later.")
     return
+
+
+
+   
 
 async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
@@ -1367,23 +1370,75 @@ async def fetch_latest_token():
             logger.error(f"Error fetching token: {str(e)}")
             return None
 
+
+async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Start token updates for a subscribed user"""
+    # Check if the user already has a job running
+    current_jobs = context.job_queue.get_jobs_by_name(f"token_updates_{user_id}")
+    if current_jobs:
+        logger.debug(f"Token updates already running for user {user_id}")
+        return
+    
+    logger.debug(f"Starting token updates for user {user_id}")
+    
+    # Schedule the token update job
+    context.job_queue.run_repeating(
+        update_token_info,
+        interval=30,  # Check every 30 seconds
+        first=5,       # First run in 5 seconds
+        user_id=user_id,
+        name=f"token_updates_{user_id}"  # Unique name for this job
+    )
+
 async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.user_id
+    logger.debug(f"Running token update check for user {user_id}")
+    
     user = users_collection.find_one({'user_id': user_id})
     if not user:
+        logger.debug(f"No user found for user_id {user_id}, cancelling job")
+        context.job.schedule_removal()
         return
+        
     if not await check_subscription(user_id):
+        logger.debug(f"User {user_id} subscription not active, cancelling job")
+        context.job.schedule_removal()
         return
-    if time.time() - user['last_api_call'] < 1:
+    
+    # Add rate limiting to prevent too frequent checks
+    last_check = user.get('last_token_check', 0)
+    if time.time() - last_check < 30:
         return
     
     token = await fetch_latest_token()
     if not token:
         return
     
-    posted_tokens = user.get('posted_tokens', [])
-    if token['contract_address'] in posted_tokens:
+    # Check global posted tokens collection
+    global_posted = db.global_posted_tokens
+    if global_posted.find_one({'contract_address': token['contract_address']}):
+        logger.debug(f"Token {token['contract_address']} already posted globally")
         return
+    
+    # Check if this user has already seen this token
+    if token['contract_address'] in user.get('posted_tokens', []):
+        logger.debug(f"User {user_id} already saw token {token['contract_address']}")
+        return
+    
+    # Add token to global posted tokens
+    global_posted.insert_one({
+        'contract_address': token['contract_address'],
+        'timestamp': datetime.now()
+    })
+    
+    # Update user's last check time and add to their posted tokens
+    users_collection.update_one(
+        {'user_id': user_id},
+        {
+            '$set': {'last_token_check': time.time()},
+            '$addToSet': {'posted_tokens': token['contract_address']}
+        }
+    )
     
     is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
     warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
@@ -1429,6 +1484,7 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
             await auto_trade(context, user_id=user_id, token=token)
     except Exception as e:
         logger.error(f"Error sending token info: {str(e)}")
+        context.job.schedule_removal()
 
 async def check_balance(user_id, chain):
     user = users_collection.find_one({'user_id': user_id})
