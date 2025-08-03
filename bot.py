@@ -1793,29 +1793,21 @@ async def debug_info():
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.on_event("startup")
-async def verify_webhook():
-    try:
-        webhook_info = await application.bot.get_webhook_info()
-        logger.info("Current webhook info", webhook_info=webhook_info.to_dict())
-        expected_url = os.getenv("WEBHOOK_URL")
-        if webhook_info.url != expected_url:
-            logger.warning(
-                "Webhook URL mismatch",
-                current_url=webhook_info.url,
-                expected_url=expected_url
-            )
-            await application.bot.set_webhook(url=expected_url)
-            logger.info("Webhook reset successfully", url=expected_url)
-        else:
-            logger.info("Webhook URL is correctly set", url=webhook_info.url)
-    except Exception as e:
-        logger.error("Failed to verify webhook on startup", error=str(e), exc_info=True)
+async def startup_event():
+    logger.info(
+        "FastAPI application starting",
+        environment={
+            "PORT": os.getenv("PORT"),
+            "WEBHOOK_URL": os.getenv("WEBHOOK_URL"),
+            "TELEGRAM_TOKEN_SET": bool(os.getenv("TELEGRAM_TOKEN"))
+        }
+    )
 
 async def main():
     global application
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     if not TELEGRAM_TOKEN:
-        logger.error("Missing TELEGRAM_TOKEN in environment variables")
+        logger.error("Missing TELEGRAM_TOKEN", exc_info=True)
         raise ValueError("TELEGRAM_TOKEN not found in .env file")
     
     application = (
@@ -1827,17 +1819,33 @@ async def main():
     
     setup_handlers(application)
     
+    logger.info("Initializing Telegram application")
     await application.initialize()
+    
     webhook_url = os.getenv("WEBHOOK_URL")
     if not webhook_url:
-        logger.error("Missing WEBHOOK_URL in environment variables")
+        logger.error("Missing WEBHOOK_URL", exc_info=True)
         raise ValueError("WEBHOOK_URL not found in .env file")
     
-    logger.info("Initializing application", webhook_url=webhook_url)
-    await application.bot.set_webhook(url=webhook_url)
-    logger.info("Webhook set successfully", url=webhook_url)
+    # Verify and set webhook
+    try:
+        webhook_info = await application.bot.get_webhook_info()
+        logger.info("Current webhook info", webhook_info=webhook_info.to_dict())
+        if webhook_info.url != webhook_url:
+            logger.warning(
+                "Webhook URL mismatch",
+                current_url=webhook_info.url,
+                expected_url=webhook_url
+            )
+            await application.bot.set_webhook(url=webhook_url)
+            logger.info("Webhook reset successfully", url=webhook_url)
+        else:
+            logger.info("Webhook URL is correctly set", url=webhook_info.url)
+    except Exception as e:
+        logger.error("Failed to verify/set webhook", error_message=str(e), exc_info=True)
+        raise
     
-    # Run FastAPI app with uvicorn
+    logger.info("Starting FastAPI server", webhook_url=webhook_url)
     config = uvicorn.Config(
         app=app,
         host="0.0.0.0",
