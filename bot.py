@@ -104,6 +104,13 @@ for attempt in range(max_retries):
         db = mongo_client.get_database('trading_bot')
         users_collection = db.users
         users_collection.create_index('user_id', unique=True)
+        
+        # Initialize global posted tokens collection
+        if 'global_posted_tokens' not in db.list_collection_names():
+            db.create_collection('global_posted_tokens')
+            db.global_posted_tokens.create_index('contract_address', unique=True)
+            db.global_posted_tokens.create_index('timestamp', expireAfterSeconds=86400)  # 24h expiration
+            logger.info("Created global_posted_tokens collection with indexes")
         break
     except ConnectionFailure as e:
         logger.error(f"Attempt {attempt + 1} failed to connect to MongoDB Atlas: {str(e)}")
@@ -174,11 +181,6 @@ USDT_ABI = [
     }
 ]
 usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
-
-if 'global_posted_tokens' not in db.list_collection_names():
-    db.create_collection('global_posted_tokens')
-    db.global_posted_tokens.create_index('contract_address', unique=True)
-    db.global_posted_tokens.create_index('timestamp', expireAfterSeconds=86400)  # 24h expiration
 
 # DexScreener API endpoints
 DEXSCREENER_PROFILE_API = "https://api.dexscreener.com/token-profiles/latest/v1"
@@ -386,7 +388,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error in start for user {user_id}: {str(e)}")
             return
 
-
 async def get_subscription_status_message(user: dict) -> str:
     if user.get('subscription_status') != 'active':
         return "You do not have an active subscription. Use /subscribe to start a weekly subscription."
@@ -401,6 +402,25 @@ async def get_subscription_status_message(user: dict) -> str:
             {'$set': {'subscription_status': 'inactive', 'subscription_expiry': None}}
         )
         return "Your subscription has expired. Use /subscribe to renew."
+
+async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Start token updates for a subscribed user"""
+    # Check if the user already has a job running
+    current_jobs = context.job_queue.get_jobs_by_name(f"token_updates_{user_id}")
+    if current_jobs:
+        logger.debug(f"Token updates already running for user {user_id}")
+        return
+    
+    logger.debug(f"Starting token updates for user {user_id}")
+    
+    # Schedule the token update job
+    context.job_queue.run_repeating(
+        update_token_info,
+        interval=30,  # Check every 30 seconds
+        first=5,       # First run in 5 seconds
+        user_id=user_id,
+        name=f"token_updates_{user_id}"  # Unique name for this job
+    )
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -438,6 +458,9 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         )
 
+        # Start token updates after setting up payment
+        await start_token_updates(context, user_id)
+        
         await update.message.reply_text(
             f"To subscribe ($5/week), send {usdt_amount:.6f} USDT to:\n"
             f"Address: {payment_address}\n"
@@ -445,15 +468,10 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Deadline: {payment_deadline.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Your subscription will activate automatically after payment is confirmed."
         )
-        await start_token_updates(context, user_id)
     except Exception as e:
         logger.error(f"Error creating subscription for user {user_id}: {str(e)}")
         await update.message.reply_text("Error initiating subscription. Please try again later.")
     return
-
-
-
-   
 
 async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
@@ -519,7 +537,6 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
         )
         logger.error("JobQueue is not initialized.")
         return ConversationHandler.END
-    context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
     return ConversationHandler.END
 
 async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -659,7 +676,6 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 logger.error("JobQueue is not initialized.")
                 return ConversationHandler.END
-            context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
             return ConversationHandler.END
         except Exception as e:
             message = await update.message.reply_text(
@@ -751,7 +767,6 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 )
                 logger.error("JobQueue is not initialized.")
                 return ConversationHandler.END
-            context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
             return ConversationHandler.END
         except Exception as e:
             message = await update.message.reply_text(
@@ -807,7 +822,6 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             logger.error("JobQueue is not initialized.")
             return ConversationHandler.END
-        context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
         return ConversationHandler.END
     except Exception as e:
         await query.message.reply_text(f"Error importing wallet: {str(e)}. Please start over with /set_wallet.")
@@ -942,8 +956,13 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Failed to fetch token data. Try again later.")
         return ConversationHandler.END
     
+    # Check global posted tokens
+    if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
+        await update.message.reply_text("This token has already been posted recently.")
+        return ConversationHandler.END
+    
     if token['contract_address'] in user.get('posted_tokens', []):
-        await update.message.reply_text("No new unique tokens available at this time. Try again later or use /reset_tokens to clear posted tokens.")
+        await update.message.reply_text("You've already seen this token. Use /reset_tokens to clear your history.")
         return ConversationHandler.END
     
     context.user_data['current_token'] = token
@@ -963,6 +982,12 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         parse_mode='HTML',
         reply_markup=reply_markup
     )
+    
+    # Update global and user token records
+    db.global_posted_tokens.insert_one({
+        'contract_address': token['contract_address'],
+        'timestamp': datetime.now()
+    })
     users_collection.update_one(
         {'user_id': user_id},
         {'$addToSet': {'posted_tokens': token['contract_address']}}
@@ -1370,29 +1395,9 @@ async def fetch_latest_token():
             logger.error(f"Error fetching token: {str(e)}")
             return None
 
-
-async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """Start token updates for a subscribed user"""
-    # Check if the user already has a job running
-    current_jobs = context.job_queue.get_jobs_by_name(f"token_updates_{user_id}")
-    if current_jobs:
-        logger.debug(f"Token updates already running for user {user_id}")
-        return
-    
-    logger.debug(f"Starting token updates for user {user_id}")
-    
-    # Schedule the token update job
-    context.job_queue.run_repeating(
-        update_token_info,
-        interval=30,  # Check every 30 seconds
-        first=5,       # First run in 5 seconds
-        user_id=user_id,
-        name=f"token_updates_{user_id}"  # Unique name for this job
-    )
-
 async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.user_id
-    logger.debug(f"Running token update check for user {user_id}")
+    logger.debug(f"Running token update for user {user_id}")
     
     user = users_collection.find_one({'user_id': user_id})
     if not user:
@@ -1405,18 +1410,18 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
         context.job.schedule_removal()
         return
     
-    # Add rate limiting to prevent too frequent checks
+    # Rate limit token checks (once every 30 seconds)
     last_check = user.get('last_token_check', 0)
     if time.time() - last_check < 30:
         return
     
     token = await fetch_latest_token()
     if not token:
+        logger.debug("Failed to fetch token data")
         return
     
-    # Check global posted tokens collection
-    global_posted = db.global_posted_tokens
-    if global_posted.find_one({'contract_address': token['contract_address']}):
+    # Check global posted tokens
+    if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
         logger.debug(f"Token {token['contract_address']} already posted globally")
         return
     
@@ -1426,7 +1431,7 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Add token to global posted tokens
-    global_posted.insert_one({
+    db.global_posted_tokens.insert_one({
         'contract_address': token['contract_address'],
         'timestamp': datetime.now()
     })
@@ -1445,7 +1450,7 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
     
     social_links = "\n".join([f"{k.capitalize()}: {v}" for k, v in token['socials'].items()])
     message = (
-        f"<b>ASKJAH GEM Solana Token</b>\n"
+        f"<b>New Solana Token Detected</b>\n"
         f"Name: {token['name']} ({token['symbol']})\n\n"
         f"Contract: {token['contract_address']}\n\n"
         f"Price: ${token['price_usd']:.6f}\n"
@@ -1472,19 +1477,12 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML',
             reply_markup=reply_markup
         )
-        users_collection.update_one(
-            {'user_id': user_id},
-            {
-                '$set': {'last_api_call': time.time()},
-                '$addToSet': {'posted_tokens': token['contract_address']}
-            }
-        )
         
+        # Auto-trade logic if in automatic mode
         if user['trading_mode'] == 'automatic':
             await auto_trade(context, user_id=user_id, token=token)
     except Exception as e:
         logger.error(f"Error sending token info: {str(e)}")
-        context.job.schedule_removal()
 
 async def check_balance(user_id, chain):
     user = users_collection.find_one({'user_id': user_id})
