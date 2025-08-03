@@ -187,8 +187,8 @@ usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
 
 # DexScreener API endpoints
 
-DEXSCREENER_LATEST_API = "https://api.dexscreener.com/token-profiles/latest/v1"
-DEXSCREENER_PAIR_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
+DEXSCREENER_PROFILE_API = "https://api.dexscreener.com/token-profiles/latest/v1"
+DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
 
 # Bot states for conversation
 (SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
@@ -416,29 +416,47 @@ async def get_subscription_status_message(user: dict) -> str:
 
 async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.debug(f"Manual token fetch by user {user_id}")
+    
     try:
         if not await check_subscription(user_id):
             await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
             return
 
+        # Rate limiting
+        user = users_collection.find_one({'user_id': user_id})
+        current_time = time.time()
+        if user.get('last_api_call', 0) > current_time - 1:
+            await update.message.reply_text("Please wait at least 1 second between fetches.")
+            return
+
         # Fetch token
+        logger.debug("Starting token fetch")
         token = await fetch_latest_token()
+        
         if not token:
+            logger.error("Token fetch returned None")
             await update.message.reply_text("Failed to fetch token data. Please try again later.")
             return
+            
+        logger.info(f"Fetched token: {token.get('name')} ({token.get('contract_address')})")
 
         # Check if already posted
         if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
+            logger.info("Token already posted globally")
             await update.message.reply_text("This token has already been posted recently.")
             return
 
         user = users_collection.find_one({'user_id': user_id})
         if token['contract_address'] in user.get('posted_tokens', []):
+            logger.info("User already saw this token")
             await update.message.reply_text("You've already seen this token. Use /reset_tokens to clear your history.")
             return
 
         # Format token info
         message = format_token_message(token)
+        is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
+        warning = "⚠️ *LOW LIQUIDITY - Trade with caution!*\n" if is_suspicious else ""
     
         # Create buttons
         keyboard = [
@@ -451,25 +469,25 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
             if token.get('image'):
                 await update.message.reply_photo(
                     photo=token['image'],
-                    caption=message,
+                    caption=warning + message,
                     parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
             else:
                 await update.message.reply_text(
-                    message,
+                    warning + message,
                     parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
         except Exception as e:
             logger.error(f"Error sending token: {str(e)}")
             await update.message.reply_text(
-                f"✅ Fetched {token['name']}!\n" + message,
+                warning + message,
                 parse_mode='Markdown',
                 reply_markup=reply_markup
             )
         
-        # Update global and user token records
+        # Update records
         try:
             db.global_posted_tokens.insert_one({
                 'contract_address': token['contract_address'],
@@ -480,15 +498,19 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             users_collection.update_one(
                 {'user_id': user_id},
-                {'$addToSet': {'posted_tokens': token['contract_address']}}
+                {
+                    '$set': {'last_api_call': current_time},
+                    '$addToSet': {'posted_tokens': token['contract_address']}
+                }
             )
+            logger.info("Token records updated")
         except Exception as e:
             logger.error(f"Error updating token records: {str(e)}")
             
     except Exception as e:
         logger.error(f"Error in manual token fetch: {str(e)}", exc_info=True)
         await update.message.reply_text("An error occurred while fetching tokens. Please try again.")
-
+        
 async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = users_collection.find_one({'user_id': user_id})
@@ -1495,80 +1517,107 @@ async def transfer_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return TRANSFER_ADDRESS
 
 async def fetch_latest_token():
+    """Fetch latest Solana token from DexScreener APIs asynchronously."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            # Step 1: Fetch latest token profiles
-            logger.debug("Fetching latest token profiles")
-            response = await client.get(DEXSCREENER_LATEST_API, headers=headers)
-            logger.debug(f"Latest API status: {response.status_code}")
+            # Step 1: Fetch latest token from profile API
+            logger.debug("Fetching token profiles")
+            response = await client.get(DEXSCREENER_PROFILE_API, 
+                                      params={'chainId': 'solana'}, 
+                                      headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"Latest API failed: {response.status_code} - {response.text}")
+                logger.error(f"Profile API failed: {response.status_code} - {response.text}")
                 return None
-                
+            
             data = response.json()
-            if not data:
-                logger.error("Empty response from latest API")
+            
+            # Check if data is a list
+            if not isinstance(data, list):
+                logger.error(f"Expected list from profile API, got {type(data)}")
                 return None
-                
-            # Find Solana tokens
-            solana_tokens = [t for t in data if isinstance(t, dict) and t.get('chainId') == 'solana']
+            
+            logger.debug(f"Received {len(data)} tokens from profile API")
+            
+            # Filter Solana tokens
+            solana_tokens = [token for token in data if isinstance(token, dict) and token.get('chainId') == 'solana']
             if not solana_tokens:
-                logger.error("No Solana tokens found in response")
+                logger.warning("No Solana tokens found in profile API response")
                 return None
-                
+            
+            # Get the first token
             token_profile = solana_tokens[0]
             token_address = token_profile.get('tokenAddress', '')
-            
             if not token_address:
-                logger.error("Token address not found in token data")
+                logger.warning("No tokenAddress found in token data")
                 return None
-                
-            # Step 2: Fetch token pair details
-            logger.debug(f"Fetching pair details for: {token_address}")
-            pair_url = DEXSCREENER_PAIR_API.format(token_address=token_address)
-            pair_response = await client.get(pair_url, headers=headers)
-            logger.debug(f"Pair API status: {pair_response.status_code}")
             
-            if pair_response.status_code != 200:
-                logger.error(f"Pair API failed: {pair_response.status_code} - {pair_response.text}")
+            # Step 2: Fetch detailed token data
+            logger.debug(f"Fetching token details for {token_address}")
+            token_url = DEXSCREENER_TOKEN_API.format(token_address=token_address)
+            token_response = await client.get(token_url, headers=headers)
+            
+            if token_response.status_code != 200:
+                logger.error(f"Token API failed: {token_response.status_code} - {token_response.text}")
                 return None
-                
-            pair_data = pair_response.json()
             
-            if not pair_data or not pair_data.get('pairs') or not pair_data['pairs']:
-                logger.error("No pairs data found in token response")
+            token_data = token_response.json()
+            
+            # Handle token_data as a list of pairs
+            if not isinstance(token_data, list):
+                logger.error(f"Expected list from token API, got {type(token_data)}")
                 return None
-                
-            pair = pair_data['pairs'][0]
             
-            # Extract token information
-            base_token = pair.get('baseToken', {})
-            token_info = {
-                'name': base_token.get('name', 'Unknown'),
-                'symbol': base_token.get('symbol', 'UNKNOWN'),
+            if not token_data:
+                logger.warning("No token pairs found in token API response")
+                return None
+            
+            # Select the first pair (most relevant)
+            pair_data = token_data[0]
+            
+            if not isinstance(pair_data, dict):
+                logger.error(f"Expected dict for pair data, got {type(pair_data)}")
+                return None
+
+            # Extract fields from profile API token
+            name = token_profile.get('description', 'Unknown').split()[0] if token_profile.get('description') else 'Unknown'
+            symbol = token_profile.get('url', '').split('/')[-1].upper() if token_profile.get('url') else 'Unknown'
+            website = next((link['url'] for link in token_profile.get('links', []) if link.get('label') == 'Website'), '')
+            social_links = {link['type']: link['url'] for link in token_profile.get('links', []) if link.get('type')}
+            dexscreener_url = f"https://dexscreener.com/solana/{token_address}"
+
+            # Extract fields from token API pair
+            price_usd = float(pair_data.get('priceUsd', '0.0'))
+            market_cap = float(pair_data.get('marketCap', 0.0))
+            liquidity = float(pair_data.get('liquidity', {}).get('usd', 0.0))
+            volume = float(pair_data.get('volume', {}).get('h24', 0.0))
+            
+            # Use pair data names if available
+            name_main = pair_data.get('name', name)
+            symbol_main = pair_data.get('symbol', symbol)
+            
+            # Get image from either source
+            image = token_profile.get('icon', '')
+            if not image:
+                image = pair_data.get('baseToken', {}).get('logoURI', '')
+
+            return {
+                'name':  name_main,
+                'symbol': symbol_main,
                 'contract_address': token_address,
-                'price_usd': float(pair.get('priceUsd', 0)),
-                'market_cap': float(pair.get('fdv', 0)),
-                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
-                'volume': float(pair.get('volume', {}).get('h24', 0)),
-                'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{token_address}"),
-                'image': base_token.get('logoURI', ''),
-                'socials': {}
+                'price_usd': price_usd,
+                'market_cap': market_cap,
+                'image': image,
+                'website': website,
+                'socials': social_links,
+                'liquidity': liquidity,
+                'volume': volume,
+                'dexscreener_url': dexscreener_url
             }
-            
-            # Add social links from the profile
-            for link in token_profile.get('links', []):
-                if isinstance(link, dict) and link.get('type'):
-                    token_info['socials'][link['type']] = link['url']
-            
-            logger.debug(f"Successfully fetched token: {token_info['name']}")
-            return token_info
-            
         except httpx.ReadTimeout:
             logger.error("DexScreener API timeout")
             return None
@@ -1576,11 +1625,11 @@ async def fetch_latest_token():
             logger.error("Connection error to DexScreener API")
             return None
         except Exception as e:
-            logger.error(f"Unexpected error in fetch_latest_token: {str(e)}", exc_info=True)
+            logger.error(f"Unexpected error fetching token: {str(e)}", exc_info=True)
             return None
 
 def format_token_message(token):
-    """Create beautifully formatted token message"""
+    """Create formatted token message with improved social links"""
     # Emoji mapping for social platforms
     platform_icons = {
         'telegram': '📢',
@@ -1592,6 +1641,8 @@ def format_token_message(token):
     
     # Build social links
     social_links = ""
+    if token.get('website'):
+        social_links += f"🌐 [Website]({token['website']})\n"
     for platform, url in token.get('socials', {}).items():
         icon = platform_icons.get(platform.lower(), '🔗')
         social_links += f"{icon} [{platform.capitalize()}]({url})\n"
@@ -1605,105 +1656,87 @@ def format_token_message(token):
         f"📈 *24h Volume:* ${token.get('volume', 0):,.2f}\n\n"
         f"🔗 *Contract:* `{token.get('contract_address', '')}`\n\n"
         f"🔗 *Links:*\n{social_links or 'No links available'}\n"
-        f"{'⚠️ *LOW LIQUIDITY - Trade with caution!*' if token.get('liquidity', 0) < 1000 else ''}\n"
         f"[📊 View Chart]({token.get('dexscreener_url', '')})"
     )
 
 async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
+    """Periodically update and send unique Solana token info."""
     user_id = context.job.user_id
-    job_name = context.job.name
-    logger.info(f"🏁 Starting job: {job_name} for user {user_id}")
+    logger.debug(f"Starting auto token fetch for user {user_id}")
     
     try:
-        # Check if user exists and is subscribed
         user = users_collection.find_one({'user_id': user_id})
         if not user:
-            logger.info(f"User {user_id} not found, cancelling job")
+            logger.info(f"User {user_id} not found in database")
             context.job.schedule_removal()
             return
             
         if not await check_subscription(user_id):
-            logger.info(f"User {user_id} not subscribed, cancelling job")
+            logger.info(f"User {user_id} subscription inactive")
             context.job.schedule_removal()
             return
         
-        logger.info(f"User {user_id} is active, fetching token...")
+        # Rate limiting: 1 request per second
+        current_time = time.time()
+        if user.get('last_api_call', 0) > current_time - 1:
+            logger.debug("Skipping due to rate limit")
+            return
         
-        # Fetch token with retries
-        token = None
-        for attempt in range(3):
-            token = await fetch_latest_token()
-            if token:
-                break
-            logger.warning(f"Attempt {attempt+1} failed for user {user_id}")
-            await asyncio.sleep(2)
-        
+        token = await fetch_latest_token()
         if not token:
-            logger.error(f"Failed to fetch token after 3 attempts for user {user_id}")
-            # Notify user
-            await context.bot.send_message(
-                user_id,
-                "⚠️ Failed to fetch new tokens this cycle. Will retry in 30 seconds."
-            )
+            logger.warning("Token fetch returned None")
             return
         
-        # Check if token is valid
-        if 'contract_address' not in token or not token['contract_address']:
-            logger.error(f"Invalid token data: {token}")
-            return
+        logger.debug(f"Fetched token: {token['name']} ({token['contract_address']})")
         
-        # Relaxed global token tracking (1-hour window)
-        existing_global = db.global_posted_tokens.find_one({
-            'contract_address': token['contract_address'],
-            'timestamp': {'$gt': datetime.now() - timedelta(hours=1)}
-        })
-        
-        if existing_global:
-            logger.info(f"Token {token['contract_address']} already posted globally")
+        # Check for duplicates
+        if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
+            logger.debug("Token already posted globally")
             return
             
         if token['contract_address'] in user.get('posted_tokens', []):
-            logger.info(f"User {user_id} already saw token {token['contract_address']}")
+            logger.debug("User already saw this token")
             return
         
-        logger.info(f"New token found: {token['contract_address']} for user {user_id}")
-        
-        # Format and send token
+        # Format token info
         message = format_token_message(token)
+        is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
+        warning = "⚠️ *LOW LIQUIDITY - Trade with caution!*\n" if is_suspicious else ""
+        
+        # Create buttons
         keyboard = [
             [InlineKeyboardButton("💰 Buy", callback_data=f"buy_{token['contract_address']}"),
              InlineKeyboardButton("💸 Sell", callback_data=f"sell_{token['contract_address']}")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Try to send with image
+        # Send to user
         try:
             if token.get('image'):
                 await context.bot.send_photo(
                     chat_id=user_id,
                     photo=token['image'],
-                    caption=message,
+                    caption=warning + message,
                     parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
             else:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=message,
+                    text=warning + message,
                     parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
         except Exception as e:
             logger.error(f"Error sending token: {str(e)}")
-            # Fallback to text only
             await context.bot.send_message(
                 user_id,
-                message,
+                warning + message,
                 parse_mode='Markdown',
                 reply_markup=reply_markup
             )
         
-        # Update global and user token records
+        # Update records
         try:
             db.global_posted_tokens.insert_one({
                 'contract_address': token['contract_address'],
@@ -1714,23 +1747,23 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
             
             users_collection.update_one(
                 {'user_id': user_id},
-                {'$addToSet': {'posted_tokens': token['contract_address']}}
+                {
+                    '$set': {'last_api_call': current_time},
+                    '$addToSet': {'posted_tokens': token['contract_address']}
+                }
             )
+            logger.info("Token records updated")
         except Exception as e:
             logger.error(f"Error updating token records: {str(e)}")
         
-        logger.info(f"✅ Token sent to user {user_id}")
-        
+        # Auto trade if enabled
+        if user.get('trading_mode') == 'automatic':
+            await auto_trade(context, user_id, token)
+            
     except Exception as e:
-        logger.error(f"🔥 Critical error in job {job_name}: {str(e)}", exc_info=True)
-        # Try to notify user
-        try:
-            await context.bot.send_message(
-                user_id,
-                f"⚠️ Critical error in token update: {str(e)}"
-            )
-        except:
-            pass
+        logger.error(f"Error in auto token update: {str(e)}", exc_info=True)
+
+
 async def check_balance(user_id, chain):
     user = users_collection.find_one({'user_id': user_id})
     if not user:
