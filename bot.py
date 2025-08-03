@@ -43,8 +43,6 @@ import os
 from dotenv import load_dotenv
 from web3 import Web3
 from eth_account import Account
-import threading
-
 
 # Set up logging
 logging.basicConfig(
@@ -58,39 +56,51 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 # Load environment variables
 load_dotenv()
 
-# Flask app for health check
+# Flask app for health check and Telegram webhook
 app = Flask(__name__)
 
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'ok'})
 
-def run_flask():
-    port = int(os.getenv('PORT', 8080))
-    # Run Flask without Werkzeug's reloader to avoid event loop issues
-    app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
+@app.route('/webhook', methods=['POST'])
+async def webhook():
+    try:
+        update = Update.de_json(request.get_json(), application.bot)
+        if update:
+            await application.process_update(update)
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 GMGN_API_HOST = 'https://gmgn.ai'
 
-# MongoDB setup
+# MongoDB setup with retry logic
 MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
     logger.error("MONGO_URI not found in .env file")
     raise ValueError("MONGO_URI not found in .env file")
-try:
-    logger.debug("Connecting to MongoDB")
-    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    mongo_client.admin.command('ping')
-    logger.debug("MongoDB connection successful")
-    db = mongo_client.get_database('trading_bot')
-    users_collection = db.users
-    users_collection.create_index('user_id', unique=True)
-except ConnectionFailure as e:
-    logger.error(f"Failed to connect to MongoDB Atlas: {str(e)}")
-    raise
-except Exception as e:
-    logger.error(f"Unexpected error in MongoDB setup: {str(e)}")
-    raise
+max_retries = 3
+for attempt in range(max_retries):
+    try:
+        logger.debug("Connecting to MongoDB")
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30000)
+        mongo_client.admin.command('ping')
+        logger.debug("MongoDB connection successful")
+        db = mongo_client.get_database('trading_bot')
+        users_collection = db.users
+        users_collection.create_index('user_id', unique=True)
+        break
+    except ConnectionFailure as e:
+        logger.error(f"Attempt {attempt + 1} failed to connect to MongoDB Atlas: {str(e)}")
+        if attempt < max_retries - 1:
+            time.sleep(5)
+            continue
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in MongoDB setup: {str(e)}")
+        raise
 
 # Master key for encryption
 MASTER_KEY = os.getenv("MASTER_KEY")
@@ -126,7 +136,7 @@ try:
     if not Web3.is_address(BOT_USDT_ADDRESS):
         logger.error("Invalid BOT_USDT_ADDRESS: Not a valid Ethereum address")
         raise ValueError("Invalid BOT_USDT_ADDRESS: Not a valid Ethereum address")
-    BOT_USDT_ADDRESS = Web3.to_checksum_address(BOT_USDT_ADDRESS)  # Ensure checksum format
+    BOT_USDT_ADDRESS = Web3.to_checksum_address(BOT_USDT_ADDRESS)
 except Exception as e:
     logger.error(f"Error validating BOT_USDT_ADDRESS: {str(e)}")
     raise ValueError(f"Error validating BOT_USDT_ADDRESS: {str(e)}")
@@ -360,7 +370,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.job_queue is None:
         await update.message.reply_text(
-            "Error: JobQueue is not available. Please install 'python-telegram-bot[job-queue]'."
+            "Error: JobQueue is not available. Install 'python-telegram-bot[job-queue]'."
         )
         logger.error("JobQueue is not initialized.")
         return
@@ -398,7 +408,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        usdt_amount = 5.0  # Updated to $5/week as per your code
+        usdt_amount = 5.0
         usdt_amount_wei = int(usdt_amount * 10**6)
 
         user_key = derive_user_key(user_id)
@@ -889,7 +899,7 @@ async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(
                 "Error: JobQueue is not available. Install 'python-telegram-bot[job-queue]'."
             )
-            logger.error("JobQueue is not initialized for auto trading.")
+            logger.error("JobQueue is not initialized.")
             return ConversationHandler.END
         if user['trading_mode'] == 'automatic':
             context.job_queue.run_repeating(auto_trade, interval=5, first=0, user_id=user_id)
@@ -1573,207 +1583,145 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int, token: di
             if success:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"Sold {token['name']} at {price_change:.2f}% loss to stop further losses."
+                    text=f"Stopped loss for {token['name']} at {price_change:.2f}% loss."
                 )
                 users_collection.update_one(
                     {'user_id': user_id},
-    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
-)
-        else:
-            balance = await check_balance(user_id, 'solana')
-            if balance >= user['auto_buy_amount']:
-                success = await execute_trade(user_id, token['contract_address'], user['auto_buy_amount'], 'buy', 'solana')
-                if success:
-                    users_collection.update_one(
-                        {'user_id': user_id},
-                        {'$set': {f'portfolio.{token["contract_address"]}': {
-                            'name': token['name'],
-                            'symbol': token['symbol'],
-                            'amount': user['auto_buy_amount'],
-                            'buy_price': token['price_usd']
-                        }}}
-                    )
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"Automatically bought {user['auto_buy_amount']} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
-                    )
-
-async def check_payment(context: ContextTypes.DEFAULT_TYPE):
-    users = users_collection.find({'payment_address': {'$ne': None}})
-    for user in users:
-        user_id = user['user_id']
-        payment_address = user['payment_address']
-        expected_amount = user['expected_amount']
-        deadline = user.get('payment_deadline')
-        if deadline and isinstance(deadline, str):
-            deadline = datetime.fromisoformat(deadline)
-        if deadline and datetime.now() > deadline:
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': {'payment_address': None, 'expected_amount': None, 'payment_deadline': None}}
-            )
-            continue
-        try:
-            balance = usdt_contract.functions.balanceOf(payment_address).call()
-            if balance >= expected_amount:
-                expiry = datetime.now() + timedelta(days=7)
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {
-                        '$set': {
-                            'subscription_status': 'active',
-                            'subscription_expiry': expiry.isoformat(),
-                            'payment_address': None,
-                            'expected_amount': None,
-                            'payment_deadline': None
-                        }
-                    }
+                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
                 )
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"Payment confirmed! Your subscription is active until {expiry.strftime('%Y-%m-%d %H:%M:%S')}."
-                )
-                if context.job_queue:
-                    context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
-        except Exception as e:
-            logger.error(f"Error checking payment for user {user_id}: {str(e)}")
+        return
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    balance = await check_balance(user_id, 'solana')
+    if balance < user['auto_buy_amount']:
+        logger.debug(f"Insufficient balance for auto-buy for user {user_id}: {balance} SOL available")
+        return
+
+    success = await execute_trade(user_id, token['contract_address'], user['auto_buy_amount'], 'buy', 'solana')
+    if success:
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {f'portfolio.{token["contract_address"]}': {
+                'name': token['name'],
+                'symbol': token['symbol'],
+                'amount': user['auto_buy_amount'],
+                'buy_price': token['price_usd']
+            }}}
+        )
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"Automatically bought {user['auto_buy_amount']} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
+        )
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
-    if update and update.message:
+    if update:
         await update.message.reply_text("An error occurred. Please try again or contact support.")
 
-# Flask app for health check
-
-async def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        logger.error("TELEGRAM_BOT_TOKEN not found in .env file")
-        raise ValueError("TELEGRAM_BOT_TOKEN not found in .env file")
-    
-    # Initialize Telegram application
-    application = Application.builder().token(token).build()
-
-    # Set up command and conversation handlers
+def setup_handlers(application: Application):
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("subscribe", subscribe))
-    application.add_handler(CommandHandler("balance", balance))
-    application.add_handler(CommandHandler("reset_tokens", reset_tokens))
-    
-    generate_wallet_handler = ConversationHandler(
-        entry_points=[CommandHandler('generate_wallet', generate_wallet)],
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("generate_wallet", generate_wallet)],
         states={
-            CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet, pattern='^(confirm_new_wallet|cancel_new_wallet)$')],
+            CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet, pattern='^(confirm_new_wallet|cancel_new_wallet)$')]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    application.add_handler(generate_wallet_handler)
-    
-    set_wallet_handler = ConversationHandler(
-        entry_points=[CommandHandler('set_wallet', set_wallet)],
+        fallbacks=[CommandHandler("cancel", cancel)]
+    ))
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("set_wallet", set_wallet)],
         states={
             SET_WALLET_METHOD: [CallbackQueryHandler(set_wallet_method, pattern='^(mnemonic|private_key)$')],
             INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_mnemonic)],
             INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_private_key)],
-            CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet, pattern='^(confirm_set_wallet|cancel_set_wallet)$')],
+            CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet, pattern='^(confirm_set_wallet|cancel_set_wallet)$')]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    application.add_handler(set_wallet_handler)
-    
-    set_mode_handler = ConversationHandler(
-        entry_points=[CommandHandler('setmode', set_mode)],
+        fallbacks=[CommandHandler("cancel", cancel)]
+    ))
+    application.add_handler(CommandHandler("reset_tokens", reset_tokens))
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("setmode", set_mode)],
         states={
             SET_TRADING_MODE: [CallbackQueryHandler(mode_callback, pattern='^(manual|automatic)$')],
             SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_auto_buy_amount)],
             SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_sell_percentage)],
-            SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_loss_percentage)],
+            SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_loss_percentage)]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    application.add_handler(set_mode_handler)
-    
-    trade_handler = ConversationHandler(
-        entry_points=[CommandHandler('trade', trade)],
+        fallbacks=[CommandHandler("cancel", cancel)]
+    ))
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("trade", trade)],
         states={
             SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action, pattern='^(buy|sell)_')],
             BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
             SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
-            CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade, pattern='^(confirm_trade|cancel_trade)$')],
+            CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade, pattern='^(confirm_trade|cancel_trade)$')]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    application.add_handler(trade_handler)
-    
-    transfer_handler = ConversationHandler(
-        entry_points=[CommandHandler('transfer', transfer)],
+        fallbacks=[CommandHandler("cancel", cancel)]
+    ))
+    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("transfer", transfer)],
         states={
             TRANSFER_TOKEN: [CallbackQueryHandler(transfer_token)],
             TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_amount)],
-            TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_address)],
+            TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_address)]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    application.add_handler(transfer_handler)
-    
+        fallbacks=[CommandHandler("cancel", cancel)]
+    ))
     application.add_error_handler(error_handler)
+
+async def set_webhook():
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    if not TELEGRAM_TOKEN or not WEBHOOK_URL:
+        logger.error("TELEGRAM_TOKEN or WEBHOOK_URL not found in .env file")
+        raise ValueError("TELEGRAM_TOKEN or WEBHOOK_URL not found in .env file")
     
-    # Set up commands
-    await application.bot.set_my_commands([
-        BotCommand("start", "Start the bot and create/import wallet"),
-        BotCommand("subscribe", "Subscribe to access trading features"),
+    bot = application.bot
+    webhook_info = await bot.get_webhook_info()
+    if webhook_info.url != WEBHOOK_URL:
+        await bot.set_webhook(url=WEBHOOK_URL)
+        logger.info(f"Webhook set to {WEBHOOK_URL}")
+    else:
+        logger.info("Webhook already set correctly")
+
+async def main():
+    global application
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN not found in .env file")
+        raise ValueError("TELEGRAM_TOKEN not found in .env file")
+    
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    setup_handlers(application)
+    
+    await set_webhook()
+    
+    commands = [
+        BotCommand("start", "Start the bot and create or view wallet"),
+        BotCommand("subscribe", "Subscribe to use trading features"),
         BotCommand("generate_wallet", "Generate a new wallet"),
         BotCommand("set_wallet", "Import an existing wallet"),
-        BotCommand("setmode", "Set trading mode (manual/automatic)"),
-        BotCommand("trade", "Manually trade Solana tokens"),
-        BotCommand("balance", "Check wallet balance and holdings"),
-        BotCommand("transfer", "Transfer Solana tokens"),
         BotCommand("reset_tokens", "Reset posted tokens list"),
+        BotCommand("setmode", "Set trading mode (manual/automatic)"),
+        BotCommand("trade", "Trade Solana tokens manually"),
+        BotCommand("balance", "Check wallet balance"),
+        BotCommand("transfer", "Transfer Solana tokens"),
         BotCommand("cancel", "Cancel current operation")
-    ])
+    ]
+    await application.bot.set_my_commands(commands)
     
-    # Start payment checking job
-    if application.job_queue:
-        application.job_queue.run_repeating(check_payment, interval=60, first=10)
-        logger.info("Payment checking job scheduled")
-    else:
-        logger.error("JobQueue is not available. Install 'python-telegram-bot[job-queue]'")
-    
-    # Start the bot
-    try:
-        await application.run_polling(allowed_updates=["message", "callback_query"])
-        logger.info("Telegram bot polling started")
-    except Exception as e:
-        logger.error(f"Error starting Telegram bot: {str(e)}")
-        raise
-    finally:
-        logger.info("Shutting down Telegram bot")
-        await application.stop()
-        await application.updater.stop()
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", 5000)),
+        webhook_url=os.getenv("WEBHOOK_URL"),
+        secret_token=os.getenv("WEBHOOK_SECRET_TOKEN", "")
+    )
 
 if __name__ == '__main__':
-    # Run Flask with gunicorn in a separate process or use a WSGI server in production
-    # For Render, we'll rely on gunicorn (configured separately)
-    # Create a new event loop for the Telegram bot
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(main())
-    except Exception as e:
-        logger.error(f"Main loop error: {str(e)}")
-    finally:
-        # Ensure proper cleanup
-        pending = asyncio.all_tasks(loop)
-        for task in pending:
-            task.cancel()
-        try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception as e:
-            logger.error(f"Error shutting down asyncgens: {str(e)}")
-        finally:
-            loop.close()
-            logger.info("Event loop closed")
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
