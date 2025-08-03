@@ -42,7 +42,6 @@ import time
 import os
 from dotenv import load_dotenv
 from web3 import Web3
-from web3.middleware import geth_poa_middleware
 from eth_account import Account
 import threading
 
@@ -135,11 +134,7 @@ USDT_ABI = [
         "type": "event"
     }
 ]
-w3_eth.middleware_onion.inject(geth_poa_middleware, layer=0)
 usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
-
-# Binance client for USDT price
-
 
 # DexScreener API endpoints
 DEXSCREENER_PROFILE_API = "https://api.dexscreener.com/token-profiles/latest/v1"
@@ -218,6 +213,9 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             try:
                 solana_keypair = Keypair.from_bytes(base58.b58decode(private_key))
                 solana_private_key = private_key
+                eth_account = None
+                eth_address = None
+                eth_private_key = None
             except:
                 if not private_key.startswith('0x'):
                     private_key = '0x' + private_key
@@ -233,8 +231,8 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
 
     encrypted_mnemonic = encrypt_data(mnemonic if mnemonic else 'Imported via private key', user_key)
     encrypted_solana_private_key = encrypt_data(solana_private_key, user_key)
-    encrypted_eth_private_key = encrypt_data(eth_private_key, user_key)
-    encrypted_bsc_private_key = encrypt_data(eth_private_key, user_key)
+    encrypted_eth_private_key = encrypt_data(eth_private_key, user_key) if eth_private_key else None
+    encrypted_bsc_private_key = encrypt_data(eth_private_key, user_key) if eth_private_key else None
 
     return {
         'user_id': user_id,
@@ -246,11 +244,11 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
         'eth': {
             'address': eth_address,
             'private_key': encrypted_eth_private_key
-        },
+        } if eth_address else None,
         'bsc': {
             'address': eth_address,
             'private_key': encrypted_bsc_private_key
-        },
+        } if eth_address else None,
         'trading_mode': 'manual',
         'auto_buy_amount': 0.0,
         'sell_percentage': 0.0,
@@ -282,8 +280,10 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
 
     decrypted_user['mnemonic'] = safe_decrypt(user.get('mnemonic', {}))
     decrypted_user['solana']['private_key'] = safe_decrypt(user.get('solana', {}).get('private_key', {}))
-    decrypted_user['eth']['private_key'] = safe_decrypt(user.get('eth', {}).get('private_key', {}))
-    decrypted_user['bsc']['private_key'] = safe_decrypt(user.get('bsc', {}).get('private_key', {}))
+    if user.get('eth'):
+        decrypted_user['eth']['private_key'] = safe_decrypt(user.get('eth', {}).get('private_key', {}))
+    if user.get('bsc'):
+        decrypted_user['bsc']['private_key'] = safe_decrypt(user.get('bsc', {}).get('private_key', {}))
     return decrypted_user
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -296,12 +296,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users_collection.insert_one(user_data)
         try:
             decrypted_user = await decrypt_user_wallet(user_id, user_data)
+            eth_bsc_address = user_data['eth']['address'] if user_data['eth'] else "Not set"
             message = await update.message.reply_text(
                 f"Welcome to the Multi-Chain Trading Bot!\n\n"
                 f"A new wallet has been created for you.\n"
                 f"**Mnemonic (for Solana, ETH, BSC)**: {decrypted_user['mnemonic']}\n"
                 f"**Solana Public Key**: {user_data['solana']['public_key']}\n"
-                f"**ETH/BSC Address**: {user_data['eth']['address']}\n\n"
+                f"**ETH/BSC Address**: {eth_bsc_address}\n\n"
                 f"⚠️ **Security Warning** ⚠️\n"
                 f"1. **Never share your mnemonic or private keys** with anyone.\n"
                 f"2. Store them securely offline (e.g., on paper or a hardware wallet).\n"
@@ -324,11 +325,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         try:
             decrypted_user = await decrypt_user_wallet(user_id, user)
+            eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
             subscription_message = await get_subscription_status_message(user)
             await update.message.reply_text(
                 f"Welcome back!\n"
                 f"Solana wallet: {user['solana']['public_key']}\n"
-                f"ETH/BSC wallet: {user['eth']['address']}\n"
+                f"ETH/BSC wallet: {eth_bsc_address}\n"
                 f"{subscription_message}\n"
                 f"To generate a new wallet, use /generate_wallet.\n"
                 f"To import an existing wallet, use /set_wallet."
@@ -346,6 +348,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         logger.error("JobQueue is not initialized.")
         return
+    context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
 
 async def get_subscription_status_message(user: dict) -> str:
     if user.get('subscription_status') != 'active':
@@ -379,8 +382,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        
-        usdt_amount = 1.0
+        usdt_amount = 5.0  # Updated to $5/week as per your code
         usdt_amount_wei = int(usdt_amount * 10**6)
 
         user_key = derive_user_key(user_id)
@@ -420,6 +422,7 @@ async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not await check_subscription(user_id):
         await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
         return ConversationHandler.END
+    eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
     keyboard = [
         [InlineKeyboardButton("Yes, generate new wallet", callback_data='confirm_new_wallet')],
         [InlineKeyboardButton("No, keep existing wallet", callback_data='cancel_new_wallet')]
@@ -428,7 +431,7 @@ async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(
         f"You already have a wallet:\n"
         f"Solana wallet: {user['solana']['public_key']}\n"
-        f"ETH/BSC wallet: {user['eth']['address']}\n"
+        f"ETH/BSC wallet: {eth_bsc_address}\n"
         f"Generating a new wallet will overwrite the existing one. Are you sure?",
         reply_markup=reply_markup
     )
@@ -451,11 +454,12 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
     user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
     users_collection.replace_one({'user_id': user_id}, user_data, upsert=True)
     decrypted_user = await decrypt_user_wallet(user_id, user_data)
+    eth_bsc_address = user_data['eth']['address'] if user_data['eth'] else "Not set"
     message = await query.message.reply_text(
         f"New wallet generated!\n"
         f"**Mnemonic (for Solana, ETH, BSC)**: {decrypted_user['mnemonic']}\n"
         f"**Solana Public Key**: {user_data['solana']['public_key']}\n"
-        f"**ETH/BSC Address**: {user_data['eth']['address']}\n\n"
+        f"**ETH/BSC Address**: {eth_bsc_address}\n\n"
         f"⚠️ **Security Warning** ⚠️\n"
         f"1. **Never share your mnemonic or private keys** with anyone.\n"
         f"2. Store them securely offline.\n"
@@ -473,7 +477,7 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
         )
         logger.error("JobQueue is not initialized.")
         return ConversationHandler.END
-    context.job_queue.run_repeating(update_token_info, interval=10, first=5, user_id=user_id)
+    context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
     return ConversationHandler.END
 
 async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -571,6 +575,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user = users_collection.find_one({'user_id': user_id})
     if user:
+        eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
         keyboard = [
             [InlineKeyboardButton("Yes, import new wallet", callback_data='confirm_set_wallet')],
             [InlineKeyboardButton("No, keep existing wallet", callback_data='cancel_set_wallet')]
@@ -579,7 +584,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             f"You already have a wallet:\n"
             f"Solana wallet: {user['solana']['public_key']}\n"
-            f"ETH/BSC wallet: {user['eth']['address']}\n"
+            f"ETH/BSC wallet: {eth_bsc_address}\n"
             f"Importing a new wallet will overwrite the existing one. Are you sure?",
             reply_markup=reply_markup
         )
@@ -589,11 +594,12 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
             users_collection.insert_one(user_data)
             decrypted_user = await decrypt_user_wallet(user_id, user_data)
+            eth_bsc_address = user_data['eth']['address'] if user_data['eth'] else "Not set"
             message = await update.message.reply_text(
                 f"Wallet imported successfully!\n"
                 f"**Mnemonic**: {decrypted_user['mnemonic']}\n"
                 f"**Solana Public Key**: {user_data['solana']['public_key']}\n"
-                f"**ETH/BSC Address**: {user_data['eth']['address']}\n\n"
+                f"**ETH/BSC Address**: {eth_bsc_address}\n\n"
                 f"⚠️ **Security Warning** ⚠️\n"
                 f"1. **Never share your mnemonic or private keys** with anyone.\n"
                 f"2. Store them securely offline.\n"
@@ -611,7 +617,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 logger.error("JobQueue is not initialized.")
                 return ConversationHandler.END
-            context.job_queue.run_repeating(update_token_info, interval=10, first=5, user_id=user_id)
+            context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
             return ConversationHandler.END
         except Exception as e:
             message = await update.message.reply_text(
@@ -662,6 +668,7 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     user = users_collection.find_one({'user_id': user_id})
     if user:
+        eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
         keyboard = [
             [InlineKeyboardButton("Yes, import new wallet", callback_data='confirm_set_wallet')],
             [InlineKeyboardButton("No, keep existing wallet", callback_data='cancel_set_wallet')]
@@ -670,7 +677,7 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(
             f"You already have a wallet:\n"
             f"Solana wallet: {user['solana']['public_key']}\n"
-            f"ETH/BSC wallet: {user['eth']['address']}\n"
+            f"ETH/BSC wallet: {eth_bsc_address}\n"
             f"Importing a new wallet will overwrite the existing one. Are you sure?",
             reply_markup=reply_markup
         )
@@ -680,10 +687,11 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             user_data = await set_user_wallet(user_id, private_key=private_key)
             users_collection.insert_one(user_data)
             decrypted_user = await decrypt_user_wallet(user_id, user_data)
+            eth_bsc_address = user_data['eth']['address'] if user_data['eth'] else "Not set"
             message = await update.message.reply_text(
                 f"Wallet imported successfully!\n"
                 f"**Solana Public Key**: {user_data['solana']['public_key']}\n"
-                f"**ETH/BSC Address**: {user_data['eth']['address']}\n\n"
+                f"**ETH/BSC Address**: {eth_bsc_address}\n\n"
                 f"⚠️ **Security Warning** ⚠️\n"
                 f"1. **Never share your mnemonic or private keys** with anyone.\n"
                 f"2. Store them securely offline.\n"
@@ -701,7 +709,7 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 )
                 logger.error("JobQueue is not initialized.")
                 return ConversationHandler.END
-            context.job_queue.run_repeating(update_token_info, interval=10, first=5, user_id=user_id)
+            context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
             return ConversationHandler.END
         except Exception as e:
             message = await update.message.reply_text(
@@ -734,11 +742,12 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
                                         private_key=wallet_input if method == 'private_key' else None)
         users_collection.replace_one({'user_id': user_id}, user_data, upsert=True)
         decrypted_user = await decrypt_user_wallet(user_id, user_data)
+        eth_bsc_address = user_data['eth']['address'] if user_data['eth'] else "Not set"
         message = await query.message.reply_text(
             f"Wallet imported successfully!\n"
             f"**{'Mnemonic' if method == 'mnemonic' else 'Private Key'}**: {decrypted_user['mnemonic'] if method == 'mnemonic' else '[Hidden]'}\n"
             f"**Solana Public Key**: {user_data['solana']['public_key']}\n"
-            f"**ETH/BSC Address**: {user_data['eth']['address']}\n\n"
+            f"**ETH/BSC Address**: {eth_bsc_address}\n\n"
             f"⚠️ **Security Warning** ⚠️\n"
             f"1. **Never share your mnemonic or private keys** with anyone.\n"
             f"2. Store them securely offline.\n"
@@ -756,7 +765,7 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             logger.error("JobQueue is not initialized.")
             return ConversationHandler.END
-        context.job_queue.run_repeating(update_token_info, interval=10, first=5, user_id=user_id)
+        context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
         return ConversationHandler.END
     except Exception as e:
         await query.message.reply_text(f"Error importing wallet: {str(e)}. Please start over with /set_wallet.")
@@ -867,7 +876,7 @@ async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.error("JobQueue is not initialized for auto trading.")
             return ConversationHandler.END
         if user['trading_mode'] == 'automatic':
-            context.job_queue.run_repeating(auto_trade, interval=10, first=5, user_id=user_id)
+            context.job_queue.run_repeating(auto_trade, interval=5, first=0, user_id=user_id)
         return ConversationHandler.END
     except ValueError:
         await update.message.reply_text("Invalid percentage. Please enter a number.")
@@ -1140,8 +1149,8 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No wallet found. Please use /start to create a wallet or /set_wallet to import one.")
         return
     sol_balance = await check_balance(user_id, 'solana')
-    eth_balance = await check_balance(user_id, 'eth')
-    bsc_balance = await check_balance(user_id, 'bsc')
+    eth_balance = await check_balance(user_id, 'eth') if user.get('eth') else 0.0
+    bsc_balance = await check_balance(user_id, 'bsc') if user.get('bsc') else 0.0
     portfolio = user.get('portfolio', {})
     
     message = (
@@ -1391,11 +1400,11 @@ async def check_balance(user_id, chain):
             pubkey = Pubkey.from_string(user['solana']['public_key'])
             response = solana_sync_client.get_balance(pubkey)
             return response.value / 1_000_000_000
-        elif chain == 'eth':
+        elif chain == 'eth' and user.get('eth'):
             address = user['eth']['address']
             balance = w3_eth.eth.get_balance(address)
             return w3_eth.from_wei(balance, 'ether')
-        elif chain == 'bsc':
+        elif chain == 'bsc' and user.get('bsc'):
             address = user['bsc']['address']
             balance = w3_bsc.eth.get_balance(address)
             return w3_bsc.from_wei(balance, 'ether')
@@ -1552,195 +1561,147 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int, token: di
                 )
                 users_collection.update_one(
                     {'user_id': user_id},
-                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
-                )
-    else:
-        balance = await check_balance(user_id, 'solana')
-        buy_amount = user['auto_buy_amount']
-        if balance >= buy_amount and not (token['liquidity'] < 1000 or token['volume'] < 1000):
-            success = await execute_trade(user_id, token['contract_address'], buy_amount, 'buy', 'solana')
-            if success:
+    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
+)
+        else:
+            balance = await check_balance(user_id, 'solana')
+            if balance >= user['auto_buy_amount']:
+                success = await execute_trade(user_id, token['contract_address'], user['auto_buy_amount'], 'buy', 'solana')
+                if success:
+                    users_collection.update_one(
+                        {'user_id': user_id},
+                        {'$set': {f'portfolio.{token["contract_address"]}': {
+                            'name': token['name'],
+                            'symbol': token['symbol'],
+                            'amount': user['auto_buy_amount'],
+                            'buy_price': token['price_usd']
+                        }}}
+                    )
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"Automatically bought {user['auto_buy_amount']} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
+                    )
+
+async def check_payment(context: ContextTypes.DEFAULT_TYPE):
+    users = users_collection.find({'payment_address': {'$ne': None}})
+    for user in users:
+        user_id = user['user_id']
+        payment_address = user['payment_address']
+        expected_amount = user['expected_amount']
+        deadline = user.get('payment_deadline')
+        if deadline and isinstance(deadline, str):
+            deadline = datetime.fromisoformat(deadline)
+        if deadline and datetime.now() > deadline:
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {'payment_address': None, 'expected_amount': None, 'payment_deadline': None}}
+            )
+            continue
+        try:
+            balance = usdt_contract.functions.balanceOf(payment_address).call()
+            if balance >= expected_amount:
+                expiry = datetime.now() + timedelta(days=7)
                 users_collection.update_one(
                     {'user_id': user_id},
-                    {'$set': {f'portfolio.{token["contract_address"]}': {
-                        'name': token['name'],
-                        'symbol': token['symbol'],
-                        'amount': buy_amount,
-                        'buy_price': token['price_usd']
-                    }}}
+                    {
+                        '$set': {
+                            'subscription_status': 'active',
+                            'subscription_expiry': expiry.isoformat(),
+                            'payment_address': None,
+                            'expected_amount': None,
+                            'payment_deadline': None
+                        }
+                    }
                 )
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"Automatically bought {buy_amount} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
+                    text=f"Payment confirmed! Your subscription is active until {expiry.strftime('%Y-%m-%d %H:%M:%S')}."
                 )
-
-# Flask app for webhook
-app = Flask(__name__)
-
-@app.route('/webhook/usdt', methods=['POST'])
-def usdt_webhook():
-    try:
-        data = request.get_json()
-        if not data:
-            logger.error("No data received in webhook")
-            return jsonify({'status': 'error', 'message': 'No data provided'}), 400
-
-        # Process Ethereum transaction webhook (e.g., from a block explorer or custom node)
-        tx_hash = data.get('hash')
-        from_address = data.get('from')
-        to_address = data.get('to')
-        value = data.get('value')  # In wei
-        contract_address = data.get('contract_address')
-
-        logger.debug(f"Webhook received: tx_hash={tx_hash}, from={from_address}, to={to_address}, value={value}")
-
-        if contract_address != USDT_CONTRACT_ADDRESS:
-            logger.debug(f"Ignoring non-USDT transaction: {contract_address}")
-            return jsonify({'status': 'success', 'message': 'Non-USDT transaction ignored'}), 200
-
-        if to_address.lower() != BOT_USDT_ADDRESS.lower():
-            logger.debug(f"Ignoring transaction not sent to bot wallet: {to_address}")
-            return jsonify({'status': 'success', 'message': 'Transaction not to bot wallet'}), 200
-
-        # Find user by payment address
-        user = users_collection.find_one({'payment_address': from_address})
-        if not user:
-            logger.error(f"No user found for payment address: {from_address}")
-            return jsonify({'status': 'error', 'message': 'No user found'}), 404
-
-        expected_amount = user.get('expected_amount')
-        payment_deadline = user.get('payment_deadline')
-        if not expected_amount or not payment_deadline:
-            logger.error(f"No payment pending for user {user['user_id']}")
-            return jsonify({'status': 'error', 'message': 'No payment pending'}), 400
-
-        if isinstance(payment_deadline, str):
-            payment_deadline = datetime.fromisoformat(payment_deadline)
-        if datetime.now() > payment_deadline:
-            logger.error(f"Payment deadline expired for user {user['user_id']}")
-            users_collection.update_one(
-                {'user_id': user['user_id']},
-                {'$unset': {'payment_address': "", 'expected_amount': "", 'payment_deadline': ""}}
-            )
-            return jsonify({'status': 'error', 'message': 'Payment deadline expired'}), 400
-
-        if int(value) < expected_amount:
-            logger.error(f"Insufficient payment from user {user['user_id']}: got {value}, expected {expected_amount}")
-            return jsonify({'status': 'error', 'message': 'Insufficient payment amount'}), 400
-
-        # Verify transaction on-chain
-        try:
-            receipt = w3_eth.eth.get_transaction_receipt(tx_hash)
-            if receipt.status != 1:
-                logger.error(f"Transaction {tx_hash} failed for user {user['user_id']}")
-                return jsonify({'status': 'error', 'message': 'Transaction failed'}), 400
+                if context.job_queue:
+                    context.job_queue.run_repeating(update_token_info, interval=5, first=0, user_id=user_id)
         except Exception as e:
-            logger.error(f"Error verifying transaction {tx_hash}: {str(e)}")
-            return jsonify({'status': 'error', 'message': 'Transaction verification failed'}), 500
+            logger.error(f"Error checking payment for user {user_id}: {str(e)}")
 
-        # Activate subscription
-        subscription_expiry = datetime.now() + timedelta(days=7)
-        users_collection.update_one(
-            {'user_id': user['user_id']},
-            {
-                '$set': {
-                    'subscription_status': 'active',
-                    'subscription_expiry': subscription_expiry.isoformat()
-                },
-                '$unset': {
-                    'payment_address': "",
-                    'expected_amount': "",
-                    'payment_deadline': ""
-                }
-            }
-        )
-        logger.info(f"Subscription activated for user {user['user_id']} until {subscription_expiry}")
-        return jsonify({'status': 'success', 'message': 'Subscription activated'}), 200
-
-    except Exception as e:
-        logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-async def subscription_check(context: ContextTypes.DEFAULT_TYPE):
-    """Periodic job to check and update subscription statuses."""
-    users = users_collection.find({'subscription_status': 'active'})
-    current_time = datetime.now()
-    for user in users:
-        expiry = user.get('subscription_expiry')
-        if isinstance(expiry, str):
-            expiry = datetime.fromisoformat(expiry)
-        if expiry and current_time >= expiry:
-            logger.info(f"Subscription expired for user {user['user_id']}")
-            users_collection.update_one(
-                {'user_id': user['user_id']},
-                {'$set': {'subscription_status': 'inactive', 'subscription_expiry': None}}
-            )
-            await context.bot.send_message(
-                chat_id=user['user_id'],
-                text="Your subscription has expired. Please renew using /subscribe."
-            )
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel the current conversation."""
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
 
-def main():
-    """Main function to start the bot and Flask webhook."""
-    bot_token = os.getenv("BOT_TOKEN")
-    if not bot_token:
-        logger.error("BOT_TOKEN not found in .env file")
-        raise ValueError("BOT_TOKEN not found in .env file")
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Update {update} caused error {context.error}")
+    if update and update.message:
+        await update.message.reply_text("An error occurred. Please try again or contact support.")
 
-    application = Application.builder().token(bot_token).build()
+# Flask app for health check
+app = Flask(__name__)
 
-    # Conversation handler for setting trading mode
-    set_mode_conv = ConversationHandler(
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'ok'})
+
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))
+
+# Main function
+async def main():
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN not found in .env file")
+        raise ValueError("TELEGRAM_BOT_TOKEN not found in .env file")
+    
+    application = Application.builder().token(token).build()
+
+    # Set up command and conversation handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("subscribe", subscribe))
+    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(CommandHandler("reset_tokens", reset_tokens))
+    
+    generate_wallet_handler = ConversationHandler(
+        entry_points=[CommandHandler('generate_wallet', generate_wallet)],
+        states={
+            CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet, pattern='^(confirm_new_wallet|cancel_new_wallet)$')],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    application.add_handler(generate_wallet_handler)
+    
+    set_wallet_handler = ConversationHandler(
+        entry_points=[CommandHandler('set_wallet', set_wallet)],
+        states={
+            SET_WALLET_METHOD: [CallbackQueryHandler(set_wallet_method, pattern='^(mnemonic|private_key)$')],
+            INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_mnemonic)],
+            INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_private_key)],
+            CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet, pattern='^(confirm_set_wallet|cancel_set_wallet)$')],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    application.add_handler(set_wallet_handler)
+    
+    set_mode_handler = ConversationHandler(
         entry_points=[CommandHandler('setmode', set_mode)],
         states={
-            SET_TRADING_MODE: [CallbackQueryHandler(mode_callback)],
+            SET_TRADING_MODE: [CallbackQueryHandler(mode_callback, pattern='^(manual|automatic)$')],
             SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_auto_buy_amount)],
             SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_sell_percentage)],
             SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_loss_percentage)],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
-
-    # Conversation handler for generating a new wallet
-    generate_wallet_conv = ConversationHandler(
-        entry_points=[CommandHandler('generate_wallet', generate_wallet)],
-        states={
-            CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-
-    # Conversation handler for setting/importing a wallet
-    set_wallet_conv = ConversationHandler(
-        entry_points=[CommandHandler('set_wallet', set_wallet)],
-        states={
-            SET_WALLET_METHOD: [CallbackQueryHandler(set_wallet_method)],
-            INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_mnemonic)],
-            INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_private_key)],
-            CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-
-    # Conversation handler for trading
-    trade_conv = ConversationHandler(
+    application.add_handler(set_mode_handler)
+    
+    trade_handler = ConversationHandler(
         entry_points=[CommandHandler('trade', trade)],
         states={
-            SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action)],
+            SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action, pattern='^(buy|sell)_')],
             BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
             SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
-            CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade)],
+            CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade, pattern='^(confirm_trade|cancel_trade)$')],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
-
-    # Conversation handler for transferring tokens
-    transfer_conv = ConversationHandler(
+    application.add_handler(trade_handler)
+    
+    transfer_handler = ConversationHandler(
         entry_points=[CommandHandler('transfer', transfer)],
         states={
             TRANSFER_TOKEN: [CallbackQueryHandler(transfer_token)],
@@ -1749,47 +1710,33 @@ def main():
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
-
-    # Add handlers to the application
-    application.add_handler(set_mode_conv)
-    application.add_handler(generate_wallet_conv)
-    application.add_handler(set_wallet_conv)
-    application.add_handler(trade_conv)
-    application.add_handler(transfer_conv)
-    application.add_handler(CommandHandler('subscribe', subscribe))
-    application.add_handler(CommandHandler('balance', balance))
-    application.add_handler(CommandHandler('reset_tokens', reset_tokens))
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('cancel', cancel))
-
-    # Set bot commands for the menu
-    commands = [
-        BotCommand('start', 'Start the bot and create/view wallet'),
-        BotCommand('subscribe', 'Subscribe to access trading features ($5/week via USDT)'),
-        BotCommand('setmode', 'Set trading mode (manual or automatic)'),
-        BotCommand('generate_wallet', 'Generate a new wallet'),
-        BotCommand('set_wallet', 'Import an existing wallet'),
-        BotCommand('trade', 'Trade Solana tokens manually'),
-        BotCommand('balance', 'Check wallet balance and holdings'),
-        BotCommand('transfer', 'Transfer Solana tokens'),
-        BotCommand('reset_tokens', 'Reset posted tokens list'),
-        BotCommand('cancel', 'Cancel current operation')
-    ]
-    application.bot.set_my_commands(commands)
-
-    # Start periodic subscription check
-    application.job_queue.run_repeating(subscription_check, interval=3600, first=10)
-
-    # Start Flask app in a separate thread
-    def run_flask():
-        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-
+    application.add_handler(transfer_handler)
+    
+    application.add_error_handler(error_handler)
+    
+    # Set up commands
+    await application.bot.set_my_commands([
+        BotCommand("start", "Start the bot and create/import wallet"),
+        BotCommand("subscribe", "Subscribe to access trading features"),
+        BotCommand("generate_wallet", "Generate a new wallet"),
+        BotCommand("set_wallet", "Import an existing wallet"),
+        BotCommand("setmode", "Set trading mode (manual/automatic)"),
+        BotCommand("trade", "Manually trade Solana tokens"),
+        BotCommand("balance", "Check wallet balance and holdings"),
+        BotCommand("transfer", "Transfer Solana tokens"),
+        BotCommand("reset_tokens", "Reset posted tokens list"),
+        BotCommand("cancel", "Cancel current operation")
+    ])
+    
+    # Start Flask in a separate thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-
+    
+    # Start payment checking job
+    application.job_queue.run_repeating(check_payment, interval=60, first=10)
+    
     # Start the bot
-    logger.info("Starting bot polling")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    await application.run_polling()
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
