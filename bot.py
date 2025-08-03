@@ -75,16 +75,19 @@ async def health_check():
 async def telegram_webhook(request: Request):
     global application
     try:
+        if not application:
+            logger.error("Application not initialized")
+            return JSONResponse(content={'error': 'Application not initialized'}, status_code=500)
+        
         update_data = await request.json()
         update = Update.de_json(update_data, application.bot)
         
-        # Process the update
-        async with application:
-            await application.process_update(update)
+        # Process the update directly without context manager
+        await application.process_update(update)
             
         return JSONResponse(content={'status': 'ok'})
     except Exception as e:
-        logger.error(f"Webhook error: {str(e)}")
+        logger.error(f"Webhook error: {str(e)}", exc_info=True)
         return JSONResponse(content={'error': str(e)}, status_code=500)
 
 GMGN_API_HOST = 'https://gmgn.ai'
@@ -406,67 +409,86 @@ async def get_subscription_status_message(user: dict) -> str:
 
 async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not await check_subscription(user_id):
-        await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
-        return
+    try:
+        if not await check_subscription(user_id):
+            await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
+            return
 
-    # Force fetch token immediately
-    token = await fetch_latest_token()
-    if not token:
-        await update.message.reply_text("Failed to fetch token data. Try again later.")
-        return
+        # Try fetching token 3 times
+        token = None
+        for attempt in range(3):
+            token = await fetch_latest_token()
+            if token:
+                break
+            await asyncio.sleep(2)
+            
+        if not token:
+            await update.message.reply_text("Failed to fetch token data after 3 attempts. Please try again later.")
+            return
 
-    # Check if already posted
-    if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
-        await update.message.reply_text("This token has already been posted recently.")
-        return
+        # Check if already posted
+        if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
+            await update.message.reply_text("This token has already been posted recently.")
+            return
 
-    user = users_collection.find_one({'user_id': user_id})
-    if token['contract_address'] in user.get('posted_tokens', []):
-        await update.message.reply_text("You've already seen this token. Use /reset_tokens to clear your history.")
-        return
+        user = users_collection.find_one({'user_id': user_id})
+        if token['contract_address'] in user.get('posted_tokens', []):
+            await update.message.reply_text("You've already seen this token. Use /reset_tokens to clear your history.")
+            return
 
-    # Format token info
-    is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
-    warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
-    
-    social_links = "\n".join([f"{k.capitalize()}: {v}" for k, v in token['socials'].items()])
-    message = (
-        f"<b>Manual Token Fetch</b>\n"
-        f"Name: {token['name']} ({token['symbol']})\n\n"
-        f"Contract: {token['contract_address']}\n\n"
-        f"Price: ${token['price_usd']:.6f}\n"
-        f"Market Cap: ${token['market_cap']:,.2f}\n\n"
-        f"Liquidity: ${token['liquidity']:,.2f}\n\n"
-        f"24h Volume: ${token['volume']:,.2f}\n\n"
-        f"Website: {token['website']}\n\n"
-        f"Socials:\n{social_links or 'N/A'}\n\n"
-        f"Image: <a href='{token['image']}'>View Image</a>\n\n"
-        f"DexScreener: <a href='{token['dexscreener_url']}'>View on DexScreener</a>\n"
-        f"{warning}"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
-        [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        message,
-        parse_mode='HTML',
-        reply_markup=reply_markup
-    )
-    
-    # Update global and user token records
-    db.global_posted_tokens.insert_one({
-        'contract_address': token['contract_address'],
-        'timestamp': datetime.now()
-    })
-    users_collection.update_one(
-        {'user_id': user_id},
-        {'$addToSet': {'posted_tokens': token['contract_address']}}
-    )
+        # Format token info
+        is_suspicious = token.get('liquidity', 0) < 1000 or token.get('volume', 0) < 1000
+        warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
+        
+        socials = token.get('socials', {})
+        social_links = "\n".join([f"{k.capitalize()}: {v}" for k, v in socials.items()]) if socials else "N/A"
+        
+        message = (
+            f"<b>Manual Token Fetch</b>\n"
+            f"Name: {token.get('name', 'Unknown')} ({token.get('symbol', '?')})\n"
+            f"Contract: {token['contract_address']}\n"
+            f"Price: ${token.get('price_usd', 0):.6f}\n"
+            f"Market Cap: ${token.get('market_cap', 0):,.2f}\n"
+            f"Liquidity: ${token.get('liquidity', 0):,.2f}\n"
+            f"24h Volume: ${token.get('volume', 0):,.2f}\n"
+            f"Website: {token.get('website', 'N/A')}\n"
+            f"Socials:\n{social_links}\n"
+            f"{warning}\n"
+            f"DexScreener: <a href='{token.get('dexscreener_url', '')}'>View Chart</a>"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
+            [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            message,
+            parse_mode='HTML',
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+        
+        # Update global and user token records
+        try:
+            db.global_posted_tokens.insert_one({
+                'contract_address': token['contract_address'],
+                'timestamp': datetime.now(),
+                'name': token.get('name', ''),
+                'symbol': token.get('symbol', '')
+            })
+            
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'posted_tokens': token['contract_address']}}
+            )
+        except Exception as e:
+            logger.error(f"Error updating token records: {str(e)}")
+            
+    except Exception as e:
+        logger.error(f"Error in manual token fetch: {str(e)}", exc_info=True)
+        await update.message.reply_text("An error occurred while fetching tokens. Please try again.")
 
 async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Start token updates for a subscribed user"""
@@ -474,16 +496,17 @@ async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     jobs = context.job_queue.get_jobs_by_name(f"token_updates_{user_id}")
     for job in jobs:
         job.schedule_removal()
+        logger.debug(f"Removed existing job for user {user_id}")
     
-    logger.debug(f"Starting token updates for user {user_id}")
+    logger.info(f"Starting token updates for user {user_id}")
     
     # Schedule the token update job
     context.job_queue.run_repeating(
         update_token_info,
-        interval=30,  # Check every 30 seconds
-        first=5,       # First run in 5 seconds
+        interval=30,
+        first=5,
         user_id=user_id,
-        name=f"token_updates_{user_id}"  # Unique name for this job
+        name=f"token_updates_{user_id}"
     )
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1392,161 +1415,168 @@ async def transfer_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return TRANSFER_ADDRESS
 
 async def fetch_latest_token():
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            response = await client.get(DEXSCREENER_PROFILE_API, params={'chainId': 'solana'})
+            logger.debug("Fetching token profile from DexScreener")
+            response = await client.get(
+                DEXSCREENER_PROFILE_API, 
+                params={'chainId': 'solana'},
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
             response.raise_for_status()
             data = response.json()
             
             if not isinstance(data, list):
-                logger.error(f"Expected a list from DexScreener profile API, got {type(data)}: {data}")
+                logger.error(f"Invalid profile response: {type(data)}")
                 return None
             
-            solana_tokens = [token for token in data if isinstance(token, dict) and token.get('chainId') == 'solana']
+            # Find Solana tokens
+            solana_tokens = [t for t in data if isinstance(t, dict) and t.get('chainId') == 'solana']
             if not solana_tokens:
-                logger.warning("No Solana tokens found in profile API response")
+                logger.warning("No Solana tokens found in profile response")
                 return None
             
             token = solana_tokens[0]
             token_address = token.get('tokenAddress', '')
             if not token_address:
-                logger.warning("No tokenAddress found in token data")
+                logger.warning("Token address missing")
                 return None
             
+            # Fetch token details
+            logger.debug(f"Fetching details for token: {token_address}")
             token_url = DEXSCREENER_TOKEN_API.format(token_address=token_address)
-            token_response = await client.get(token_url)
+            token_response = await client.get(token_url, headers={'User-Agent': 'Mozilla/5.0'})
             token_response.raise_for_status()
             token_data = token_response.json()
-
-            if not isinstance(token_data, list):
-                logger.error(f"Expected a list from token API, got {type(token_data)}: {token_data}")
+            
+            if not token_data or not isinstance(token_data, list) or not token_data[0]:
+                logger.error(f"Invalid token response: {token_data}")
                 return None
             
-            if not token_data:
-                logger.warning("No token pairs found in token API response")
-                return None
             pair_data = token_data[0]
-
-            if not isinstance(pair_data, dict):
-                logger.error(f"Expected a dict for pair data, got {type(pair_data)}: {pair_data}")
-                return None
-
-            name = pair_data.get('name', token.get('description', 'Unknown').split()[0] if token.get('description') else 'Unknown')
-            symbol = pair_data.get('symbol', token.get('url', '').split('/')[-1].upper() if token.get('url') else 'Unknown')
-            website = next((link['url'] for link in token.get('links', []) if link.get('label') == 'Website'), 'N/A')
-            social_links = {link['type']: link['url'] for link in token.get('links', []) if link.get('type')}
-            dexscreener_url = f"https://dexscreener.com/solana/{token_address}"
-
-            price_usd = float(pair_data.get('priceUsd', '0.0'))
-            market_cap = float(pair_data.get('marketCap', 0.0))
-            liquidity = float(pair_data.get('liquidity', {}).get('usd', 0.0))
-            volume = float(pair_data.get('volume', {}).get('h24', 0.0))
-
             return {
-                'name': name,
-                'symbol': symbol,
+                'name': pair_data.get('name', token.get('description', 'Unknown').split()[0]),
+                'symbol': pair_data.get('symbol', token.get('url', '').split('/')[-1].upper()),
                 'contract_address': token_address,
-                'price_usd': price_usd,
-                'market_cap': market_cap,
-                'image': token.get('icon', 'N/A'),
-                'website': website,
-                'socials': social_links,
-                'liquidity': liquidity,
-                'volume': volume,
-                'dexscreener_url': dexscreener_url
+                'price_usd': float(pair_data.get('priceUsd', 0)),
+                'market_cap': float(pair_data.get('marketCap', 0)),
+                'liquidity': float(pair_data.get('liquidity', {}).get('usd', 0)),
+                'volume': float(pair_data.get('volume', {}).get('h24', 0)),
+                'website': next((link['url'] for link in token.get('links', []) if link.get('label') == 'Website'), 'N/A'),
+                'socials': {link['type']: link['url'] for link in token.get('links', []) if link.get('type')},
+                'dexscreener_url': f"https://dexscreener.com/solana/{token_address}"
             }
+            
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error fetching token: {str(e)}")
         except Exception as e:
-            logger.error(f"Error fetching token: {str(e)}")
-            return None
+            logger.error(f"Unexpected error fetching token: {str(e)}", exc_info=True)
+        return None
 
 async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.user_id
-    logger.debug(f"Running token update for user {user_id}")
-    
-    user = users_collection.find_one({'user_id': user_id})
-    if not user:
-        logger.debug(f"No user found for user_id {user_id}, cancelling job")
-        context.job.schedule_removal()
-        return
-        
-    if not await check_subscription(user_id):
-        logger.debug(f"User {user_id} subscription not active, cancelling job")
-        context.job.schedule_removal()
-        return
-    
-    # Rate limit token checks (once every 30 seconds)
-    last_check = user.get('last_token_check', 0)
-    if time.time() - last_check < 30:
-        return
-    
-    token = await fetch_latest_token()
-    if not token:
-        logger.debug("Failed to fetch token data")
-        return
-    
-    # Check global posted tokens
-    if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
-        logger.debug(f"Token {token['contract_address']} already posted globally")
-        return
-    
-    # Check if this user has already seen this token
-    if token['contract_address'] in user.get('posted_tokens', []):
-        logger.debug(f"User {user_id} already saw token {token['contract_address']}")
-        return
-    
-    # Add token to global posted tokens
-    db.global_posted_tokens.insert_one({
-        'contract_address': token['contract_address'],
-        'timestamp': datetime.now()
-    })
-    
-    # Update user's last check time and add to their posted tokens
-    users_collection.update_one(
-        {'user_id': user_id},
-        {
-            '$set': {'last_token_check': time.time()},
-            '$addToSet': {'posted_tokens': token['contract_address']}
-        }
-    )
-    
-    is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
-    warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
-    
-    social_links = "\n".join([f"{k.capitalize()}: {v}" for k, v in token['socials'].items()])
-    message = (
-        f"<b>New Solana Token Detected</b>\n"
-        f"Name: {token['name']} ({token['symbol']})\n\n"
-        f"Contract: {token['contract_address']}\n\n"
-        f"Price: ${token['price_usd']:.6f}\n"
-        f"Market Cap: ${token['market_cap']:,.2f}\n\n"
-        f"Liquidity: ${token['liquidity']:,.2f}\n\n"
-        f"24h Volume: ${token['volume']:,.2f}\n\n"
-        f"Website: {token['website']}\n\n"
-        f"Socials:\n{social_links or 'N/A'}\n\n"
-        f"Image: <a href='{token['image']}'>View Image</a>\n\n"
-        f"DexScreener: <a href='{token['dexscreener_url']}'>View on DexScreener</a>\n"
-        f"{warning}"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
-        [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    logger.info(f"Starting token update for user {user_id}")
     
     try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=message,
-            parse_mode='HTML',
-            reply_markup=reply_markup
+        # Check if user exists and is subscribed
+        user = users_collection.find_one({'user_id': user_id})
+        if not user:
+            logger.info(f"User {user_id} not found, cancelling job")
+            context.job.schedule_removal()
+            return
+            
+        if not await check_subscription(user_id):
+            logger.info(f"User {user_id} not subscribed, cancelling job")
+            context.job.schedule_removal()
+            return
+        
+        # Fetch token with retries
+        token = None
+        for attempt in range(3):
+            token = await fetch_latest_token()
+            if token:
+                break
+            await asyncio.sleep(5)
+        
+        if not token:
+            logger.error(f"Failed to fetch token after 3 attempts for user {user_id}")
+            return
+        
+        # Check if token is valid
+        if 'contract_address' not in token or not token['contract_address']:
+            logger.error(f"Invalid token data: {token}")
+            return
+        
+        # Check global and user token history
+        if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
+            logger.debug(f"Token {token['contract_address']} already posted globally")
+            return
+            
+        if token['contract_address'] in user.get('posted_tokens', []):
+            logger.debug(f"User {user_id} already saw token {token['contract_address']}")
+            return
+        
+        # Format token info
+        is_suspicious = token.get('liquidity', 0) < 1000 or token.get('volume', 0) < 1000
+        warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
+        
+        socials = token.get('socials', {})
+        social_links = "\n".join([f"{k.capitalize()}: {v}" for k, v in socials.items()]) if socials else "N/A"
+        
+        message = (
+            f"<b>New Solana Token Detected</b>\n"
+            f"Name: {token.get('name', 'Unknown')} ({token.get('symbol', '?')})\n"
+            f"Contract: {token['contract_address']}\n"
+            f"Price: ${token.get('price_usd', 0):.6f}\n"
+            f"Market Cap: ${token.get('market_cap', 0):,.2f}\n"
+            f"Liquidity: ${token.get('liquidity', 0):,.2f}\n"
+            f"24h Volume: ${token.get('volume', 0):,.2f}\n"
+            f"Website: {token.get('website', 'N/A')}\n"
+            f"Socials:\n{social_links}\n"
+            f"{warning}\n"
+            f"DexScreener: <a href='{token.get('dexscreener_url', '')}'>View Chart</a>"
         )
         
-        # Auto-trade logic if in automatic mode
-        if user['trading_mode'] == 'automatic':
+        keyboard = [
+            [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
+            [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Send message with error handling
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode='HTML',
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            logger.error(f"Error sending message to user {user_id}: {str(e)}")
+        
+        # Update global and user token records
+        try:
+            db.global_posted_tokens.insert_one({
+                'contract_address': token['contract_address'],
+                'timestamp': datetime.now(),
+                'name': token.get('name', ''),
+                'symbol': token.get('symbol', '')
+            })
+            
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'posted_tokens': token['contract_address']}}
+            )
+        except Exception as e:
+            logger.error(f"Error updating token records: {str(e)}")
+        
+        # Auto-trade if enabled
+        if user.get('trading_mode') == 'automatic':
             await auto_trade(context, user_id=user_id, token=token)
+            
     except Exception as e:
-        logger.error(f"Error sending token info: {str(e)}")
+        logger.error(f"Critical error in token update for user {user_id}: {str(e)}", exc_info=True)
 
 async def check_balance(user_id, chain):
     user = users_collection.find_one({'user_id': user_id})
@@ -1680,6 +1710,41 @@ async def execute_trade(user_id, contract_address, amount, action, chain):
         logger.error(f"Error executing {action} trade for user {user_id}: {str(e)}", exc_info=True)
         return False
 
+
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = users_collection.find_one({'user_id': user_id})
+    
+    # Get active jobs
+    job_count = 0
+    if context.job_queue:
+        job_count = len(context.job_queue.jobs())
+    
+    # Get subscription status
+    sub_status = "Not subscribed"
+    if user and user.get('subscription_status') == 'active':
+        expiry = user.get('subscription_expiry')
+        if isinstance(expiry, str):
+            expiry = datetime.fromisoformat(expiry)
+        if expiry > datetime.now():
+            sub_status = f"Active until {expiry}"
+    
+    # Get last token check
+    last_check = "Never"
+    if user and 'last_token_check' in user:
+        last_check = datetime.fromtimestamp(user['last_token_check']).strftime('%Y-%m-%d %H:%M:%S')
+    
+    message = (
+        f"<b>Debug Information</b>\n"
+        f"User ID: {user_id}\n"
+        f"Subscription: {sub_status}\n"
+        f"Active jobs: {job_count}\n"
+        f"Last token check: {last_check}\n"
+        f"Posted tokens: {len(user.get('posted_tokens', [])) if user else 0}"
+    )
+    
+    await update.message.reply_text(message, parse_mode='HTML')
+
 async def execute_transfer(user_id, recipient, token_contract, amount, chain):
     if chain != 'solana':
         logger.error(f"Transfer not supported for {chain} yet")
@@ -1756,6 +1821,7 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("subscribe", subscribe))
     application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
+    application.add_handler(CommandHandler("debug", debug))
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("generate_wallet", generate_wallet)],
         states={
@@ -1816,6 +1882,9 @@ async def setup_bot():
     if not TELEGRAM_TOKEN or not WEBHOOK_URL:
         logger.error("TELEGRAM_TOKEN or WEBHOOK_URL not found in .env file")
         raise ValueError("TELEGRAM_TOKEN or WEBHOOK_URL not found in .env file")
+    if application and application.running:
+        logger.info("Application is already running")
+        return application
     
     # Create application instance
     application = (
@@ -1849,7 +1918,8 @@ async def setup_bot():
         BotCommand("trade", "Trade Solana tokens manually"),
         BotCommand("balance", "Check wallet balance"),
         BotCommand("transfer", "Transfer Solana tokens"),
-        BotCommand("cancel", "Cancel current operation")
+        BotCommand("cancel", "Cancel current operation"),
+        BotCommand("debug", "Show debug information")
     ]
     await application.bot.set_my_commands(commands)
     
@@ -1869,6 +1939,10 @@ async def on_shutdown():
     global application
     logger.info("Shutting down...")
     if application:
-        await application.stop()
-        await application.shutdown()
+        try:
+            await application.stop()
+            await application.shutdown()
+        except Exception as e:
+            logger.error(f"Error shutting down application: {str(e)}")
+        application = None
     logger.info("Bot stopped")
