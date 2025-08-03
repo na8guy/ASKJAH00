@@ -110,10 +110,13 @@ if not BOT_USDT_ADDRESS:
     logger.error("BOT_USDT_ADDRESS not found in .env file")
     raise ValueError("BOT_USDT_ADDRESS not found in .env file")
 try:
-    w3_eth.eth.account.from_key(BOT_USDT_ADDRESS)  # Validate address
-except:
-    logger.error("Invalid BOT_USDT_ADDRESS")
-    raise ValueError("Invalid BOT_USDT_ADDRESS")
+    if not Web3.is_address(BOT_USDT_ADDRESS):
+        logger.error("Invalid BOT_USDT_ADDRESS: Not a valid Ethereum address")
+        raise ValueError("Invalid BOT_USDT_ADDRESS: Not a valid Ethereum address")
+    BOT_USDT_ADDRESS = Web3.to_checksum_address(BOT_USDT_ADDRESS)  # Ensure checksum format
+except Exception as e:
+    logger.error(f"Error validating BOT_USDT_ADDRESS: {str(e)}")
+    raise ValueError(f"Error validating BOT_USDT_ADDRESS: {str(e)}")
 USDT_CONTRACT_ADDRESS = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
 USDT_ABI = [
     {
