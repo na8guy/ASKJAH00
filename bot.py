@@ -193,7 +193,7 @@ DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_add
 (SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
  SELECT_TOKEN, BUY_AMOUNT, CONFIRM_TRADE, TRANSFER_TOKEN, TRANSFER_AMOUNT, TRANSFER_ADDRESS,
  CONFIRM_NEW_WALLET, SET_WALLET_METHOD, INPUT_MNEMONIC, INPUT_PRIVATE_KEY, CONFIRM_SET_WALLET,
- SELECT_TOKEN_ACTION, SELL_AMOUNT) = range(17)
+ SELECT_TOKEN_ACTION, SELL_AMOUNT,INPUT_CONTRACT) = range(18)
 
 def derive_user_key(user_id: int) -> bytes:
     kdf = PBKDF2HMAC(
@@ -589,7 +589,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        usdt_amount = 5.0
+        usdt_amount = 1.0
         usdt_amount_wei = int(usdt_amount * 10**6)
 
         user_key = derive_user_key(user_id)
@@ -1094,56 +1094,123 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await check_subscription(user_id):
         await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
         return ConversationHandler.END
-    user = users_collection.find_one({'user_id': user_id})
-    if not user:
-        await update.message.reply_text("No wallet found. Please use /start to create a wallet or /set_wallet to import one.")
-        return ConversationHandler.END
-    if user['trading_mode'] != 'manual':
-        await update.message.reply_text("Please set trading mode to Manual using /setmode.")
-        return ConversationHandler.END
+        
+    await update.message.reply_text(
+        "🔍 Enter the Solana token contract address you want to trade:\n"
+        "(e.g., 4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R)\n\n"
+        "You can find token addresses on DexScreener or Solscan."
+    )
+    return INPUT_CONTRACT
+
+async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    contract_address = update.message.text.strip()
     
-    token = await fetch_latest_token()
+    # Validate contract address
+    if len(contract_address) < 32 or len(contract_address) > 44:
+        await update.message.reply_text("❌ Invalid contract address format. Please enter a valid Solana token address.")
+        return INPUT_CONTRACT
+    
+    # Fetch token data
+    await update.message.reply_text("⏳ Fetching token data...")
+    token = await fetch_token_by_contract(contract_address)
+    
     if not token:
-        await update.message.reply_text("Failed to fetch token data. Try again later.")
+        await update.message.reply_text("❌ Failed to fetch token data. Please verify the contract address and try again.")
         return ConversationHandler.END
-    
-    # Check global posted tokens
-    if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
-        await update.message.reply_text("This token has already been posted recently.")
-        return ConversationHandler.END
-    
-    if token['contract_address'] in user.get('posted_tokens', []):
-        await update.message.reply_text("You've already seen this token. Use /reset_tokens to clear your history.")
-        return ConversationHandler.END
-    
+        
     context.user_data['current_token'] = token
+    
+    # Format the token info
+    message = format_token_message(token)
+    
+    # Create action buttons
     keyboard = [
-        [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
-        [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
+        [InlineKeyboardButton("💰 Buy", callback_data=f"buy_{token['contract_address']}"),
+         InlineKeyboardButton("💸 Sell", callback_data=f"sell_{token['contract_address']}")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        f"<b>Latest Solana Token</b>\n"
-        f"Name: {token['name']} ({token['symbol']})\n"
-        f"Contract: {token['contract_address']}\n"
-        f"Price: ${token['price_usd']:.6f}\n"
-        f"Market Cap: ${token['market_cap']:,.2f}\n"
-        f"DexScreener: <a href='{token['dexscreener_url']}'>View on DexScreener</a>\n"
-        f"Select an action:",
-        parse_mode='HTML',
-        reply_markup=reply_markup
-    )
     
-    # Update global and user token records
-    db.global_posted_tokens.insert_one({
-        'contract_address': token['contract_address'],
-        'timestamp': datetime.now()
-    })
-    users_collection.update_one(
-        {'user_id': user_id},
-        {'$addToSet': {'posted_tokens': token['contract_address']}}
-    )
+    # Send token info with image
+    try:
+        if token.get('image'):
+            await context.bot.send_photo(
+                chat_id=user_id,
+                photo=token['image'],
+                caption=message,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+    except Exception as e:
+        logger.error(f"Error sending token info: {str(e)}")
+        await update.message.reply_text(
+            f"✅ Successfully fetched {token['name']}!\n" + message,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+    
     return SELECT_TOKEN_ACTION
+
+async def fetch_token_by_contract(contract_address: str):
+    """Fetch token data by contract address"""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            # Fetch token details directly
+            token_url = DEXSCREENER_TOKEN_API.format(token_address=contract_address)
+            token_response = await client.get(token_url)
+            token_response.raise_for_status()
+            token_data = token_response.json()
+            
+            if not token_data or not token_data.get('pairs') or not token_data['pairs']:
+                logger.error(f"No token data found for contract: {contract_address}")
+                return None
+                
+            pair_data = token_data['pairs'][0]
+            
+            # Extract token information
+            token = {
+                'name': pair_data.get('baseToken', {}).get('name', 'Unknown'),
+                'symbol': pair_data.get('baseToken', {}).get('symbol', 'UNKNOWN'),
+                'contract_address': contract_address,
+                'price_usd': float(pair_data.get('priceUsd', 0)),
+                'market_cap': float(pair_data.get('fdv', 0)),
+                'liquidity': float(pair_data.get('liquidity', {}).get('usd', 0)),
+                'volume': float(pair_data.get('volume', {}).get('h24', 0)),
+                'dexscreener_url': pair_data.get('url', f"https://dexscreener.com/solana/{contract_address}"),
+                'image': pair_data.get('baseToken', {}).get('logoURI', '')
+            }
+            
+            # Fetch additional details from profile if available
+            try:
+                profile_url = f"{DEXSCREENER_PROFILE_API}?tokenAddress={contract_address}"
+                profile_response = await client.get(profile_url)
+                if profile_response.is_success:
+                    profile_data = profile_response.json()
+                    if profile_data and isinstance(profile_data, list) and profile_data[0]:
+                        profile = profile_data[0]
+                        token['website'] = next(
+                            (link['url'] for link in profile.get('links', []) 
+                             if link.get('label') == 'Website'), ''
+                        )
+                        token['socials'] = {
+                            link['type']: link['url'] 
+                            for link in profile.get('links', []) 
+                            if link.get('type')
+                        }
+            except Exception as e:
+                logger.warning(f"Couldn't fetch profile data: {str(e)}")
+            
+            return token
+        except Exception as e:
+            logger.error(f"Error fetching token by contract: {str(e)}")
+            return None
 
 async def select_token_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -1313,6 +1380,7 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def confirm_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    await query.edit_message_text(text="⏳ Processing your trade...")
     user_id = query.from_user.id
     if not await check_subscription(user_id):
         await query.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
@@ -1897,15 +1965,16 @@ def setup_handlers(application: Application):
         fallbacks=[CommandHandler("cancel", cancel)]
     ))
     application.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("trade", trade)],
-        states={
-            SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action, pattern='^(buy|sell)_')],
-            BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
-            SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
-            CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade, pattern='^(confirm_trade|cancel_trade)$')]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)]
-    ))
+    entry_points=[CommandHandler("trade", trade)],
+    states={
+        INPUT_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_contract)],
+        SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action, pattern='^(buy|sell)_')],
+        BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
+        SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
+        CONFIRM_TRADE: [CallbackQueryHandler(confirm_trade, pattern='^(confirm_trade|cancel_trade)$')]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)]
+))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("transfer", transfer)],
