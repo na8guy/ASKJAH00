@@ -462,37 +462,35 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         # Format token info
-        is_suspicious = token.get('liquidity', 0) < 1000 or token.get('volume', 0) < 1000
-        warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
-        
-        socials = token.get('socials', {})
-        social_links = "\n".join([f"{k.capitalize()}: {v}" for k, v in socials.items()]) if socials else "N/A"
-        
-        message = (
-            f"<b>Manual Token Fetch</b>\n"
-            f"Name: {token.get('name', 'Unknown')} ({token.get('symbol', '?')})\n"
-            f"Contract: {token['contract_address']}\n"
-            f"Price: ${token.get('price_usd', 0):.6f}\n"
-            f"Market Cap: ${token.get('market_cap', 0):,.2f}\n"
-            f"Liquidity: ${token.get('liquidity', 0):,.2f}\n"
-            f"24h Volume: ${token.get('volume', 0):,.2f}\n"
-            f"Website: {token.get('website', 'N/A')}\n"
-            f"Socials:\n{social_links}\n"
-            f"{warning}\n"
-            f"DexScreener: <a href='{token.get('dexscreener_url', '')}'>View Chart</a>"
-        )
-        
+        message = format_token_message(token)
+    
+    # Create buttons
         keyboard = [
-            [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
-            [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
+        [InlineKeyboardButton("💰 Buy", callback_data=f"buy_{token['contract_address']}"),
+         InlineKeyboardButton("💸 Sell", callback_data=f"sell_{token['contract_address']}")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
+        try:
+            if token.get('image'):
+             await update.message.reply_photo(
+                photo=token['image'],
+                caption=message,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+            else:
+               await update.message.reply_text(
+                message,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+         logger.error(f"Error sending token: {str(e)}")
         await update.message.reply_text(
-            message,
-            parse_mode='HTML',
-            reply_markup=reply_markup,
-            disable_web_page_preview=True
+            f"✅ Fetched {token['name']}!\n" + message,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
         )
         
         # Update global and user token records
@@ -517,60 +515,94 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Start token updates for a subscribed user"""
-    # Remove any existing jobs for this user
+    # Remove any existing jobs
     jobs = context.job_queue.get_jobs_by_name(f"token_updates_{user_id}")
     for job in jobs:
         job.schedule_removal()
-        logger.debug(f"Removed existing job for user {user_id}")
     
-    logger.info(f"Starting token updates for user {user_id}")
+    logger.info(f"🚀 Starting token updates for user {user_id}")
     
-    # Schedule the token update job
+    # Run first check immediately
+    context.job_queue.run_once(
+        lambda ctx: update_token_info(ctx),
+        when=0,
+        user_id=user_id,
+        name=f"immediate_fetch_{user_id}"
+    )
+    
+    # Schedule recurring checks
     context.job_queue.run_repeating(
         update_token_info,
-        interval=6,
-        first=5,
+        interval=30,
+        first=30,  # First recurring in 30 seconds
         user_id=user_id,
         name=f"token_updates_{user_id}"
     )
 
 
 def format_token_message(token):
-    # Extract social links
-    socials = token.get('socials', {})
-    social_links = ""
-    for platform, url in socials.items():
-        platform_icon = {
-            'telegram': '📢',
-            'twitter': '🐦',
-            'website': '🌐',
-            'discord': '💬'
-        }.get(platform.lower(), '🔗')
-        social_links += f"{platform_icon} [{platform.capitalize()}]({url})\n"
+    """Create beautifully formatted token message"""
+    # Emoji mapping for social platforms
+    platform_icons = {
+        'telegram': '📢',
+        'twitter': '🐦',
+        'website': '🌐',
+        'discord': '💬',
+        'medium': '✍️'
+    }
     
-    # Format market data
-    market_data = (
+    # Build social links
+    social_links = ""
+    for platform, url in token.get('socials', {}).items():
+        icon = platform_icons.get(platform.lower(), '🔗')
+        social_links += f"{icon} [{platform.capitalize()}]({url})\n"
+    
+    # Create token info
+    return (
+        f"🚀 *{token.get('name', 'New Token')} ({token.get('symbol', 'TOKEN')})*\n\n"
         f"💵 *Price:* ${token.get('price_usd', 0):.6f}\n"
         f"📊 *Market Cap:* ${token.get('market_cap', 0):,.2f}\n"
         f"💧 *Liquidity:* ${token.get('liquidity', 0):,.2f}\n"
-        f"📈 *24h Volume:* ${token.get('volume', 0):,.2f}\n"
-    )
-    
-    # Create warning if needed
-    is_suspicious = token.get('liquidity', 0) < 1000 or token.get('volume', 0) < 1000
-    warning = "🚨 *Low liquidity/volume! Trade with caution!*" if is_suspicious else ""
-    
-    # Build final message
-    return (
-        f"🚀 *{token.get('name', 'New Token')} ({token.get('symbol', 'TOKEN')})*\n\n"
-        f"{market_data}\n"
+        f"📈 *24h Volume:* ${token.get('volume', 0):,.2f}\n\n"
         f"🔗 *Contract:* `{token.get('contract_address', '')}`\n\n"
-        f"🔗 *Links:*\n{social_links}\n"
-        f"{warning}\n"
+        f"🔗 *Links:*\n{social_links or 'No links available'}\n"
+        f"{'⚠️ *LOW LIQUIDITY - Trade with caution!*' if token.get('liquidity', 0) < 1000 else ''}\n"
         f"[📊 View Chart]({token.get('dexscreener_url', '')}) | "
         f"[🖼️ View Image]({token.get('image', '')})"
     )
 
+
+async def token_system_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = users_collection.find_one({'user_id': user_id})
+    
+    # Get job information
+    job_status = "No active jobs"
+    if context.job_queue:
+        jobs = context.job_queue.get_jobs_by_name(f"token_updates_{user_id}")
+        if jobs:
+            next_run = jobs[0].next_t.strftime('%Y-%m-%d %H:%M:%S')
+            job_status = f"Active (next run: {next_run})"
+    
+    # Get token stats
+    global_token_count = db.global_posted_tokens.count_documents({
+        'timestamp': {'$gt': datetime.now() - timedelta(hours=24)}
+    })
+    user_token_count = len(user.get('posted_tokens', [])) if user else 0
+    
+    message = (
+        f"🔧 *Token System Debug*\n\n"
+        f"🔄 **Automatic Fetch Status:** {job_status}\n"
+        f"⏱️ **Last Token Check:** {datetime.fromtimestamp(user.get('last_token_check', 0)) if user and 'last_token_check' in user else 'Never'}\n"
+        f"📊 **Global Tokens (24h):** {global_token_count}\n"
+        f"👤 **Your Tokens Seen:** {user_token_count}\n\n"
+        f"🛠️ **Troubleshooting:**\n"
+        f"- Use /fetch_tokens to test manual fetch\n"
+        f"- Use /reset_tokens to clear your token history\n"
+        f"- Ensure your subscription is active with /subscribe"
+    )
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1212,11 +1244,17 @@ async def fetch_token_by_contract(contract_address: str):
             logger.error(f"Error fetching token by contract: {str(e)}")
             return None
 
+
 async def select_token_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    logger.debug(f"select_token_action called for user {user_id} with data: {query.data}")
+    logger.debug(f"Received callback: {query.data}")
+    
+    # Immediately update the button to prevent "loading" state
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as e:
+        logger.warning(f"Couldn't remove buttons: {str(e)}")
 
     await query.edit_message_text(text="⏳ Processing your request...")
     
@@ -1598,7 +1636,7 @@ async def fetch_latest_token():
 
 async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.user_id
-    logger.info(f"Starting token update for user {user_id}")
+    logger.info(f"⏰ Automatic token fetch triggered for user {user_id}")
     
     try:
         # Check if user exists and is subscribed
@@ -1633,6 +1671,14 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
         # Check global and user token history
         if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
             logger.debug(f"Token {token['contract_address']} already posted globally")
+            return
+
+        if not token:
+            logger.error(f"🔴 Token fetch failed for user {user_id}")
+            await context.bot.send_message(
+                user_id,
+                "⚠️ Token fetch failed this cycle. Will retry in 30 seconds."
+            )
             return
             
         if token['contract_address'] in user.get('posted_tokens', []):
@@ -1688,9 +1734,14 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
         if user.get('trading_mode') == 'automatic':
             await auto_trade(context, user_id=user_id, token=token)
             
+        logger.info(f"✅ Automatic token sent to user {user_id}")
+        
     except Exception as e:
-        logger.error(f"Critical error in token update for user {user_id}: {str(e)}", exc_info=True)
-
+        logger.error(f"🔥 Critical error in auto-fetch: {str(e)}", exc_info=True)
+        await context.bot.send_message(
+            user_id,
+            "❌ Critical error in automatic token fetch. Please contact support."
+        )
 async def check_balance(user_id, chain):
     user = users_collection.find_one({'user_id': user_id})
     if not user:
@@ -1935,6 +1986,7 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("subscribe", subscribe))
     application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
     application.add_handler(CommandHandler("trade_status", trade_status))
+    application.add_handler(CommandHandler("token_debug", token_system_debug))
     application.add_handler(CommandHandler("debug", debug))
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("generate_wallet", generate_wallet)],
