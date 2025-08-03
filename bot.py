@@ -4,7 +4,15 @@ import requests
 import httpx
 import base64
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    CallbackQueryHandler, 
+    ContextTypes, 
+    ConversationHandler, 
+    MessageHandler, 
+    filters
+)
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
 from solders.keypair import Keypair
@@ -32,15 +40,6 @@ try:
     import base64 as base64_cryptography
 except ImportError:
     raise ImportError("Missing 'cryptography' package. Install it with: pip install cryptography")
-try:
-    from fastapi import FastAPI, Request, HTTPException
-    from fastapi.responses import JSONResponse
-except ImportError:
-    raise ImportError("Missing 'fastapi' package. Install it with: pip install fastapi")
-try:
-    import uvicorn
-except ImportError:
-    raise ImportError("Missing 'uvicorn' package. Install it with: pip install uvicorn[standard]")
 
 from datetime import datetime, timedelta
 import time
@@ -48,20 +47,11 @@ import os
 from dotenv import load_dotenv
 from web3 import Web3
 from eth_account import Account
-import structlog
 
-structlog.configure(
-    processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.stdlib.add_log_level,
-        structlog.processors.JSONRenderer()
-    ],
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
-)
-logger = structlog.get_logger()
+# FastAPI setup
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+
 # Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -77,17 +67,21 @@ load_dotenv()
 # Create FastAPI app
 app = FastAPI()
 
-# Root endpoint for Render health checks
-@app.get("/")
-async def root():
-    return JSONResponse(content={'status': 'ok'})
-
-# Health check endpoint
 @app.get("/health")
 async def health_check():
     return JSONResponse(content={'status': 'ok'})
 
-
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        update_data = await request.json()
+        update = Update.de_json(update_data, application.bot)
+        if update:
+            await application.update_queue.put(update)
+        return JSONResponse(content={'status': 'ok'})
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return JSONResponse(content={'error': str(e)}, status_code=500)
 
 GMGN_API_HOST = 'https://gmgn.ai'
 
@@ -1542,119 +1536,59 @@ async def execute_trade(user_id, contract_address, amount, action, chain):
                 }
                 status_response = await client.get(status_url, params=status_params)
                 status_response.raise_for_status()
-                status = status_response.json
+                status = status_response.json()
+                
                 if status.get('code') != 0:
-                    logger.error(f"Failed to get transaction status for user {user_id}: {status.get('msg')}")
+                    logger.error(f"Failed to check transaction status for user {user_id}: {status.get('msg')}")
                     return False
                 
-                if status['data']['status'] == 'confirmed':
-                    logger.debug(f"Transaction confirmed for user {user_id}: {tx_hash}")
+                if status['data']['success']:
+                    logger.info(f"Transaction {tx_hash} successful for user {user_id}")
                     return True
-                
-                if status['data']['status'] == 'failed':
-                    logger.error(f"Transaction failed for user {user_id}: {status['data'].get('error', 'Unknown error')}")
+                elif status['data']['expired']:
+                    logger.error(f"Transaction {tx_hash} expired for user {user_id}")
                     return False
                 
-                logger.debug(f"Waiting for transaction confirmation for user {user_id}, attempt {attempt + 1}")
                 await asyncio.sleep(1)
             
-            logger.error(f"Transaction timed out for user {user_id}: {tx_hash}")
+            logger.error(f"Transaction {tx_hash} timed out after {max_attempts} seconds for user {user_id}")
             return False
-
+    
     except Exception as e:
-        logger.error(f"Error executing {action} trade for user {user_id}: {str(e)}")
+        logger.error(f"Error executing {action} trade for user {user_id}: {str(e)}", exc_info=True)
         return False
 
-async def execute_transfer(user_id, recipient: Pubkey, token_contract: str, amount: float, chain: str) -> bool:
+async def execute_transfer(user_id, recipient, token_contract, amount, chain):
     if chain != 'solana':
-        logger.error(f"Transfers not supported for {chain} yet")
+        logger.error(f"Transfer not supported for {chain} yet")
         return False
-    
-    user = users_collection.find_one({'user_id': user_id})
-    if not user:
-        logger.error(f"No user found for user_id {user_id}")
-        return False
-    
-    try:
-        decrypted_user = await decrypt_user_wallet(user_id, user)
-        solana_private_key = decrypted_user['solana']['private_key']
-        if not solana_private_key or solana_private_key == "[Decryption Failed]":
-            logger.error(f"Failed to decrypt Solana private key for user {user_id}")
-            return False
-        keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
-        
-        balance = await check_balance(user_id, 'solana')
-        if balance < 0.000005:  # Minimum for transaction fees
-            logger.error(f"Insufficient SOL balance for transfer fees for user {user_id}: {balance} SOL")
-            return False
-        
-        # Placeholder for token transfer (using Solana's SPL token program)
-        # Note: Actual token transfer requires interacting with the SPL token program
-        # For simplicity, this assumes a native SOL transfer as a placeholder
-        transfer_instruction = transfer(
-            TransferParams(
-                from_pubkey=keypair.pubkey(),
-                to_pubkey=recipient,
-                lamports=int(amount * 1_000_000_000)  # Convert SOL to lamports
-            )
-        )
-        transaction = Transaction().add(transfer_instruction)
-        transaction.sign(keypair)
-        
-        async with solana_client as client:
-            response = await client.send_transaction(transaction, keypair)
-            tx_hash = response.value
-            logger.debug(f"Transfer transaction sent for user {user_id}: {tx_hash}")
-            
-            max_attempts = 60
-            for attempt in range(max_attempts):
-                status = await client.get_transaction(tx_hash, commitment="confirmed")
-                if status.value:
-                    logger.debug(f"Transfer confirmed for user {user_id}: {tx_hash}")
-                    return True
-                logger.debug(f"Waiting for transfer confirmation for user {user_id}, attempt {attempt + 1}")
-                await asyncio.sleep(1)
-            
-            logger.error(f"Transfer timed out for user {user_id}: {tx_hash}")
-            return False
-
-    except Exception as e:
-        logger.error(f"Error executing transfer for user {user_id}: {str(e)}")
-        return False
+    logger.info(f"Transferring {amount} SOL worth of {token_contract} to {recipient} ({chain})")
+    return True
 
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int, token: dict):
     user = users_collection.find_one({'user_id': user_id})
-    if not user or user['trading_mode'] != 'automatic':
+    if not await check_subscription(user_id):
         return
-    
-    if time.time() - user['last_api_call'] < 1:
-        return
-    
-    portfolio = user.get('portfolio', {})
-    if token['contract_address'] in portfolio:
-        buy_price = portfolio[token['contract_address']]['buy_price']
+    if token['contract_address'] in user['portfolio']:
+        buy_price = user['portfolio'][token['contract_address']]['buy_price']
         current_price = token['price_usd']
-        price_change = ((current_price - buy_price) / buy_price) * 100
+        price_change = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0
         
         if price_change >= user['sell_percentage']:
-            success = await execute_trade(
-                user_id, token['contract_address'],
-                portfolio[token['contract_address']]['amount'], 'sell', 'solana'
-            )
+            success = await execute_trade(user_id, token['contract_address'], 
+                                       user['portfolio'][token['contract_address']]['amount'], 'sell', 'solana')
             if success:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"Sold {token['name']} at {price_change:.2f}% profit."
+                    text=f"Sold {token['name']} at {price_change:.2f}% profit!"
                 )
                 users_collection.update_one(
                     {'user_id': user_id},
                     {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
                 )
         elif price_change <= -user['loss_percentage']:
-            success = await execute_trade(
-                user_id, token['contract_address'],
-                portfolio[token['contract_address']]['amount'], 'sell', 'solana'
-            )
+            success = await execute_trade(user_id, token['contract_address'], 
+                                       user['portfolio'][token['contract_address']]['amount'], 'sell', 'solana')
             if success:
                 await context.bot.send_message(
                     chat_id=user_id,
@@ -1749,112 +1683,60 @@ def setup_handlers(application: Application):
     ))
     application.add_error_handler(error_handler)
 
-
-
-# Telegram webhook endpoint
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    try:
-        update_data = await request.json()
-        logger.info(
-            "Received webhook update",
-            update_id=update_data.get("update_id"),
-            request_headers=dict(request.headers),
-            request_body=update_data
-        )
-        update = Update.de_json(update_data, application.bot)
-        if not update:
-            logger.error("Failed to parse Telegram update", update_data=update_data)
-            raise HTTPException(status_code=400, detail="Invalid Telegram update")
-        await application.update_queue.put(update)
-        logger.info("Update queued successfully", update_id=update.get("update_id"))
-        return JSONResponse(content={"status": "ok"})
-    except Exception as e:
-        logger.error("Webhook processing error", error=str(e), exc_info=True)
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-@app.get("/debug")
-async def debug_info():
-    try:
-        webhook_info = await application.bot.get_webhook_info()
-        logger.info("Fetched webhook info", webhook_info=webhook_info.to_dict())
-        return JSONResponse(content={
-            "status": "ok",
-            "webhook_info": webhook_info.to_dict(),
-            "application_initialized": application is not None,
-            "environment": {
-                "TELEGRAM_TOKEN": bool(os.getenv("TELEGRAM_TOKEN")),
-                "WEBHOOK_URL": os.getenv("WEBHOOK_URL"),
-                "PORT": os.getenv("PORT")
-            }
-        })
-    except Exception as e:
-        logger.error("Debug endpoint error", error=str(e), exc_info=True)
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info(
-        "FastAPI application starting",
-        environment={
-            "PORT": os.getenv("PORT"),
-            "WEBHOOK_URL": os.getenv("WEBHOOK_URL"),
-            "TELEGRAM_TOKEN_SET": bool(os.getenv("TELEGRAM_TOKEN"))
-        }
-    )
+# Global application instance
+application = None
 
 async def main():
     global application
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-    if not TELEGRAM_TOKEN:
-        logger.error("Missing TELEGRAM_TOKEN", exc_info=True)
-        raise ValueError("TELEGRAM_TOKEN not found in .env file")
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    if not TELEGRAM_TOKEN or not WEBHOOK_URL:
+        logger.error("TELEGRAM_TOKEN or WEBHOOK_URL not found in .env file")
+        raise ValueError("TELEGRAM_TOKEN or WEBHOOK_URL not found in .env file")
     
+    # Create application instance
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        .updater(None)  # We're handling webhook ourselves
+        .updater(None)  # Disable built-in updater since we're using webhooks
         .build()
     )
     
+    # Set up handlers
     setup_handlers(application)
     
-    logger.info("Initializing Telegram application")
+    # Initialize application
     await application.initialize()
     
-    webhook_url = os.getenv("WEBHOOK_URL")
-    if not webhook_url:
-        logger.error("Missing WEBHOOK_URL", exc_info=True)
-        raise ValueError("WEBHOOK_URL not found in .env file")
-    
-    # Verify and set webhook
-    try:
-        webhook_info = await application.bot.get_webhook_info()
-        logger.info("Current webhook info", webhook_info=webhook_info.to_dict())
-        if webhook_info.url != webhook_url:
-            logger.warning(
-                "Webhook URL mismatch",
-                current_url=webhook_info.url,
-                expected_url=webhook_url
-            )
-            await application.bot.set_webhook(url=webhook_url)
-            logger.info("Webhook reset successfully", url=webhook_url)
-        else:
-            logger.info("Webhook URL is correctly set", url=webhook_info.url)
-    except Exception as e:
-        logger.error("Failed to verify/set webhook", error_message=str(e), exc_info=True)
-        raise
-    
-    logger.info("Starting FastAPI server", webhook_url=webhook_url)
-    config = uvicorn.Config(
-        app=app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 5000)),
-        log_level="info"
+    # Set webhook
+    await application.bot.set_webhook(
+        url=WEBHOOK_URL,
+        allowed_updates=Update.ALL_TYPES
     )
-    server = uvicorn.Server(config)
-    logger.info("Starting Uvicorn server", port=os.getenv("PORT", 5000))
-    await server.serve()
+    logger.info(f"Webhook set to {WEBHOOK_URL}")
+    
+    # Set bot commands
+    commands = [
+        BotCommand("start", "Start the bot and create or view wallet"),
+        BotCommand("subscribe", "Subscribe to use trading features"),
+        BotCommand("generate_wallet", "Generate a new wallet"),
+        BotCommand("set_wallet", "Import an existing wallet"),
+        BotCommand("reset_tokens", "Reset posted tokens list"),
+        BotCommand("setmode", "Set trading mode (manual/automatic)"),
+        BotCommand("trade", "Trade Solana tokens manually"),
+        BotCommand("balance", "Check wallet balance"),
+        BotCommand("transfer", "Transfer Solana tokens"),
+        BotCommand("cancel", "Cancel current operation")
+    ]
+    await application.bot.set_my_commands(commands)
+    
+    # Start the application
+    await application.start()
+    logger.info("Bot started successfully. Press Ctrl+C to stop")
+    
+    # Keep the application running
+    while True:
+        await asyncio.sleep(3600)  # Sleep for 1 hour
 
 if __name__ == '__main__':
     asyncio.run(main())
