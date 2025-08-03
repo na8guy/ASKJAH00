@@ -403,13 +403,77 @@ async def get_subscription_status_message(user: dict) -> str:
         )
         return "Your subscription has expired. Use /subscribe to renew."
 
+
+async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await check_subscription(user_id):
+        await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
+        return
+
+    # Force fetch token immediately
+    token = await fetch_latest_token()
+    if not token:
+        await update.message.reply_text("Failed to fetch token data. Try again later.")
+        return
+
+    # Check if already posted
+    if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
+        await update.message.reply_text("This token has already been posted recently.")
+        return
+
+    user = users_collection.find_one({'user_id': user_id})
+    if token['contract_address'] in user.get('posted_tokens', []):
+        await update.message.reply_text("You've already seen this token. Use /reset_tokens to clear your history.")
+        return
+
+    # Format token info
+    is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
+    warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
+    
+    social_links = "\n".join([f"{k.capitalize()}: {v}" for k, v in token['socials'].items()])
+    message = (
+        f"<b>Manual Token Fetch</b>\n"
+        f"Name: {token['name']} ({token['symbol']})\n\n"
+        f"Contract: {token['contract_address']}\n\n"
+        f"Price: ${token['price_usd']:.6f}\n"
+        f"Market Cap: ${token['market_cap']:,.2f}\n\n"
+        f"Liquidity: ${token['liquidity']:,.2f}\n\n"
+        f"24h Volume: ${token['volume']:,.2f}\n\n"
+        f"Website: {token['website']}\n\n"
+        f"Socials:\n{social_links or 'N/A'}\n\n"
+        f"Image: <a href='{token['image']}'>View Image</a>\n\n"
+        f"DexScreener: <a href='{token['dexscreener_url']}'>View on DexScreener</a>\n"
+        f"{warning}"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
+        [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        message,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+    
+    # Update global and user token records
+    db.global_posted_tokens.insert_one({
+        'contract_address': token['contract_address'],
+        'timestamp': datetime.now()
+    })
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$addToSet': {'posted_tokens': token['contract_address']}}
+    )
+
 async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Start token updates for a subscribed user"""
-    # Check if the user already has a job running
-    current_jobs = context.job_queue.get_jobs_by_name(f"token_updates_{user_id}")
-    if current_jobs:
-        logger.debug(f"Token updates already running for user {user_id}")
-        return
+    # Remove any existing jobs for this user
+    jobs = context.job_queue.get_jobs_by_name(f"token_updates_{user_id}")
+    for job in jobs:
+        job.schedule_removal()
     
     logger.debug(f"Starting token updates for user {user_id}")
     
@@ -1691,6 +1755,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def setup_handlers(application: Application):
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("subscribe", subscribe))
+    application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("generate_wallet", generate_wallet)],
         states={
@@ -1778,6 +1843,7 @@ async def setup_bot():
         BotCommand("subscribe", "Subscribe to use trading features"),
         BotCommand("generate_wallet", "Generate a new wallet"),
         BotCommand("set_wallet", "Import an existing wallet"),
+        BotCommand("fetch_tokens", "Manually fetch new tokens"),
         BotCommand("reset_tokens", "Reset posted tokens list"),
         BotCommand("setmode", "Set trading mode (manual/automatic)"),
         BotCommand("trade", "Trade Solana tokens manually"),
