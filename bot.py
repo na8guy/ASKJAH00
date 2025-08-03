@@ -45,6 +45,7 @@ from web3 import Web3
 from eth_account import Account
 import threading
 
+
 # Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -56,6 +57,18 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 
 # Load environment variables
 load_dotenv()
+
+# Flask app for health check
+app = Flask(__name__)
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'ok'})
+
+def run_flask():
+    port = int(os.getenv('PORT', 8080))
+    # Run Flask without Werkzeug's reloader to avoid event loop issues
+    app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
 
 GMGN_API_HOST = 'https://gmgn.ai'
 
@@ -1651,6 +1664,7 @@ async def main():
         logger.error("TELEGRAM_BOT_TOKEN not found in .env file")
         raise ValueError("TELEGRAM_BOT_TOKEN not found in .env file")
     
+    # Initialize Telegram application
     application = Application.builder().token(token).build()
 
     # Set up command and conversation handlers
@@ -1734,12 +1748,34 @@ async def main():
     # Start Flask in a separate thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
+    logger.info("Flask server started in separate thread")
     
     # Start payment checking job
-    application.job_queue.run_repeating(check_payment, interval=60, first=10)
+    if application.job_queue:
+        application.job_queue.run_repeating(check_payment, interval=60, first=10)
+        logger.info("Payment checking job scheduled")
+    else:
+        logger.error("JobQueue is not available. Install 'python-telegram-bot[job-queue]'")
     
     # Start the bot
-    await application.run_polling()
+    try:
+        await application.run_polling(allowed_updates=["message", "callback_query"])
+        logger.info("Telegram bot polling started")
+    except Exception as e:
+        logger.error(f"Error starting Telegram bot: {str(e)}")
+        raise
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    # Create a new event loop for the main function
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(main())
+    finally:
+        # Ensure proper cleanup
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        logger.info("Event loop closed")
