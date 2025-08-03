@@ -36,10 +36,7 @@ try:
     from flask import Flask, request, jsonify
 except ImportError:
     raise ImportError("Missing 'flask' package. Install it with: pip install flask")
-try:
-    from binance.client import Client as BinanceClient
-except ImportError:
-    raise ImportError("Missing 'python-binance' package. Install it with: pip install python-binance")
+
 from datetime import datetime, timedelta
 import time
 import os
@@ -142,7 +139,7 @@ w3_eth.middleware_onion.inject(geth_poa_middleware, layer=0)
 usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
 
 # Binance client for USDT price
-binance_client = BinanceClient()
+
 
 # DexScreener API endpoints
 DEXSCREENER_PROFILE_API = "https://api.dexscreener.com/token-profiles/latest/v1"
@@ -382,10 +379,8 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        ticker = binance_client.get_symbol_ticker(symbol="USDTUSD")
-        usdt_price = float(ticker['price'])
-        subscription_cost_usd = 5.0
-        usdt_amount = subscription_cost_usd / usdt_price
+        
+        usdt_amount = 1.0
         usdt_amount_wei = int(usdt_amount * 10**6)
 
         user_key = derive_user_key(user_id)
