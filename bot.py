@@ -515,30 +515,51 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Start token updates for a subscribed user"""
-    # Remove any existing jobs
-    jobs = context.job_queue.get_jobs_by_name(f"token_updates_{user_id}")
-    for job in jobs:
-        job.schedule_removal()
-    
     logger.info(f"🚀 Starting token updates for user {user_id}")
     
-    # Run first check immediately
-    context.job_queue.run_once(
-        lambda ctx: update_token_info(ctx),
-        when=0,
-        user_id=user_id,
-        name=f"immediate_fetch_{user_id}"
-    )
+    # Log current jobs
+    all_jobs = context.job_queue.jobs()
+    logger.info(f"Current jobs: {len(all_jobs)} total jobs in queue")
     
-    # Schedule recurring checks
-    context.job_queue.run_repeating(
-        update_token_info,
-        interval=30,
-        first=30,  # First recurring in 30 seconds
-        user_id=user_id,
-        name=f"token_updates_{user_id}"
-    )
-
+    # Remove any existing jobs for this user
+    jobs = context.job_queue.get_jobs_by_name(f"token_updates_{user_id}")
+    logger.info(f"Found {len(jobs)} existing jobs for user {user_id}")
+    
+    for job in jobs:
+        job.schedule_removal()
+        logger.info(f"Removed existing job: {job.name}")
+    
+    # Schedule the token update job
+    try:
+        # Immediate job
+        context.job_queue.run_once(
+            lambda ctx: update_token_info(ctx),
+            when=0,
+            user_id=user_id,
+            name=f"immediate_fetch_{user_id}"
+        )
+        logger.info(f"Scheduled immediate job for user {user_id}")
+        
+        # Recurring job
+        context.job_queue.run_repeating(
+            update_token_info,
+            interval=30,
+            first=30,  # First recurring in 30 seconds
+            user_id=user_id,
+            name=f"token_updates_{user_id}"
+        )
+        logger.info(f"Scheduled recurring job for user {user_id} every 30 seconds")
+        
+    except Exception as e:
+        logger.error(f"Error scheduling jobs: {str(e)}")
+        # Try to notify user
+        try:
+            await context.bot.send_message(
+                user_id,
+                f"⚠️ Error scheduling token updates: {str(e)}"
+            )
+        except:
+            pass
 
 def format_token_message(token):
     """Create beautifully formatted token message"""
@@ -1244,6 +1265,43 @@ async def fetch_token_by_contract(contract_address: str):
             logger.error(f"Error fetching token by contract: {str(e)}")
             return None
 
+async def job_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.job_queue:
+        await update.message.reply_text("Job queue not initialized")
+        return
+        
+    # Get all jobs for this user
+    user_jobs = []
+    for job in context.job_queue.jobs():
+        if job.user_id == user_id:
+            next_run = job.next_t.strftime('%Y-%m-%d %H:%M:%S') if job.next_t else "N/A"
+            user_jobs.append(f"- {job.name}: Next run at {next_run}")
+    
+    if not user_jobs:
+        message = "No active jobs for your account"
+    else:
+        message = "📅 Your active jobs:\n" + "\n".join(user_jobs)
+    
+    await update.message.reply_text(message)
+
+
+async def force_token_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.job_queue:
+        await update.message.reply_text("Job queue not initialized")
+        return
+        
+    # Create a one-time job
+    context.job_queue.run_once(
+        update_token_info,
+        when=0,
+        user_id=user_id,
+        name=f"manual_fetch_{user_id}_{int(time.time())}"
+    )
+    
+    await update.message.reply_text("Token fetch triggered. You should receive tokens shortly.")
+
 
 async def select_token_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -1636,7 +1694,8 @@ async def fetch_latest_token():
 
 async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.user_id
-    logger.info(f"⏰ Automatic token fetch triggered for user {user_id}")
+    job_name = context.job.name
+    logger.info(f"🏁 Starting job: {job_name} for user {user_id}")
     
     try:
         # Check if user exists and is subscribed
@@ -1651,16 +1710,24 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
             context.job.schedule_removal()
             return
         
+        logger.info(f"User {user_id} is active, fetching token...")
+        
         # Fetch token with retries
         token = None
         for attempt in range(3):
             token = await fetch_latest_token()
             if token:
                 break
-            await asyncio.sleep(5)
+            logger.warning(f"Attempt {attempt+1} failed for user {user_id}")
+            await asyncio.sleep(2)
         
         if not token:
             logger.error(f"Failed to fetch token after 3 attempts for user {user_id}")
+            # Notify user
+            await context.bot.send_message(
+                user_id,
+                "⚠️ Failed to fetch new tokens this cycle. Will retry in 30 seconds."
+            )
             return
         
         # Check if token is valid
@@ -1668,51 +1735,56 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Invalid token data: {token}")
             return
         
-        # Check global and user token history
-        if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
-            logger.debug(f"Token {token['contract_address']} already posted globally")
-            return
-
-        if not token:
-            logger.error(f"🔴 Token fetch failed for user {user_id}")
-            await context.bot.send_message(
-                user_id,
-                "⚠️ Token fetch failed this cycle. Will retry in 30 seconds."
-            )
+        # Relaxed global token tracking (1-hour window)
+        existing_global = db.global_posted_tokens.find_one({
+            'contract_address': token['contract_address'],
+            'timestamp': {'$gt': datetime.now() - timedelta(hours=1)}
+        })
+        
+        if existing_global:
+            logger.info(f"Token {token['contract_address']} already posted globally")
             return
             
         if token['contract_address'] in user.get('posted_tokens', []):
-            logger.debug(f"User {user_id} already saw token {token['contract_address']}")
+            logger.info(f"User {user_id} already saw token {token['contract_address']}")
             return
         
-        # Format token info
-        message = format_token_message(token)
+        logger.info(f"New token found: {token['contract_address']} for user {user_id}")
         
+        # Format and send token
+        message = format_token_message(token)
         keyboard = [
-             [InlineKeyboardButton("💰 Buy", callback_data=f"buy_{token['contract_address']}"),
+            [InlineKeyboardButton("💰 Buy", callback_data=f"buy_{token['contract_address']}"),
              InlineKeyboardButton("💸 Sell", callback_data=f"sell_{token['contract_address']}")]
-      ]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Send message with error handling
+        # Try to send with image
         try:
             if token.get('image'):
-             await context.bot.send_photo(
-                chat_id=user_id,
-                photo=token['image'],
-                caption=message,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
-            )
+                await context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=token['image'],
+                    caption=message,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
             else:
-             await context.bot.send_message(
-                chat_id=user_id,
-                text=message,
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+        except Exception as e:
+            logger.error(f"Error sending token: {str(e)}")
+            # Fallback to text only
+            await context.bot.send_message(
+                user_id,
+                message,
                 parse_mode='Markdown',
                 reply_markup=reply_markup
             )
-        except Exception as e:
-         logger.error(f"Error sending token info: {str(e)}")
         
         # Update global and user token records
         try:
@@ -1730,18 +1802,18 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Error updating token records: {str(e)}")
         
-        # Auto-trade if enabled
-        if user.get('trading_mode') == 'automatic':
-            await auto_trade(context, user_id=user_id, token=token)
-            
-        logger.info(f"✅ Automatic token sent to user {user_id}")
+        logger.info(f"✅ Token sent to user {user_id}")
         
     except Exception as e:
-        logger.error(f"🔥 Critical error in auto-fetch: {str(e)}", exc_info=True)
-        await context.bot.send_message(
-            user_id,
-            "❌ Critical error in automatic token fetch. Please contact support."
-        )
+        logger.error(f"🔥 Critical error in job {job_name}: {str(e)}", exc_info=True)
+        # Try to notify user
+        try:
+            await context.bot.send_message(
+                user_id,
+                f"⚠️ Critical error in token update: {str(e)}"
+            )
+        except:
+            pass
 async def check_balance(user_id, chain):
     user = users_collection.find_one({'user_id': user_id})
     if not user:
@@ -1984,7 +2056,9 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def setup_handlers(application: Application):
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("subscribe", subscribe))
+    application.add_handler(CommandHandler("job_status", job_status))
     application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
+    application.add_handler(CommandHandler("force_fetch", force_token_fetch))
     application.add_handler(CommandHandler("trade_status", trade_status))
     application.add_handler(CommandHandler("token_debug", token_system_debug))
     application.add_handler(CommandHandler("debug", debug))
@@ -2057,8 +2131,15 @@ async def setup_bot():
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
+        .concurrent_updates(True)
         .build()
     )
+    
+    # IMPORTANT: Initialize job queue
+    if not application.job_queue:
+        application.job_queue = JobQueue()
+        application.job_queue.set_application(application)
+        await application.job_queue.start()
     
     # Set up handlers
     setup_handlers(application)
