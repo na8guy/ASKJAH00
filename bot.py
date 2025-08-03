@@ -1872,6 +1872,3 @@ async def on_shutdown():
         await application.stop()
         await application.shutdown()
     logger.info("Bot stopped")
-
-if __name__ == '__main__':
-    asyncio.run(main())
