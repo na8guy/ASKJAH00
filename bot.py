@@ -1,5 +1,5 @@
 import asyncio
-from email.mime import application
+from email.mime import application as email_application  # Avoid naming conflict
 import logging
 import requests
 import httpx
@@ -57,6 +57,7 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 
 # Load environment variables
 load_dotenv()
+telegram_application = None
 
 GMGN_API_HOST = 'https://gmgn.ai'
 
@@ -1582,8 +1583,12 @@ app = Flask(__name__)
 @app.route('/telegram_webhook', methods=['POST'])
 def telegram_webhook():
     """Handle Telegram updates via webhook"""
-    update = Update.de_json(request.get_json(), application.bot)
-    application.process_update(update)
+    if telegram_application is None:
+        logger.error("Telegram application not initialized")
+        return "Service Unavailable", 503
+        
+    update = Update.de_json(request.get_json(), telegram_application.bot)
+    telegram_application.process_update(update)
     return '', 200
 
 @app.route('/webhook/usdt', methods=['POST'])
@@ -1751,75 +1756,13 @@ async def periodic_token_check(context: ContextTypes.DEFAULT_TYPE):
             # Trigger auto-trade if enabled
             if user['trading_mode'] == 'automatic':
                 await auto_trade(context, user_id=user_id, token=token)
+
+               
                 
         except Exception as e:
             logger.error(f"Error sending token to user {user_id}: {str(e)}")
 
 
-async def periodic_token_check(context: ContextTypes.DEFAULT_TYPE):
-    """Periodic job to check for new tokens"""
-    logger.debug("Running periodic token check")
-    token = await fetch_latest_token()
-    if not token:
-        logger.debug("No new token found")
-        return
-    
-    # Get all subscribed users
-    users = users_collection.find({'subscription_status': 'active'})
-    for user in users:
-        user_id = user['user_id']
-        
-        # Skip if token was already posted
-        if token['contract_address'] in user.get('posted_tokens', []):
-            continue
-        
-        # Rate limit API calls
-        if time.time() - user.get('last_api_call', 0) < 1:
-            continue
-        
-        try:
-            is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
-            warning = "⚠️ Low liquidity or volume detected. Trade with caution." if is_suspicious else ""
-            
-            message = (
-                f"<b>New Solana Token Alert</b>\n"
-                f"Name: {token['name']} ({token['symbol']})\n"
-                f"Contract: {token['contract_address']}\n"
-                f"Price: ${token['price_usd']:.6f}\n"
-                f"Market Cap: ${token['market_cap']:,.2f}\n"
-                f"Liquidity: ${token['liquidity']:,.2f}\n"
-                f"24h Volume: ${token['volume']:,.2f}\n"
-                f"{warning}"
-            )
-            
-            keyboard = [
-                [InlineKeyboardButton("Buy", callback_data=f"buy_{token['contract_address']}")],
-                [InlineKeyboardButton("Sell", callback_data=f"sell_{token['contract_address']}")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=message,
-                parse_mode='HTML',
-                reply_markup=reply_markup
-            )
-            
-            # Update user's last API call and posted tokens
-            users_collection.update_one(
-                {'user_id': user_id},
-                {
-                    '$set': {'last_api_call': time.time()},
-                    '$addToSet': {'posted_tokens': token['contract_address']}
-                }
-            )
-            
-            # Trigger auto-trade if enabled
-            if user['trading_mode'] == 'automatic':
-                await auto_trade(context, user_id=user_id, token=token)
-                
-        except Exception as e:
-            logger.error(f"Error sending token to user {user_id}: {str(e)}")
 
 
 async def subscription_check(context: ContextTypes.DEFAULT_TYPE):
@@ -1871,17 +1814,17 @@ def main():
         raise ValueError("WEBHOOK_URL not found in .env file")
     
     # Create and configure the bot application
-    application = Application.builder().token(bot_token).build()
+    telegram_app = Application.builder().token(bot_token).build()
 
     # Add command handlers
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('subscribe', subscribe))
-    application.add_handler(CommandHandler('balance', balance))
-    application.add_handler(CommandHandler('reset_tokens', reset_tokens))
-    application.add_handler(CommandHandler('cancel', cancel))
+    telegram_app.add_handler(CommandHandler('start', start))
+    telegram_app.add_handler(CommandHandler('subscribe', subscribe))
+    telegram_app.add_handler(CommandHandler('balance', balance))
+    telegram_app.add_handler(CommandHandler('reset_tokens', reset_tokens))
+    telegram_app.add_handler(CommandHandler('cancel', cancel))
 
     # Add conversation handlers
-    application.add_handler(ConversationHandler(
+    telegram_app.add_handler(ConversationHandler(
         entry_points=[CommandHandler('setmode', set_mode)],
         states={
             SET_TRADING_MODE: [CallbackQueryHandler(mode_callback)],
@@ -1892,7 +1835,7 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)]
     ))
 
-    application.add_handler(ConversationHandler(
+    telegram_app.add_handler(ConversationHandler(
         entry_points=[CommandHandler('generate_wallet', generate_wallet)],
         states={
             CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet)],
@@ -1900,7 +1843,7 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)]
     ))
 
-    application.add_handler(ConversationHandler(
+    telegram_app.add_handler(ConversationHandler(
         entry_points=[CommandHandler('set_wallet', set_wallet)],
         states={
             SET_WALLET_METHOD: [CallbackQueryHandler(set_wallet_method)],
@@ -1911,7 +1854,7 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)]
     ))
 
-    application.add_handler(ConversationHandler(
+    telegram_app.add_handler(ConversationHandler(
         entry_points=[CommandHandler('trade', trade)],
         states={
             SELECT_TOKEN_ACTION: [CallbackQueryHandler(select_token_action)],
@@ -1922,7 +1865,7 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)]
     ))
 
-    application.add_handler(ConversationHandler(
+    telegram_app.add_handler(ConversationHandler(
         entry_points=[CommandHandler('transfer', transfer)],
         states={
             TRANSFER_TOKEN: [CallbackQueryHandler(transfer_token)],
@@ -1945,15 +1888,15 @@ def main():
         BotCommand('reset_tokens', 'Reset posted tokens list'),
         BotCommand('cancel', 'Cancel current operation')
     ]
-    application.bot.set_my_commands(commands)
+    telegram_app.bot.set_my_commands(commands)
 
     # Start periodic jobs
-    application.job_queue.run_repeating(subscription_check, interval=3600, first=10)
-    application.job_queue.run_repeating(periodic_token_check, interval=10, first=5)
+    telegram_app.job_queue.run_repeating(subscription_check, interval=3600, first=10)
+    telegram_app.job_queue.run_repeating(periodic_token_check, interval=10, first=5)
 
     # Set up webhook
     async def set_webhook():
-        await application.bot.set_webhook(
+        await telegram_app.bot.set_webhook(
             url=f"{webhook_url}/telegram_webhook",
             drop_pending_updates=True
         )
@@ -1962,6 +1905,10 @@ def main():
     # Run the webhook setup in the event loop
     loop = asyncio.get_event_loop()
     loop.run_until_complete(set_webhook())
+
+    global telegram_application
+    telegram_application = telegram_app
+
 
     # Start Flask app
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
