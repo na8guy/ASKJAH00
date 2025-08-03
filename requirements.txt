@@ -5,11 +5,11 @@ base58
 mnemonic
 pymongo
 cryptography
-fastapi
-uvicorn[standard]
+fastapi==0.110.0
+uvicorn==0.29.0
+gunicorn==21.2.0
 solana
 solders
 web3
 python-dotenv
-gunicorn
 structlog

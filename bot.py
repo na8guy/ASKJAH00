@@ -73,11 +73,15 @@ async def health_check():
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
+    global application
     try:
         update_data = await request.json()
         update = Update.de_json(update_data, application.bot)
-        if update:
-            await application.update_queue.put(update)
+        
+        # Process the update
+        async with application:
+            await application.process_update(update)
+            
         return JSONResponse(content={'status': 'ok'})
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}")
@@ -1686,7 +1690,7 @@ def setup_handlers(application: Application):
 # Global application instance
 application = None
 
-async def main():
+async def setup_bot():
     global application
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -1698,7 +1702,6 @@ async def main():
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        .updater(None)  # Disable built-in updater since we're using webhooks
         .build()
     )
     
@@ -1732,11 +1735,23 @@ async def main():
     
     # Start the application
     await application.start()
-    logger.info("Bot started successfully. Press Ctrl+C to stop")
+    logger.info("Bot started successfully")
     
-    # Keep the application running
-    while True:
-        await asyncio.sleep(3600)  # Sleep for 1 hour
+    return application
+
+@app.on_event("startup")
+async def on_startup():
+    logger.info("Starting up...")
+    await setup_bot()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global application
+    logger.info("Shutting down...")
+    if application:
+        await application.stop()
+        await application.shutdown()
+    logger.info("Bot stopped")
 
 if __name__ == '__main__':
     asyncio.run(main())
