@@ -62,20 +62,20 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 load_dotenv()
 
 # Create FastAPI app
-fastapi_app = FastAPI()
+app = FastAPI()
 
 # Root endpoint for Render health checks
-@fastapi_app.get("/")
+@app.get("/")
 async def root():
     return JSONResponse(content={'status': 'ok'})
 
 # Health check endpoint
-@fastapi_app.get("/health")
+@app.get("/health")
 async def health_check():
     return JSONResponse(content={'status': 'ok'})
 
 # Telegram webhook endpoint
-@fastapi_app.post("/webhook")
+@app.post("/webhook")
 async def telegram_webhook(request: Request):
     try:
         update_data = await request.json()
@@ -86,6 +86,12 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}")
         return JSONResponse(content={'error': str(e)}, status_code=500)
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("FastAPI application starting up...")
+    logger.info(f"Environment variables: PORT={os.getenv('PORT')}, WEBHOOK_URL={os.getenv('WEBHOOK_URL')}")
+    logger.info("Gunicorn should be running with 'gunicorn bot:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT'")
 
 GMGN_API_HOST = 'https://gmgn.ai'
 
