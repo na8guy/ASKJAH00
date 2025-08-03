@@ -1723,5 +1723,7 @@ async def main():
     )
 
 if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    # Remove direct uvicorn.run call to prevent ASGI/WSGI mismatch
+    # Deployment should use gunicorn with UvicornWorker as specified in Render start command
+    logger.error("Direct execution with uvicorn is not supported. Use 'gunicorn bot:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT' for deployment.")
+    raise RuntimeError("Direct execution not allowed. Configure gunicorn for deployment.")
