@@ -334,47 +334,62 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
     return decrypted_user
 
 async def fetch_latest_token() -> dict:
-    """Fetches the latest token from DexScreener API"""
+    """Fetches the latest Solana token from DexScreener API"""
     try:
         async with httpx.AsyncClient() as client:
-            # Get the latest token profile
-            response = await client.get(DEXSCREENER_PROFILE_API)
+            # Get latest token profiles
+            response = await client.get(
+                DEXSCREENER_PROFILE_API,
+                params={"sort": "createdAt", "order": "desc", "limit": 1, "chainId": "solana"}
+            )
             response.raise_for_status()
             data = response.json()
             
-            # Find the most recent token
+            # Validate response
             if not data or 'data' not in data or not data['data']:
+                logger.warning("No tokens found in profile response")
                 return None
                 
-            latest_token = max(
-                data['data'], 
-                key=lambda x: datetime.strptime(x['createdAt'], '%Y-%m-%dT%H:%M:%S.%fZ')
-            )
+            token_profile = data['data'][0]
+            token_address = token_profile.get('tokenAddress')
+            if not token_address:
+                logger.warning("No token address in profile")
+                return None
             
             # Get detailed token information
-            token_address = latest_token['address']
             token_url = DEXSCREENER_TOKEN_API.format(token_address=token_address)
             token_response = await client.get(token_url)
             token_response.raise_for_status()
             token_data = token_response.json()
             
             if not token_data or 'data' not in token_data or not token_data['data']:
+                logger.warning("No token data found")
                 return None
                 
             token_info = token_data['data'][0]
             
+            # Extract social links
+            social_links = {}
+            for link in token_profile.get('links', []):
+                if 'type' in link and 'url' in link:
+                    social_links[link['type']] = link['url']
+            
             return {
                 'contract_address': token_address,
-                'name': token_info['name'],
-                'symbol': token_info['symbol'],
-                'price_usd': float(token_info['price']),
-                'market_cap': float(token_info['marketCap']),
-                'liquidity': float(token_info['liquidity']),
-                'volume': float(token_info['volume']),
+                'name': token_info.get('name', token_profile.get('description', 'Unknown')).split()[0],
+                'symbol': token_info.get('symbol', 'UNKNOWN'),
+                'price_usd': float(token_info.get('price', 0.0)),
+                'market_cap': float(token_info.get('marketCap', 0.0)),
+                'liquidity': float(token_info.get('liquidity', {}).get('usd', 0.0)),
+                'volume': float(token_info.get('volume', {}).get('h24', 0.0)),
+                'image': token_profile.get('icon', ''),
+                'website': next((link['url'] for link in token_profile.get('links', []) 
+                               if link.get('label') == 'Website'), ''),
+                'socials': social_links,
                 'dexscreener_url': f"https://dexscreener.com/solana/{token_address}"
             }
     except Exception as e:
-        logger.error(f"Error fetching latest token: {str(e)}")
+        logger.error(f"Error fetching token: {str(e)}")
         return None
 
 async def get_subscription_status_message(user: dict) -> str:
@@ -569,6 +584,8 @@ async def periodic_token_check(context: ContextTypes.DEFAULT_TYPE):
         users = users_collection.find({'subscription_status': 'active'})
         for user in users:
             user_id = user['user_id']
+
+            
             
             # Skip if token already posted
             if token['contract_address'] in user.get('posted_tokens', []):
@@ -582,17 +599,24 @@ async def periodic_token_check(context: ContextTypes.DEFAULT_TYPE):
             is_risky = token['liquidity'] < 1000 or token['volume'] < 1000
             warning = "⚠️ *Low liquidity/volume - Trade with caution!*" if is_risky else ""
             
+            # Format social links
+            social_links = "\n".join(
+            [f"{k.capitalize()}: {v}" for k, v in token.get('socials', {}).items()]
+        ) or "N/A"
+        
+        # Create message
             message = (
-                f"🚀 *New Token Alert* 🚀\n\n"
-                f"*Name:* {token['name']} ({token['symbol']})\n"
-                f"*Contract:* `{token['contract_address']}`\n"
-                f"*Price:* ${token['price_usd']:.6f}\n"
-                f"*Market Cap:* ${token['market_cap']:,.2f}\n"
-                f"*Liquidity:* ${token['liquidity']:,.2f}\n"
-                f"*24h Volume:* ${token['volume']:,.2f}\n\n"
-                f"{warning}\n"
-                f"[View on DexScreener]({token['dexscreener_url']})"
-            )
+            f"🚀 *New Token Alert* 🚀\n\n"
+            f"*Name:* {token['name']} ({token['symbol']})\n"
+            f"*Contract:* `{token['contract_address']}`\n"
+            f"*Price:* ${token['price_usd']:.6f}\n"
+            f"*Market Cap:* ${token['market_cap']:,.2f}\n"
+            f"*Liquidity:* ${token['liquidity']:,.2f}\n"
+            f"*24h Volume:* ${token['volume']:,.2f}\n"
+            f"*Website:* {token['website'] or 'N/A'}\n"
+            f"*Socials:*\n{social_links}\n\n"
+            f"[View on DexScreener]({token['dexscreener_url']})"
+        )
             
             # Create buttons
             keyboard = [
@@ -763,17 +787,9 @@ def main():
     # Assign to global
     telegram_application = telegram_app
     
-    # Start Flask in a separate thread
-    def run_flask():
-        app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
-    
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info(f"Flask server running on port {PORT}")
-    
-    # Start the application
-    logger.info("Application setup complete")
-    telegram_app.run_polling()
+    # Start Flask in the main thread (remove threading)
+    logger.info(f"Starting Flask server on port {PORT}")
+    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
 if __name__ == '__main__':
     main()
