@@ -1648,16 +1648,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("An error occurred. Please try again or contact support.")
 
 # Flask app for health check
-app = Flask(__name__)
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({'status': 'ok'})
-
-def run_flask():
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))
-
-# Main function
 async def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -1745,11 +1736,6 @@ async def main():
         BotCommand("cancel", "Cancel current operation")
     ])
     
-    # Start Flask in a separate thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("Flask server started in separate thread")
-    
     # Start payment checking job
     if application.job_queue:
         application.job_queue.run_repeating(check_payment, interval=60, first=10)
@@ -1764,18 +1750,30 @@ async def main():
     except Exception as e:
         logger.error(f"Error starting Telegram bot: {str(e)}")
         raise
+    finally:
+        logger.info("Shutting down Telegram bot")
+        await application.stop()
+        await application.updater.stop()
 
 if __name__ == '__main__':
-    # Create a new event loop for the main function
+    # Run Flask with gunicorn in a separate process or use a WSGI server in production
+    # For Render, we'll rely on gunicorn (configured separately)
+    # Create a new event loop for the Telegram bot
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(main())
+    except Exception as e:
+        logger.error(f"Main loop error: {str(e)}")
     finally:
         # Ensure proper cleanup
         pending = asyncio.all_tasks(loop)
         for task in pending:
             task.cancel()
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
-        logger.info("Event loop closed")
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception as e:
+            logger.error(f"Error shutting down asyncgens: {str(e)}")
+        finally:
+            loop.close()
+            logger.info("Event loop closed")
