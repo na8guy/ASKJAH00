@@ -1664,9 +1664,9 @@ def main():
                 logger.error(f"Error processing Telegram update: {str(e)}")
                 return jsonify({'error': 'Processing failed'}), 500
 
-        logger.info(f"Starting Flask app on port {PORT}")
-        app.run(host='0.0.0.0', port=PORT)
-        
+        logger.info(f"Starting Flask app with gunicorn on port {PORT}")
+        # Gunicorn will be started via Render's start command, so no app.run()
+        return app  # Return the Flask app for gunicorn
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")
         raise
