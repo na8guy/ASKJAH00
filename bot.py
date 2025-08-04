@@ -534,16 +534,16 @@ async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Schedule periodic token updates for the subscribed user."""
     if context.job_queue:
-        # Schedule token updates every 5 minutes (adjust interval as needed)
+        # Schedule token updates every 30 seconds
         context.job_queue.run_repeating(
             update_token_info,
-            interval=30,  # 300 seconds = 5 minutes
+            interval=30,  # 30 seconds
             first=0,
             user_id=user_id,
             name=f"token_updates_{user_id}"
         )
     else:
-        logger.error("JobQueue is not initialized for token updates.")  
+        logger.error("JobQueue is not initialized for token updates.")
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1148,14 +1148,15 @@ async def fetch_token_by_contract(contract_address: str):
             if pair_response.status_code != 200:
                 logger.error(f"Pair API failed: {pair_response.status_code} - {pair_response.text}")
                 return None
-                
+            
             pair_data = pair_response.json()
             
             if not pair_data or not pair_data.get('pairs') or not pair_data['pairs']:
                 logger.error(f"No pair data found for contract: {contract_address}")
                 return None
-                
-            pair = pair_data['pairs'][0]
+            
+            # Extract the first pair from the list
+            pair = pair_data['pairs'][0]  # Access the first pair
             
             # Extract token information
             base_token = pair.get('baseToken', {})
@@ -1686,6 +1687,7 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
             context.job.schedule_removal()
             return
             
+        logger.debug(f"Subscription status for user {user_id}: {user.get('subscription_status')}, Expiry: {user.get('subscription_expiry')}")
         if not await check_subscription(user_id):
             logger.info(f"User {user_id} subscription inactive")
             context.job.schedule_removal()
