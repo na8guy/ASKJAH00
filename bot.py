@@ -54,13 +54,18 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 # Set up logging
+# Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.DEBUG
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot_debug.log")
+    ]
 )
 logger = logging.getLogger(__name__)
-logging.getLogger('telegram.ext.ConversationHandler').setLevel(logging.CRITICAL)
 logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.INFO)
 
 # Load environment variables
 load_dotenv()
@@ -77,8 +82,9 @@ async def telegram_webhook(request: Request):
     global application
     try:
         if not application:
-            logger.error("Application not initialized")
+            logger.error("🚫 Application not initialized")
             return JSONResponse(content={'error': 'Application not initialized'}, status_code=500)
+     
         
         update_data = await request.json()
         update = Update.de_json(update_data, application.bot)
@@ -88,8 +94,9 @@ async def telegram_webhook(request: Request):
             
         return JSONResponse(content={'status': 'ok'})
     except Exception as e:
-        logger.error(f"Webhook error: {str(e)}", exc_info=True)
+        logger.error(f"🔥 Webhook error: {str(e)}", exc_info=True)
         return JSONResponse(content={'error': str(e)}, status_code=500)
+
 
 GMGN_API_HOST = 'https://gmgn.ai'
 
@@ -355,18 +362,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             decrypted_user = await decrypt_user_wallet(user_id, user_data)
             eth_bsc_address = user_data['eth']['address'] if user_data['eth'] else "Not set"
             message = await update.message.reply_text(
-                f"Welcome to the Multi-Chain Trading Bot!\n\n"
-                f"A new wallet has been created for you.\n"
-                f"**Mnemonic (for Solana, ETH, BSC)**: {decrypted_user['mnemonic']}\n"
-                f"**Solana Public Key**: {user_data['solana']['public_key']}\n"
-                f"**ETH/BSC Address**: {eth_bsc_address}\n\n"
-                f"⚠️ **Security Warning** ⚠️\n"
-                f"1. **Never share your mnemonic or private keys** with anyone.\n"
-                f"2. Store them securely offline (e.g., on paper or a hardware wallet).\n"
-                f"3. This message will auto-delete in 30 seconds for security.\n"
-                f"4. Use this wallet only for trading with small amounts.\n\n"
-                f"To access trading features, subscribe using /subscribe.\n"
-                f"To import an existing wallet, use /set_wallet."
+        f"🚀 *Welcome to the Multi-Chain Trading Bot!*\n\n"
+        f"✨ A new wallet has been created for you\n"
+        f"🔐 *Mnemonic*: `{decrypted_user['mnemonic']}`\n"
+        f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
+        f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
+        f"⚠️ *SECURITY WARNING*\n"
+        f"1️⃣ Never share your mnemonic or private keys\n"
+        f"2️⃣ Store them securely offline\n"
+        f"3️⃣ This message will auto-delete in 30 seconds\n"
+        f"4️⃣ Use for small amounts only\n\n"
+        f"💎 *Get started:*\n"
+        f"- /subscribe - Activate trading features\n"
+        f"- /set_wallet - Import existing wallet"
             )
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=message.message_id),
@@ -385,12 +393,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
             subscription_message = await get_subscription_status_message(user)
             await update.message.reply_text(
-                f"Welcome back!\n"
-                f"Solana wallet: {user['solana']['public_key']}\n"
-                f"ETH/BSC wallet: {eth_bsc_address}\n"
-                f"{subscription_message}\n"
-                f"To generate a new wallet, use /generate_wallet.\n"
-                f"To import an existing wallet, use /set_wallet."
+        f"🚀 *Welcome Back!*\n\n"
+       
+        f"🔑 *Solana Wallet: `{user_data['solana']['public_key']}`\n"
+        f"🌐 *ETH/BSC Wallet: `{eth_bsc_address}`\n\n"
+        f"{subscription_message}\n\n"
+        f"- /generate_wallet - Generate a new wallet\n\n"
+        f"- /set_wallet - Import existing wallet"
+                
             )
         except Exception as e:
             await update.message.reply_text(
@@ -581,7 +591,6 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         )
 
-        # Start token updates after setting up payment
         logger.debug(f"Attempting to start token updates for user {user_id}")
         await start_token_updates(context, user_id)
         logger.info(f"Started token updates for user {user_id}")
@@ -1140,57 +1149,41 @@ async def fetch_token_by_contract(contract_address: str):
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            # Fetch token pair details directly
+            # Fetch token pair details
             logger.debug(f"Fetching token by contract: {contract_address}")
-            pair_url = DEXSCREENER_TOKEN_API.format(token_address=contract_address)
-            pair_response = await client.get(pair_url, headers=headers)
-            logger.debug(f"Pair API status: {pair_response.status_code}")
+            token_url = DEXSCREENER_TOKEN_API.format(token_address=contract_address)
+            response = await client.get(token_url, headers=headers)
             
-            if pair_response.status_code != 200:
-                logger.error(f"Pair API failed: {pair_response.status_code} - {pair_response.text}")
+            if response.status_code != 200:
+                logger.error(f"Token API failed: {response.status_code} - {response.text}")
                 return None
             
-            pair_data = pair_response.json()
+            data = response.json()
             
-            if not pair_data or not pair_data.get('pairs') or not pair_data['pairs']:
-                logger.error(f"No pair data found for contract: {contract_address}")
+            # Handle response as list of pairs
+            if not isinstance(data, list) or not data:
+                logger.error(f"Unexpected response format: {type(data)}")
                 return None
             
-            # Extract the first pair from the list
-            pair = pair_data['pairs'][0]  # Access the first pair
-            
-            # Extract token information
+            # Take the first pair (most relevant)
+            pair = data[0]
             base_token = pair.get('baseToken', {})
-            token_info = {
-                'name': base_token.get('name', 'Unknown'),
-                'symbol': base_token.get('symbol', 'UNKNOWN'),
+            quote_token = pair.get('quoteToken', {})
+            
+            # Determine which token matches our contract
+            token_info = base_token if base_token.get('address') == contract_address else quote_token
+            
+            return {
+                'name': token_info.get('name', 'Unknown'),
+                'symbol': token_info.get('symbol', 'UNKNOWN'),
                 'contract_address': contract_address,
                 'price_usd': float(pair.get('priceUsd', 0)),
                 'market_cap': float(pair.get('fdv', 0)),
                 'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
                 'volume': float(pair.get('volume', {}).get('h24', 0)),
                 'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{contract_address}"),
-                'image': base_token.get('logoURI', '')
+                'image': pair.get('info', {}).get('imageUrl', '')
             }
-            
-            # Try to get social links from profile API
-            try:
-                logger.debug("Trying to fetch profile for social links")
-                profile_url = f"{DEXSCREENER_PROFILE_API}?tokenAddress={contract_address}"
-                profile_response = await client.get(profile_url, headers=headers)
-                if profile_response.status_code == 200:
-                    profile_data = profile_response.json()
-                    if profile_data and isinstance(profile_data, list) and profile_data[0]:
-                        token_info['socials'] = {
-                            link['type']: link['url'] 
-                            for link in profile_data[0].get('links', []) 
-                            if link.get('type')
-                        }
-            except Exception as e:
-                logger.warning(f"Couldn't fetch social links: {str(e)}")
-            
-            return token_info
-            
         except Exception as e:
             logger.error(f"Error fetching token by contract: {str(e)}")
             return None
@@ -1542,10 +1535,10 @@ async def fetch_latest_token():
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             # Step 1: Fetch latest token from profile API
-            logger.debug("Fetching token profiles")
+            logger.debug("🌐 Fetching token profiles")
             response = await client.get(DEXSCREENER_PROFILE_API, 
-                                      params={'chainId': 'solana'}, 
-                                      headers=headers)
+                                  params={'chainId': 'solana'}, 
+                                  headers=headers)
             
             if response.status_code != 200:
                 logger.error(f"Profile API failed: {response.status_code} - {response.text}")
@@ -1568,81 +1561,44 @@ async def fetch_latest_token():
             
             # Get the first token
             token_profile = solana_tokens[0]
-            token_address = token_profile.get('tokenAddress', '')
+            token_address = token_profile.get('tokenAddress')
             if not token_address:
-                logger.warning("No tokenAddress found in token data")
                 return None
             
-            # Step 2: Fetch detailed token data
-            logger.debug(f"Fetching token details for {token_address}")
+            logger.debug(f"🔍 Fetching details for {token_address}")
             token_url = DEXSCREENER_TOKEN_API.format(token_address=token_address)
             token_response = await client.get(token_url, headers=headers)
-            
+        
             if token_response.status_code != 200:
-                logger.error(f"Token API failed: {token_response.status_code} - {token_response.text}")
                 return None
-            
+        
             token_data = token_response.json()
-            
+        
             # Handle token_data as a list of pairs
-            if not isinstance(token_data, list):
-                logger.error(f"Expected list from token API, got {type(token_data)}")
+            if not isinstance(token_data, list) or not token_data:
                 return None
-            
-            if not token_data:
-                logger.warning("No token pairs found in token API response")
-                return None
-            
-            # Select the first pair (most relevant)
-            pair_data = token_data[0]
-            
-            if not isinstance(pair_data, dict):
-                logger.error(f"Expected dict for pair data, got {type(pair_data)}")
-                return None
-
-            # Extract fields from profile API token
-            name = token_profile.get('description', 'Unknown').split()[0] if token_profile.get('description') else 'Unknown'
-            symbol = token_profile.get('url', '').split('/')[-1].upper() if token_profile.get('url') else 'Unknown'
-            website = next((link['url'] for link in token_profile.get('links', []) if link.get('label') == 'Website'), '')
-            social_links = {link['type']: link['url'] for link in token_profile.get('links', []) if link.get('type')}
-            dexscreener_url = f"https://dexscreener.com/solana/{token_address}"
-
-            # Extract fields from token API pair
-            price_usd = float(pair_data.get('priceUsd', '0.0'))
-            market_cap = float(pair_data.get('marketCap', 0.0))
-            liquidity = float(pair_data.get('liquidity', {}).get('usd', 0.0))
-            volume = float(pair_data.get('volume', {}).get('h24', 0.0))
-            
-            # Use pair data names if available
-            name_main = pair_data.get('name', name)
-            symbol_main = pair_data.get('symbol', symbol)
-            
-            # Get image from either source
-            image = token_profile.get('icon', '')
-            if not image:
-                image = pair_data.get('baseToken', {}).get('logoURI', '')
-
-            return {
-                'name':  name_main,
-                'symbol': symbol_main,
+        
+            # Get the first pair
+            pair = token_data[0]
+        
+            # Extract token info
+            base_token = pair.get('baseToken', {})
+            token_info = {
+                'name': base_token.get('name', 'Unknown'),
+                'symbol': base_token.get('symbol', 'UNKNOWN'),
                 'contract_address': token_address,
-                'price_usd': price_usd,
-                'market_cap': market_cap,
-                'image': image,
-                'website': website,
-                'socials': social_links,
-                'liquidity': liquidity,
-                'volume': volume,
-                'dexscreener_url': dexscreener_url
+                'price_usd': float(pair.get('priceUsd', 0)),
+                'market_cap': float(pair.get('fdv', 0)),
+                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
+                'volume': float(pair.get('volume', {}).get('h24', 0)),
+                'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{token_address}"),
+                'image': pair.get('info', {}).get('imageUrl', '')
             }
-        except httpx.ReadTimeout:
-            logger.error("DexScreener API timeout")
-            return None
-        except httpx.ConnectError:
-            logger.error("Connection error to DexScreener API")
-            return None
+        
+            return token_info
+        
         except Exception as e:
-            logger.error(f"Unexpected error fetching token: {str(e)}", exc_info=True)
+            logger.error(f"Error fetching token: {str(e)}")
             return None
 
 def format_token_message(token):
@@ -1679,7 +1635,7 @@ def format_token_message(token):
 async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
     """Periodically update and send unique Solana token info."""
     user_id = context.job.user_id
-    logger.debug(f"Executing update_token_info for user {user_id} at {datetime.now()}")
+    logger.info(f"⏰ Job started for user {user_id} at {datetime.now()}")
     
     try:
         user = users_collection.find_one({'user_id': user_id})
@@ -1699,13 +1655,13 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
         if user.get('last_api_call', 0) > current_time - 1:
             logger.debug("Skipping due to rate limit")
             return
-        
+        logger.info(f"🔍 Fetching token for user {user_id}")
         token = await fetch_latest_token()
         if not token:
             logger.warning("Token fetch returned None")
             return
         
-        logger.debug(f"Fetched token: {token['name']} ({token['contract_address']})")
+        logger.info(f"✅ Fetched token: {token['name']} ({token['contract_address']})")
         
         # Check for duplicates
         if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
@@ -1779,7 +1735,9 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
             await auto_trade(context, user_id, token)
             
     except Exception as e:
-        logger.error(f"Error in auto token update: {str(e)}", exc_info=True)
+        logger.error(f"🔥 Error in auto token update: {str(e)}", exc_info=True)
+    finally:
+        logger.info(f"🏁 Job completed for user {user_id}")
 
 
 async def check_balance(user_id, chain):
@@ -2109,9 +2067,13 @@ async def setup_bot():
     
     # IMPORTANT: Initialize job queue
     if not application.job_queue:
+        logger.info("🚦 Initializing job queue")
         application.job_queue = JobQueue()
         application.job_queue.set_application(application)
         await application.job_queue.start()
+        logger.info("✅ Job queue started")
+    else:
+        logger.info("ℹ️ Job queue already exists")
     
     # Set up handlers
     setup_handlers(application)
