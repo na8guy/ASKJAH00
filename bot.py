@@ -2211,7 +2211,7 @@ def setup_handlers(application: Application):
         per_message=True
     )
     application.add_handler(transfer_handler)
-    application.add_handler(error_handler)
+   
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
