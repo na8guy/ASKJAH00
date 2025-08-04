@@ -347,67 +347,80 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    user = users_collection.find_one({'user_id': user_id})
+    
+    # Update chat_id for the user
     users_collection.update_one(
         {'user_id': user_id},
         {'$set': {'chat_id': chat_id}},
         upsert=True
     )
-    if not user:
-        mnemo = Mnemonic("english")
-        mnemonic = mnemo.generate(strength=256)
-        user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
-        users_collection.insert_one(user_data)
-        try:
+    
+    user = users_collection.find_one({'user_id': user_id})
+    user_data = None  # Initialize to avoid reference errors
+    
+    try:
+        if not user:
+            # Create new wallet
+            mnemo = Mnemonic("english")
+            mnemonic = mnemo.generate(strength=256)
+            user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
+            users_collection.insert_one(user_data)
+            
+            # Decrypt and show new wallet info
             decrypted_user = await decrypt_user_wallet(user_id, user_data)
-            eth_bsc_address = user_data['eth']['address'] if user_data['eth'] else "Not set"
-            message = await update.message.reply_text(
-        f"🚀 *Welcome to the Multi-Chain Trading Bot!*\n\n"
-        f"✨ A new wallet has been created for you\n"
-        f"🔐 *Mnemonic*: `{decrypted_user['mnemonic']}`\n"
-        f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
-        f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
-        f"⚠️ *SECURITY WARNING*\n"
-        f"1️⃣ Never share your mnemonic or private keys\n"
-        f"2️⃣ Store them securely offline\n"
-        f"3️⃣ This message will auto-delete in 30 seconds\n"
-        f"4️⃣ Use for small amounts only\n\n"
-        f"💎 *Get started:*\n"
-        f"- /subscribe - Activate trading features\n"
-        f"- /set_wallet - Import existing wallet"
+            eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
+            
+            message = (
+                f"🚀 *Welcome to the Multi-Chain Trading Bot!*\n\n"
+                f"✨ A new wallet has been created for you\n"
+                f"🔐 *Mnemonic*: `{decrypted_user['mnemonic']}`\n"
+                f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
+                f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
+                f"⚠️ *SECURITY WARNING*\n"
+                f"1️⃣ Never share your mnemonic or private keys\n"
+                f"2️⃣ Store them securely offline\n"
+                f"3️⃣ This message will auto-delete in 30 seconds\n"
+                f"4️⃣ Use for small amounts only\n\n"
+                f"💎 *Get started:*\n"
+                f"- /subscribe - Activate trading features\n"
+                f"- /set_wallet - Import existing wallet"
             )
+            
+            msg = await update.message.reply_text(message, parse_mode='Markdown')
+            
+            # Schedule message deletion
             context.job_queue.run_once(
-                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=message.message_id),
+                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=msg.message_id),
                 30,
                 user_id=user_id
             )
-        except Exception as e:
-            await update.message.reply_text(
-                f"Error accessing wallet data: {str(e)}. Please try /generate_wallet to create a new wallet or /set_wallet to import one."
-            )
-            logger.error(f"Error in start for user {user_id}: {str(e)}")
-            return
-    else:
-        try:
+        else:
+            # Existing user flow
             decrypted_user = await decrypt_user_wallet(user_id, user)
             eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
             subscription_message = await get_subscription_status_message(user)
-            await update.message.reply_text(
-        f"🚀 *Welcome Back!*\n\n"
-       
-        f"🔑 *Solana Wallet: `{user_data['solana']['public_key']}`\n"
-        f"🌐 *ETH/BSC Wallet: `{eth_bsc_address}`\n\n"
-        f"{subscription_message}\n\n"
-        f"- /generate_wallet - Generate a new wallet\n\n"
-        f"- /set_wallet - Import existing wallet"
-                
+            
+            message = (
+                f"👋 *Welcome back!*\n\n"
+                f"🔑 *Solana Address*: `{user['solana']['public_key']}`\n"
+                f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
+                f"{subscription_message}\n\n"
+                f"🔧 *Commands:*\n"
+                f"- /generate_wallet - Create a new wallet\n"
+                f"- /set_wallet - Import an existing wallet"
             )
-        except Exception as e:
-            await update.message.reply_text(
-                f"Error accessing wallet data: {str(e)}. Please try /generate_wallet to create a new wallet or /set_wallet to import one."
-            )
-            logger.error(f"Error in start for user {user_id}: {str(e)}")
-            return
+            
+            await update.message.reply_text(message, parse_mode='Markdown')
+            
+    except Exception as e:
+        logger.error(f"Error in start for user {user_id}: {str(e)}", exc_info=True)
+        error_msg = (
+            f"❌ Error accessing wallet data: {str(e)}\n\n"
+            f"Please try:\n"
+            f"- /generate_wallet to create a new wallet\n"
+            f"- /set_wallet to import an existing wallet"
+        )
+        await update.message.reply_text(error_msg)
 
 async def get_subscription_status_message(user: dict) -> str:
     if user.get('subscription_status') != 'active':
@@ -1149,7 +1162,6 @@ async def fetch_token_by_contract(contract_address: str):
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            # Fetch token pair details
             logger.debug(f"Fetching token by contract: {contract_address}")
             token_url = DEXSCREENER_TOKEN_API.format(token_address=contract_address)
             response = await client.get(token_url, headers=headers)
