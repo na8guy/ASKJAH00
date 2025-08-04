@@ -83,9 +83,13 @@ async def health_check():
 async def telegram_webhook(request: Request):
     global application
     try:
-        if not application:
+        # Check if application is properly initialized
+        if application is None or not application.initialized:
             logger.error("🚫 Application not initialized")
-            return JSONResponse(content={'error': 'Application not initialized'}, status_code=500)
+            return JSONResponse(
+                content={'error': 'Application not initialized'},
+                status_code=503
+            )
         
         update_data = await request.json()
         update = Update.de_json(update_data, application.bot)
@@ -93,11 +97,14 @@ async def telegram_webhook(request: Request):
         # Process the update
         await application.process_update(update)
         logger.debug(f"Processed update: {update.update_id}")
-            
+        
         return JSONResponse(content={'status': 'ok'})
     except Exception as e:
         logger.error(f"🔥 Webhook error: {str(e)}", exc_info=True)
-        return JSONResponse(content={'error': str(e)}, status_code=500)
+        return JSONResponse(
+            content={'error': str(e)},
+            status_code=500
+        )
 
 
 GMGN_API_HOST = 'https://gmgn.ai'
@@ -2182,43 +2189,37 @@ async def setup_bot():
     if not TELEGRAM_TOKEN or not WEBHOOK_URL:
         logger.error("TELEGRAM_TOKEN or WEBHOOK_URL not found in .env file")
         raise ValueError("TELEGRAM_TOKEN or WEBHOOK_URL not found in .env file")
-    if application and application.running:
-        logger.info("Application is already running")
-        return application
-    
-    logger.info("🚀 Initializing Telegram bot application")
    # Remove existing application if present
-    if application:
-        try:
-            await application.stop()
-            await application.shutdown()
-        except Exception:
-            pass
-        application = None
+    if application is None:
+        logger.info("🚀 Initializing NEW Telegram bot application")
+        application = (
+            Application.builder()
+            .token(TELEGRAM_TOKEN)
+            .concurrent_updates(True)
+            .build()
+        )
+        # Set up handlers
+        logger.info("🛠️ Setting up command handlers")
+        setup_handlers(application)
+    else:
+        logger.info("♻️ Reusing existing application instance")
     
-    # Create new application instance
-    application = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .concurrent_updates(True)
-        .build()
-    )
+   
     # Initialize job queue
     
     # Set up handlers
-    logger.info("🛠️ Setting up command handlers")
-    setup_handlers(application)
-    
-    # Initialize application
-    await application.initialize()
-    
-    # Set webhook
-    logger.info(f"🌐 Setting webhook to {WEBHOOK_URL}")
-    await application.bot.set_webhook(
-        url=WEBHOOK_URL,
-        allowed_updates=Update.ALL_TYPES
-    )
-    
+    if not application.running:
+        logger.info("⚙️ Initializing application...")
+        await application.initialize()
+        
+        logger.info(f"🌐 Setting webhook to {WEBHOOK_URL}")
+        await application.bot.set_webhook(
+            url=WEBHOOK_URL,
+            allowed_updates=Update.ALL_TYPES
+        )
+        
+        # Set bot commands
+        logger.info("📝 Registering bot commands...")
     # Set bot commands
     commands = [
         BotCommand("start", "Start the bot and create or view wallet"),
@@ -2236,28 +2237,27 @@ async def setup_bot():
         BotCommand("debug", "Show debug information")
     ]
     await application.bot.set_my_commands(commands)
-    logger.info("📝 Bot commands registered")
-    
-    # Start the application
+        
+    logger.info("🚦 Starting application...")
     await application.start()
     logger.info("🤖 Bot started successfully")
     
     return application
+
 
 @app.on_event("startup")
 async def on_startup():
     logger.info("🚀 Starting bot...")
     try:
         app = await setup_bot()
-        logger.info("⏳ Scheduling jobs for active subscribers...")
+        logger.info("✅ Bot setup complete")
         
-        # Get all active subscribers
+        logger.info("⏳ Scheduling jobs for active subscribers...")
         active_users = users_collection.find({
             "subscription_status": "active",
             "subscription_expiry": {"$gt": datetime.now().isoformat()}
         })
         
-        # Schedule jobs for each active user
         async for user in active_users:
             logger.info(f"  - Scheduling job for user {user['user_id']}")
             app.job_queue.run_repeating(
@@ -2268,7 +2268,7 @@ async def on_startup():
                 name=f"token_updates_{user['user_id']}"
             )
         
-        logger.info("✅ Bot started successfully")
+        logger.info("✅ Bot startup complete")
     except Exception as e:
         logger.critical(f"🔥 Failed to start bot: {str(e)}", exc_info=True)
 
