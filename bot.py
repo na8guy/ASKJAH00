@@ -54,8 +54,7 @@ from eth_account import Account
 # FastAPI setup
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from .config import DEXSCREENER_NEW_TOKENS_API, db
-from .utils import format_token_message
+
 
 # Set up logging
 logging.basicConfig(
