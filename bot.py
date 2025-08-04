@@ -1080,8 +1080,15 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     contract_address = update.message.text.strip()
     
     # Validate contract address
-    if len(contract_address) < 32 or len(contract_address) > 44:
-        await update.message.reply_text("❌ Invalid contract address format. Please enter a valid Solana token address.")
+    try:
+        Pubkey.from_string(contract_address)  # Try to create a Pubkey object
+        if len(contract_address) < 32 or len(contract_address) > 44:
+            raise ValueError("Invalid length")
+    except Exception as e:
+        await update.message.reply_text(
+            "❌ Invalid contract address format. Please enter a valid Solana token address (e.g., 4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R)."
+        )
+        logger.error(f"Invalid contract address provided by user {user_id}: {contract_address}, error: {str(e)}")
         return INPUT_CONTRACT
     
     # Fetch token data
@@ -1139,8 +1146,13 @@ async def fetch_token_by_contract(contract_address: str):
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
+            if not contract_address:
+                logger.error("Contract address is empty")
+                return None
+                
             logger.debug(f"Fetching token by contract: {contract_address}")
             token_url = DEXSCREENER_TOKEN_API.format(token_address=contract_address)
+            logger.debug(f"Calling DexScreener API: {token_url}")
             response = await client.get(token_url, headers=headers)
             
             if response.status_code != 200:
