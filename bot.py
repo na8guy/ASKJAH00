@@ -1,6 +1,6 @@
 import asyncio
 import logging
-import requests
+import json
 import httpx
 import base64
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -54,10 +54,9 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 # Set up logging
-# Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
+    level=logging.DEBUG,
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler("bot_debug.log")
@@ -65,7 +64,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('telegram').setLevel(logging.INFO)
+logging.getLogger('telegram').setLevel(logging.DEBUG)
 
 # Load environment variables
 load_dotenv()
@@ -84,13 +83,13 @@ async def telegram_webhook(request: Request):
         if not application:
             logger.error("🚫 Application not initialized")
             return JSONResponse(content={'error': 'Application not initialized'}, status_code=500)
-     
         
         update_data = await request.json()
         update = Update.de_json(update_data, application.bot)
         
-        # Process the update directly without context manager
+        # Process the update
         await application.process_update(update)
+        logger.debug(f"Processed update: {update.update_id}")
             
         return JSONResponse(content={'status': 'ok'})
     except Exception as e:
@@ -111,7 +110,7 @@ for attempt in range(max_retries):
         logger.debug("Connecting to MongoDB")
         mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30000)
         mongo_client.admin.command('ping')
-        logger.debug("MongoDB connection successful")
+        logger.info("✅ MongoDB connection successful")
         db = mongo_client.get_database('trading_bot')
         users_collection = db.users
         users_collection.create_index('user_id', unique=True)
@@ -194,9 +193,8 @@ USDT_ABI = [
 usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
 
 # DexScreener API endpoints
-
-DEXSCREENER_PROFILE_API = "https://api.dexscreener.com/token-profiles/latest/v1"
-DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
+DEXSCREENER_NEW_TOKENS_API = "https://api.dexscreener.com/latest/dex/tokens/new/solana"
+DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/solana/{token_address}"
 
 # Bot states for conversation
 (SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
@@ -347,6 +345,7 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    logger.debug(f"Start command from user {user_id}")
     
     # Update chat_id for the user
     users_collection.update_one(
@@ -360,6 +359,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         if not user:
+            logger.info(f"Creating new wallet for user {user_id}")
             # Create new wallet
             mnemo = Mnemonic("english")
             mnemonic = mnemo.generate(strength=256)
@@ -395,6 +395,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_id=user_id
             )
         else:
+            logger.info(f"Existing user {user_id} started bot")
             # Existing user flow
             decrypted_user = await decrypt_user_wallet(user_id, user)
             eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
@@ -537,6 +538,7 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.debug(f"Trade status requested by user {user_id}")
     user = users_collection.find_one({'user_id': user_id})
     
     if not user:
@@ -557,19 +559,26 @@ async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Schedule periodic token updates for the subscribed user."""
     if context.job_queue:
+        # Remove any existing jobs for this user
+        for job in context.job_queue.jobs():
+            if job.name == f"token_updates_{user_id}":
+                job.schedule_removal()
+        
         # Schedule token updates every 30 seconds
         context.job_queue.run_repeating(
             update_token_info,
             interval=30,  # 30 seconds
-            first=0,
+            first=5,  # Start after 5 seconds
             user_id=user_id,
             name=f"token_updates_{user_id}"
         )
+        logger.info(f"✅ Scheduled token updates for user {user_id}")
     else:
         logger.error("JobQueue is not initialized for token updates.")
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info(f"Subscribe command from user {user_id}")
     user = users_collection.find_one({'user_id': user_id})
     if not user:
         await update.message.reply_text("No wallet found. Please use /start to create a wallet.")
@@ -606,7 +615,6 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         logger.debug(f"Attempting to start token updates for user {user_id}")
         await start_token_updates(context, user_id)
-        logger.info(f"Started token updates for user {user_id}")
         
         await update.message.reply_text(
             f"To subscribe ($5/week), send {usdt_amount:.6f} USDT to:\n"
@@ -622,6 +630,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
+    logger.debug(f"Generate wallet command from user {user_id}")
     user = users_collection.find_one({'user_id': user_id})
     if not user:
         await update.message.reply_text("No wallet found. Please use /start to create a wallet.")
@@ -678,16 +687,11 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
         30,
         user_id=user_id
     )
-    if context.job_queue is None:
-        await query.message.reply_text(
-            "Error: JobQueue is not available. Install 'python-telegram-bot[job-queue]'."
-        )
-        logger.error("JobQueue is not initialized.")
-        return ConversationHandler.END
     return ConversationHandler.END
 
 async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
+    logger.debug(f"Set wallet command from user {user_id}")
     if not await check_subscription(user_id):
         await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
         return ConversationHandler.END
@@ -817,12 +821,6 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 30,
                 user_id=user_id
             )
-            if context.job_queue is None:
-                await update.message.reply_text(
-                    "Error: JobQueue is not available. Install 'python-telegram-bot[job-queue]'."
-                )
-                logger.error("JobQueue is not initialized.")
-                return ConversationHandler.END
             return ConversationHandler.END
         except Exception as e:
             message = await update.message.reply_text(
@@ -908,12 +906,6 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 30,
                 user_id=user_id
             )
-            if context.job_queue is None:
-                await update.message.reply_text(
-                    "Error: JobQueue is not available. Install 'python-telegram-bot[job-queue]'."
-                )
-                logger.error("JobQueue is not initialized.")
-                return ConversationHandler.END
             return ConversationHandler.END
         except Exception as e:
             message = await update.message.reply_text(
@@ -963,12 +955,6 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
             30,
             user_id=user_id
         )
-        if context.job_queue is None:
-            await query.message.reply_text(
-                "Error: JobQueue is not available. Install 'python-telegram-bot[job-queue]'."
-            )
-            logger.error("JobQueue is not initialized.")
-            return ConversationHandler.END
         return ConversationHandler.END
     except Exception as e:
         await query.message.reply_text(f"Error importing wallet: {str(e)}. Please start over with /set_wallet.")
@@ -976,6 +962,7 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def reset_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.debug(f"Reset tokens command from user {user_id}")
     if not await check_subscription(user_id):
         await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
         return
@@ -988,6 +975,7 @@ async def reset_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
+    logger.debug(f"Set mode command from user {user_id}")
     if not await check_subscription(user_id):
         await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
         return ConversationHandler.END
@@ -1022,9 +1010,6 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def set_auto_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    if not await check_subscription(user_id):
-        await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
-        return ConversationHandler.END
     try:
         amount = float(update.message.text)
         if amount <= 0:
@@ -1039,9 +1024,6 @@ async def set_auto_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def set_sell_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    if not await check_subscription(user_id):
-        await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
-        return ConversationHandler.END
     try:
         percentage = float(update.message.text)
         if percentage <= 0:
@@ -1056,9 +1038,6 @@ async def set_sell_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    if not await check_subscription(user_id):
-        await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
-        return ConversationHandler.END
     try:
         percentage = float(update.message.text)
         if percentage <= 0:
@@ -1072,12 +1051,6 @@ async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"Sell at: {user['sell_percentage']}% profit\n"
             f"Stop-loss at: {user['loss_percentage']}% loss"
         )
-        if context.job_queue is None:
-            await update.message.reply_text(
-                "Error: JobQueue is not available. Install 'python-telegram-bot[job-queue]'."
-            )
-            logger.error("JobQueue is not initialized.")
-            return ConversationHandler.END
         if user['trading_mode'] == 'automatic':
             context.job_queue.run_repeating(auto_trade, interval=5, first=0, user_id=user_id)
         return ConversationHandler.END
@@ -1087,6 +1060,7 @@ async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
+    logger.debug(f"Trade command from user {user_id}")
     if not await check_subscription(user_id):
         await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
         return ConversationHandler.END
@@ -1171,14 +1145,15 @@ async def fetch_token_by_contract(contract_address: str):
                 return None
             
             data = response.json()
+            logger.debug(f"API response: {json.dumps(data, indent=2)[:500]}...")
             
             # Handle response as list of pairs
-            if not isinstance(data, list) or not data:
+            if not isinstance(data, dict) or not data.get('pairs'):
                 logger.error(f"Unexpected response format: {type(data)}")
                 return None
             
             # Take the first pair (most relevant)
-            pair = data[0]
+            pair = data['pairs'][0]
             base_token = pair.get('baseToken', {})
             quote_token = pair.get('quoteToken', {})
             
@@ -1194,7 +1169,8 @@ async def fetch_token_by_contract(contract_address: str):
                 'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
                 'volume': float(pair.get('volume', {}).get('h24', 0)),
                 'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{contract_address}"),
-                'image': pair.get('info', {}).get('imageUrl', '')
+                'image': pair.get('info', {}).get('imageUrl', ''),
+                'socials': pair.get('info', {}).get('socials', {})
             }
         except Exception as e:
             logger.error(f"Error fetching token by contract: {str(e)}")
@@ -1202,6 +1178,7 @@ async def fetch_token_by_contract(contract_address: str):
 
 async def job_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.debug(f"Job status command from user {user_id}")
     if not context.job_queue:
         await update.message.reply_text("Job queue not initialized")
         return
@@ -1223,6 +1200,7 @@ async def job_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def force_token_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.debug(f"Force token fetch command from user {user_id}")
     if not context.job_queue:
         await update.message.reply_text("Job queue not initialized")
         return
@@ -1242,6 +1220,7 @@ async def handle_token_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    logger.debug(f"Token button pressed by user {user_id}: {query.data}")
     
     # Immediately remove the buttons to prevent multiple clicks
     try:
@@ -1285,9 +1264,6 @@ async def handle_token_button(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    if not await check_subscription(user_id):
-        await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
-        return ConversationHandler.END
     try:
         amount = float(update.message.text)
         if amount <= 0:
@@ -1324,9 +1300,6 @@ async def buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    if not await check_subscription(user_id):
-        await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
-        return ConversationHandler.END
     try:
         amount = float(update.message.text)
         if amount <= 0:
@@ -1419,6 +1392,7 @@ async def confirm_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.debug(f"Balance command from user {user_id}")
     if not await check_subscription(user_id):
         await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
         return
@@ -1448,6 +1422,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
+    logger.debug(f"Transfer command from user {user_id}")
     if not await check_subscription(user_id):
         await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
         return ConversationHandler.END
@@ -1546,69 +1521,36 @@ async def fetch_latest_token():
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            # Step 1: Fetch latest token from profile API
-            logger.debug("🌐 Fetching token profiles")
-            response = await client.get(DEXSCREENER_PROFILE_API, 
-                                  params={'chainId': 'solana'}, 
-                                  headers=headers)
+            # Fetch latest tokens
+            logger.info("🌐 Fetching latest tokens from DexScreener")
+            response = await client.get(DEXSCREENER_NEW_TOKENS_API, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"Profile API failed: {response.status_code} - {response.text}")
+                logger.error(f"DexScreener API failed: {response.status_code} - {response.text}")
                 return None
             
             data = response.json()
+            logger.debug(f"API response: {json.dumps(data, indent=2)[:500]}...")
             
-            # Check if data is a list
-            if not isinstance(data, list):
-                logger.error(f"Expected list from profile API, got {type(data)}")
-                return None
-            
-            logger.debug(f"Received {len(data)} tokens from profile API")
-            
-            # Filter Solana tokens
-            solana_tokens = [token for token in data if isinstance(token, dict) and token.get('chainId') == 'solana']
-            if not solana_tokens:
-                logger.warning("No Solana tokens found in profile API response")
+            # Handle response format
+            if not isinstance(data, list) or not data:
+                logger.warning("No tokens found in API response")
                 return None
             
             # Get the first token
-            token_profile = solana_tokens[0]
-            token_address = token_profile.get('tokenAddress')
-            if not token_address:
-                return None
-            
-            logger.debug(f"🔍 Fetching details for {token_address}")
-            token_url = DEXSCREENER_TOKEN_API.format(token_address=token_address)
-            token_response = await client.get(token_url, headers=headers)
-        
-            if token_response.status_code != 200:
-                return None
-        
-            token_data = token_response.json()
-        
-            # Handle token_data as a list of pairs
-            if not isinstance(token_data, list) or not token_data:
-                return None
-        
-            # Get the first pair
-            pair = token_data[0]
-        
-            # Extract token info
-            base_token = pair.get('baseToken', {})
-            token_info = {
-                'name': base_token.get('name', 'Unknown'),
-                'symbol': base_token.get('symbol', 'UNKNOWN'),
-                'contract_address': token_address,
-                'price_usd': float(pair.get('priceUsd', 0)),
-                'market_cap': float(pair.get('fdv', 0)),
-                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
-                'volume': float(pair.get('volume', {}).get('h24', 0)),
-                'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{token_address}"),
-                'image': pair.get('info', {}).get('imageUrl', '')
+            token_data = data[0]
+            return {
+                'name': token_data.get('name', 'Unknown'),
+                'symbol': token_data.get('symbol', 'UNKNOWN'),
+                'contract_address': token_data.get('address', ''),
+                'price_usd': float(token_data.get('price', 0)),
+                'market_cap': float(token_data.get('marketCap', 0)),
+                'liquidity': float(token_data.get('liquidity', 0)),
+                'volume': float(token_data.get('volume', 0)),
+                'dexscreener_url': token_data.get('url', ''),
+                'image': token_data.get('logo', ''),
+                'socials': token_data.get('socials', {})
             }
-        
-            return token_info
-        
         except Exception as e:
             logger.error(f"Error fetching token: {str(e)}")
             return None
@@ -1626,11 +1568,10 @@ def format_token_message(token):
     
     # Build social links
     social_links = ""
-    if token.get('website'):
-        social_links += f"🌐 [Website]({token['website']})\n"
-    for platform, url in token.get('socials', {}).items():
-        icon = platform_icons.get(platform.lower(), '🔗')
-        social_links += f"{icon} [{platform.capitalize()}]({url})\n"
+    if token.get('socials'):
+        for platform, url in token['socials'].items():
+            icon = platform_icons.get(platform.lower(), '🔗')
+            social_links += f"{icon} [{platform.capitalize()}]({url})\n"
     
     # Create token info
     return (
@@ -1656,7 +1597,7 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
             context.job.schedule_removal()
             return
             
-        logger.debug(f"Subscription status for user {user_id}: {user.get('subscription_status')}, Expiry: {user.get('subscription_expiry')}")
+        logger.debug(f"Subscription status for user {user_id}: {user.get('subscription_status')}")
         if not await check_subscription(user_id):
             logger.info(f"User {user_id} subscription inactive")
             context.job.schedule_removal()
@@ -1667,6 +1608,7 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
         if user.get('last_api_call', 0) > current_time - 1:
             logger.debug("Skipping due to rate limit")
             return
+        
         logger.info(f"🔍 Fetching token for user {user_id}")
         token = await fetch_latest_token()
         if not token:
@@ -1776,7 +1718,8 @@ async def check_balance(user_id, chain):
         return 0.0
 
 async def execute_trade(user_id, contract_address, amount, action, chain):
-    logger.debug(f"Executing {action} trade for user {user_id}: {amount} SOL of {contract_address} on {chain}")
+    logger.info(f"🏁 Starting {action} trade for {amount} SOL of {contract_address}")
+    
     if chain != 'solana':
         logger.error(f"Trading not supported for {chain} yet")
         return False
@@ -1792,6 +1735,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain):
         if not solana_private_key or solana_private_key == "[Decryption Failed]":
             logger.error(f"Failed to decrypt Solana private key for user {user_id}")
             return False
+        
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         from_address = str(keypair.pubkey())
         
@@ -1800,32 +1744,41 @@ async def execute_trade(user_id, contract_address, amount, action, chain):
             logger.error(f"Insufficient balance for user {user_id}: {balance} SOL available, {amount} SOL required")
             return False
         
-        input_token = 'So11111111111111111111111111111111111111112'  # SOL
-        output_token = contract_address
-        in_amount = str(int(amount * 1_000_000_000))  # Convert SOL to lamports
-        slippage = 0.5  # 0.5% slippage
-        swap_mode = 'ExactIn'
+        # Determine token addresses based on action
+        if action == 'buy':
+            token_in = 'So11111111111111111111111111111111111111112'  # SOL
+            token_out = contract_address
+        else:  # sell
+            token_in = contract_address
+            token_out = 'So11111111111111111111111111111111111111112'  # SOL
         
-        if action == 'sell':
-            input_token, output_token = output_token, input_token
+        # Convert SOL to lamports
+        in_amount = int(amount * 1_000_000_000)
         
+        quote_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_swap_route"
+        params = {
+            'token_in_address': token_in,
+            'token_out_address': token_out,
+            'in_amount': str(in_amount),
+            'from_address': from_address,
+            'slippage': '0.5',
+            'swap_mode': 'ExactIn'
+        }
+        
+        logger.debug(f"🔄 GMGN API params: {params}")
         async with httpx.AsyncClient() as client:
-            quote_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_swap_route"
-            params = {
-                'token_in_address': input_token,
-                'token_out_address': output_token,
-                'in_amount': in_amount,
-                'from_address': from_address,
-                'slippage': slippage,
-                'swap_mode': swap_mode
-            }
-            logger.debug(f"Fetching swap route for user {user_id}: {params}")
             response = await client.get(quote_url, params=params)
-            response.raise_for_status()
+            logger.debug(f"🔁 GMGN API response: {response.status_code} - {response.text[:200]}...")
+            
+            if response.status_code != 200:
+                logger.error(f"GMGN API failed: {response.status_code} - {response.text}")
+                return False
+                
             route = response.json()
+            logger.debug(f"Route data: {json.dumps(route, indent=2)[:500]}...")
             
             if route.get('code') != 0:
-                logger.error(f"Failed to get swap route for user {user_id}: {route.get('msg')}")
+                logger.error(f"Failed to get swap route: {route.get('msg')}")
                 return False
             
             swap_transaction = route['data']['raw_tx']['swapTransaction']
@@ -1841,17 +1794,17 @@ async def execute_trade(user_id, contract_address, amount, action, chain):
                 'chain': 'sol',
                 'signedTx': signed_tx
             }
-            logger.debug(f"Submitting transaction for user {user_id}: {submit_url}")
+            logger.debug(f"Submitting transaction: {submit_url}")
             submit_response = await client.post(submit_url, json=payload)
             submit_response.raise_for_status()
             submit_result = submit_response.json()
             
             if submit_result.get('code') != 0:
-                logger.error(f"Failed to submit transaction for user {user_id}: {submit_result.get('msg')}")
+                logger.error(f"Failed to submit transaction: {submit_result.get('msg')}")
                 return False
             
             tx_hash = submit_result['data']['hash']
-            logger.debug(f"Transaction hash for user {user_id}: {tx_hash}")
+            logger.info(f"✅ Transaction submitted: {tx_hash}")
             
             max_attempts = 60
             for attempt in range(max_attempts):
@@ -1865,28 +1818,29 @@ async def execute_trade(user_id, contract_address, amount, action, chain):
                 status = status_response.json()
                 
                 if status.get('code') != 0:
-                    logger.error(f"Failed to check transaction status for user {user_id}: {status.get('msg')}")
+                    logger.error(f"Failed to check transaction status: {status.get('msg')}")
                     return False
                 
                 if status['data']['success']:
-                    logger.info(f"Transaction {tx_hash} successful for user {user_id}")
+                    logger.info(f"✅ Transaction {tx_hash} confirmed")
                     return True
                 elif status['data']['expired']:
-                    logger.error(f"Transaction {tx_hash} expired for user {user_id}")
+                    logger.error(f"❌ Transaction {tx_hash} expired")
                     return False
                 
                 await asyncio.sleep(1)
             
-            logger.error(f"Transaction {tx_hash} timed out after {max_attempts} seconds for user {user_id}")
+            logger.error(f"❌ Transaction {tx_hash} timed out after {max_attempts} seconds")
             return False
     
     except Exception as e:
-        logger.error(f"Error executing {action} trade for user {user_id}: {str(e)}", exc_info=True)
+        logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
         return False
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.debug(f"Debug command from user {user_id}")
     user = users_collection.find_one({'user_id': user_id})
     
     # Get active jobs
@@ -1927,6 +1881,7 @@ async def execute_transfer(user_id, recipient, token_contract, amount, chain):
     return True
 
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int, token: dict):
+    logger.info(f"🤖 Auto-trading for user {user_id} - {token['name']}")
     user = users_collection.find_one({'user_id': user_id})
     if not await check_subscription(user_id):
         return
@@ -1941,7 +1896,7 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int, token: di
             if success:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"Sold {token['name']} at {price_change:.2f}% profit!"
+                    text=f"🤖 Sold {token['name']} at {price_change:.2f}% profit!"
                 )
                 users_collection.update_one(
                     {'user_id': user_id},
@@ -1953,7 +1908,7 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int, token: di
             if success:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"Stopped loss for {token['name']} at {price_change:.2f}% loss."
+                    text=f"🤖 Stopped loss for {token['name']} at {price_change:.2f}% loss."
                 )
                 users_collection.update_one(
                     {'user_id': user_id},
@@ -1979,10 +1934,12 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int, token: di
         )
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"Automatically bought {user['auto_buy_amount']} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
+            text=f"🤖 Automatically bought {user['auto_buy_amount']} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
         )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    logger.debug(f"Cancel command from user {user_id}")
     await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
 
@@ -2006,9 +1963,8 @@ def setup_handlers(application: Application):
             CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet, pattern='^(confirm_new_wallet|cancel_new_wallet)$')]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True  # Add this line
+        per_message=True
     ))
-    # Repeat for other ConversationHandlers with per_message=True
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("set_wallet", set_wallet)],
         states={
@@ -2069,6 +2025,7 @@ async def setup_bot():
         logger.info("Application is already running")
         return application
     
+    logger.info("🚀 Initializing Telegram bot application")
     # Create application instance
     application = (
         Application.builder()
@@ -2077,28 +2034,29 @@ async def setup_bot():
         .build()
     )
     
-    # IMPORTANT: Initialize job queue
-    if not application.job_queue:
-        logger.info("🚦 Initializing job queue")
+    # Initialize job queue
+    if application.job_queue is None:
+        logger.info("🚦 Creating new JobQueue")
         application.job_queue = JobQueue()
         application.job_queue.set_application(application)
         await application.job_queue.start()
         logger.info("✅ Job queue started")
     else:
-        logger.info("ℹ️ Job queue already exists")
+        logger.info("♻️ Using existing JobQueue")
     
     # Set up handlers
+    logger.info("🛠️ Setting up command handlers")
     setup_handlers(application)
     
     # Initialize application
     await application.initialize()
     
     # Set webhook
+    logger.info(f"🌐 Setting webhook to {WEBHOOK_URL}")
     await application.bot.set_webhook(
         url=WEBHOOK_URL,
         allowed_updates=Update.ALL_TYPES
     )
-    logger.info(f"Webhook set to {WEBHOOK_URL}")
     
     # Set bot commands
     commands = [
@@ -2117,27 +2075,33 @@ async def setup_bot():
         BotCommand("debug", "Show debug information")
     ]
     await application.bot.set_my_commands(commands)
+    logger.info("📝 Bot commands registered")
     
     # Start the application
     await application.start()
-    logger.info("Bot started successfully")
+    logger.info("🤖 Bot started successfully")
     
     return application
 
 @app.on_event("startup")
 async def on_startup():
-    logger.info("Starting up...")
-    await setup_bot()
+    logger.info("🚀 Starting bot...")
+    try:
+        await setup_bot()
+        logger.info("✅ Bot started successfully")
+    except Exception as e:
+        logger.critical(f"🔥 Failed to start bot: {str(e)}", exc_info=True)
 
 @app.on_event("shutdown")
 async def on_shutdown():
     global application
-    logger.info("Shutting down...")
+    logger.info("🛑 Shutting down bot...")
     if application:
         try:
             await application.stop()
             await application.shutdown()
+            logger.info("✅ Bot stopped cleanly")
         except Exception as e:
             logger.error(f"Error shutting down application: {str(e)}")
         application = None
-    logger.info("Bot stopped")
+    logger.info("👋 Bot shutdown complete")
