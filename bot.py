@@ -14,6 +14,7 @@ from telegram.ext import (
     filters,
     JobQueue
 )
+from typing import Optional, Dict, Any
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
 from solders.keypair import Keypair
@@ -1076,14 +1077,20 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return INPUT_CONTRACT
 
 async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle user input for contract address and fetch token data."""
     user_id = update.effective_user.id
     contract_address = update.message.text.strip()
     
     # Validate contract address
+    if not contract_address:
+        await update.message.reply_text("❌ Contract address cannot be empty. Please enter a valid Solana token address.")
+        logger.error(f"Empty contract address provided by user {user_id}")
+        return INPUT_CONTRACT
+    
     try:
-        Pubkey.from_string(contract_address)  # Try to create a Pubkey object
+        Pubkey.from_string(contract_address)  # Validate Solana public key
         if len(contract_address) < 32 or len(contract_address) > 44:
-            raise ValueError("Invalid length")
+            raise ValueError("Invalid length for Solana address")
     except Exception as e:
         await update.message.reply_text(
             "❌ Invalid contract address format. Please enter a valid Solana token address (e.g., 4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R)."
@@ -1096,7 +1103,8 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     token = await fetch_token_by_contract(contract_address)
     
     if not token:
-        await update.message.reply_text("❌ Failed to fetch token data. Please verify the contract address and try again.")
+        await update.message.reply_text("❌ Failed to fetch token data. The token may not have active trading pairs or the address is invalid.")
+        logger.error(f"Failed to fetch token data for contract {contract_address} for user {user_id}")
         return ConversationHandler.END
         
     context.user_data['current_token'] = token
@@ -1129,7 +1137,7 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 reply_markup=reply_markup
             )
     except Exception as e:
-        logger.error(f"Error sending token info: {str(e)}")
+        logger.error(f"Error sending token info for user {user_id}: {str(e)}")
         await update.message.reply_text(
             f"✅ Successfully fetched {token['name']}!\n" + message,
             parse_mode='Markdown',
@@ -1138,8 +1146,8 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     return SELECT_TOKEN_ACTION
 
-async def fetch_token_by_contract(contract_address: str):
-    """Fetch token data by contract address using pair API"""
+async def fetch_token_by_contract(contract_address: str) -> Optional[Dict[str, Any]]:
+    """Fetch token data by contract address using DexScreener pair API."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept': 'application/json'
@@ -1163,32 +1171,37 @@ async def fetch_token_by_contract(contract_address: str):
             logger.debug(f"API response: {json.dumps(data, indent=2)[:500]}...")
             
             # Handle response as list of pairs
-            if not isinstance(data, dict) or not data.get('pairs'):
+            if not isinstance(data, list) or not data:
                 logger.error(f"Unexpected response format: {type(data)}")
                 return None
             
-            # Take the first pair (most relevant)
-            pair = data['pairs'][0]
+            # Find the first Solana pair with valid data
+            pair = next((p for p in data if p.get('chainId') == 'solana'), None)
+            if not pair:
+                logger.error(f"No Solana pairs found for token {contract_address}")
+                return None
+                
             base_token = pair.get('baseToken', {})
             quote_token = pair.get('quoteToken', {})
             
-            # Determine which token matches our contract
-            token_info = base_token if base_token.get('address') == contract_address else quote_token
+            # Determine which token matches our contract (case-insensitive)
+            token_info = base_token if base_token.get('address', '').lower() == contract_address.lower() else quote_token
             
             return {
                 'name': token_info.get('name', 'Unknown'),
                 'symbol': token_info.get('symbol', 'UNKNOWN'),
                 'contract_address': contract_address,
                 'price_usd': float(pair.get('priceUsd', 0)),
-                'market_cap': float(pair.get('fdv', 0)),
+                'market_cap': float(pair.get('marketCap', pair.get('fdv', 0))),
                 'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
                 'volume': float(pair.get('volume', {}).get('h24', 0)),
                 'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{contract_address}"),
                 'image': pair.get('info', {}).get('imageUrl', ''),
-                'socials': pair.get('info', {}).get('socials', {})
+                'socials': {link.get('type', link.get('label', 'website').lower()): link['url'] 
+                           for link in pair.get('info', {}).get('socials', [])}
             }
         except Exception as e:
-            logger.error(f"Error fetching token by contract: {str(e)}")
+            logger.error(f"Error fetching token by contract {contract_address}: {str(e)}")
             return None
 
 async def job_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1528,7 +1541,7 @@ async def transfer_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"Invalid address: {str(e)}")
         return TRANSFER_ADDRESS
 
-async def fetch_latest_token():
+async def fetch_latest_token() -> Optional[Dict[str, Any]]:
     """Fetch latest Solana token from DexScreener APIs asynchronously."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -1552,27 +1565,39 @@ async def fetch_latest_token():
                 logger.warning("No tokens found in API response")
                 return None
             
-            # Get the first token
-            token_data = data[0]
-            return {
-                'name': token_data.get('name', 'Unknown'),
-                'symbol': token_data.get('symbol', 'UNKNOWN'),
-                'contract_address': token_data.get('address', ''),
-                'price_usd': float(token_data.get('price', 0)),
-                'market_cap': float(token_data.get('marketCap', 0)),
-                'liquidity': float(token_data.get('liquidity', 0)),
-                'volume': float(token_data.get('volume', 0)),
-                'dexscreener_url': token_data.get('url', ''),
-                'image': token_data.get('logo', ''),
-                'socials': token_data.get('socials', {})
-            }
+            # Filter for Solana tokens
+            solana_tokens = [token for token in data if token.get('chainId') == 'solana']
+            if not solana_tokens:
+                logger.warning("No Solana tokens found in API response")
+                return None
+            
+            # Get the first Solana token
+            token_data = solana_tokens[0]
+            contract_address = token_data.get('tokenAddress', '')
+            
+            # Fetch trading data for the token
+            token = await fetch_token_by_contract(contract_address)
+            if not token:
+                logger.warning(f"Failed to fetch trading data for token {contract_address}")
+                return None
+            
+            # Merge profile data with trading data
+            token.update({
+                'name': token_data.get('name', token['name']),
+                'symbol': token_data.get('symbol', token['symbol']),
+                'image': token_data.get('icon', token['image']),
+                'socials': {link.get('type', link.get('label', 'website').lower()): link['url'] 
+                           for link in token_data.get('links', [])},
+                'description': token_data.get('description', '')
+            })
+            
+            return token
         except Exception as e:
-            logger.error(f"Error fetching token: {str(e)}")
+            logger.error(f"Error fetching latest token: {str(e)}")
             return None
 
-def format_token_message(token):
-    """Create formatted token message with improved social links"""
-    # Emoji mapping for social platforms
+def format_token_message(token: Dict[str, Any]) -> str:
+    """Create formatted token message with improved social links."""
     platform_icons = {
         'telegram': '📢',
         'twitter': '🐦',
@@ -1581,21 +1606,20 @@ def format_token_message(token):
         'medium': '✍️'
     }
     
-    # Build social links
     social_links = ""
     if token.get('socials'):
         for platform, url in token['socials'].items():
             icon = platform_icons.get(platform.lower(), '🔗')
             social_links += f"{icon} [{platform.capitalize()}]({url})\n"
     
-    # Create token info
     return (
         f"🚀 *{token.get('name', 'New Token')} ({token.get('symbol', 'TOKEN')})*\n\n"
         f"💵 *Price:* ${token.get('price_usd', 0):.6f}\n"
         f"📊 *Market Cap:* ${token.get('market_cap', 0):,.2f}\n"
         f"💧 *Liquidity:* ${token.get('liquidity', 0):,.2f}\n"
         f"📈 *24h Volume:* ${token.get('volume', 0):,.2f}\n\n"
-        f"🔗 *Contract:* `{token.get('contract_address', '')}`\n\n"
+        f"🔗 *Contract:* `{token.get('contract_address', '')}`\n"
+        f"📝 *Description:* {token.get('description', 'No description available')}\n\n"
         f"🔗 *Links:*\n{social_links or 'No links available'}\n"
         f"[📊 View Chart]({token.get('dexscreener_url', '')})"
     )
