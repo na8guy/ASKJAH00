@@ -193,8 +193,8 @@ USDT_ABI = [
 usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
 
 # DexScreener API endpoints
-DEXSCREENER_NEW_TOKENS_API = "https://api.dexscreener.com/latest/dex/tokens/new/solana"
-DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/solana/{token_address}"
+DEXSCREENER_NEW_TOKENS_API = "https://api.dexscreener.com/token-profiles/latest/v1"
+DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
 
 # Bot states for conversation
 (SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
@@ -395,13 +395,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_id=user_id
             )
         else:
-            logger.info(f"Existing user {user_id} started bot")
-            # Existing user flow
-            decrypted_user = await decrypt_user_wallet(user_id, user)
-            eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
-            subscription_message = await get_subscription_status_message(user)
+             logger.info(f"Existing user {user_id} started bot")
+        # Existing user flow
+             decrypted_user = await decrypt_user_wallet(user_id, user)
+             eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
+             subscription_message = await get_subscription_status_message(user)
             
-            message = (
+             message = (
                 f"👋 *Welcome back!*\n\n"
                 f"🔑 *Solana Address*: `{user['solana']['public_key']}`\n"
                 f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
@@ -410,8 +410,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"- /generate_wallet - Create a new wallet\n"
                 f"- /set_wallet - Import an existing wallet"
             )
-            
-            await update.message.reply_text(message, parse_mode='Markdown')
+                
+             await update.message.reply_text(message, parse_mode='Markdown')
+             if await check_subscription(user_id):
+              logger.info(f"📡 Starting token updates for existing subscriber {user_id}")
+             await start_token_updates(context, user_id)
             
     except Exception as e:
         logger.error(f"Error in start for user {user_id}: {str(e)}", exc_info=True)
@@ -1519,7 +1522,7 @@ async def fetch_latest_token():
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     }
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             # Fetch latest tokens
             logger.info("🌐 Fetching latest tokens from DexScreener")
@@ -1586,6 +1589,7 @@ def format_token_message(token):
     )
 
 async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
+    logger.debug("♥️ Job heartbeat - still running")
     """Periodically update and send unique Solana token info."""
     user_id = context.job.user_id
     logger.info(f"⏰ Job started for user {user_id} at {datetime.now()}")
@@ -2026,23 +2030,23 @@ async def setup_bot():
         return application
     
     logger.info("🚀 Initializing Telegram bot application")
-    # Create application instance
+   # Remove existing application if present
+    if application:
+        try:
+            await application.stop()
+            await application.shutdown()
+        except Exception:
+            pass
+        application = None
+    
+    # Create new application instance
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .concurrent_updates(True)
         .build()
     )
-    
     # Initialize job queue
-    if application.job_queue is None:
-        logger.info("🚦 Creating new JobQueue")
-        application.job_queue = JobQueue()
-        application.job_queue.set_application(application)
-        await application.job_queue.start()
-        logger.info("✅ Job queue started")
-    else:
-        logger.info("♻️ Using existing JobQueue")
     
     # Set up handlers
     logger.info("🛠️ Setting up command handlers")
@@ -2087,7 +2091,26 @@ async def setup_bot():
 async def on_startup():
     logger.info("🚀 Starting bot...")
     try:
-        await setup_bot()
+        app = await setup_bot()
+        logger.info("⏳ Scheduling jobs for active subscribers...")
+        
+        # Get all active subscribers
+        active_users = users_collection.find({
+            "subscription_status": "active",
+            "subscription_expiry": {"$gt": datetime.now().isoformat()}
+        })
+        
+        # Schedule jobs for each active user
+        async for user in active_users:
+            logger.info(f"  - Scheduling job for user {user['user_id']}")
+            app.job_queue.run_repeating(
+                update_token_info,
+                interval=30,
+                first=5,
+                user_id=user['user_id'],
+                name=f"token_updates_{user['user_id']}"
+            )
+        
         logger.info("✅ Bot started successfully")
     except Exception as e:
         logger.critical(f"🔥 Failed to start bot: {str(e)}", exc_info=True)
