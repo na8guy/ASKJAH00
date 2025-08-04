@@ -83,11 +83,26 @@ async def health_check():
 async def telegram_webhook(request: Request):
     global application
     try:
-        # Check if application is properly initialized
-        if application is None or not application.initialized:
+        # Check if application is properly initialized and running
+        if application is None:
+            logger.error("🚫 Application instance is None")
+            return JSONResponse(
+                content={'error': 'Application not created'},
+                status_code=503
+            )
+        
+        # Check both initialization and running state
+        if not hasattr(application, '_initialized') or not application._initialized:
             logger.error("🚫 Application not initialized")
             return JSONResponse(
                 content={'error': 'Application not initialized'},
+                status_code=503
+            )
+        
+        if not application.running:
+            logger.error("🚫 Application not running")
+            return JSONResponse(
+                content={'error': 'Application not running'},
                 status_code=503
             )
         
