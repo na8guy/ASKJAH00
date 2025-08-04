@@ -2302,19 +2302,21 @@ async def on_startup():
         logger.info("✅ Bot setup complete")
         
         logger.info("⏳ Scheduling jobs for active subscribers...")
+        # Convert cursor to list synchronously
         active_users = users_collection.find({
             "subscription_status": "active",
             "subscription_expiry": {"$gt": datetime.now().isoformat()}
         })
         
-        async for user in active_users:
-            logger.info(f"  - Scheduling job for user {user['user_id']}")
+        for user in active_users:
+            user_id = user['user_id']
+            logger.info(f"  - Scheduling job for user {user_id}")
             app.job_queue.run_repeating(
                 update_token_info,
                 interval=30,
                 first=5,
-                user_id=user['user_id'],
-                name=f"token_updates_{user['user_id']}"
+                user_id=user_id,
+                name=f"token_updates_{user_id}"
             )
         
         logger.info("✅ Bot startup complete")
