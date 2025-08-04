@@ -1569,12 +1569,25 @@ async def fetch_latest_token() -> List[Dict[str, Any]]:
             
             # Filter for Solana tokens with timestamp within last 30 seconds
             time_threshold = datetime.now() - timedelta(seconds=30)
-            solana_tokens = [
-                token for token in data
-                if token.get('chainId') == 'solana' and
-                   token.get('createdAt') and
-                   datetime.fromisoformat(token['createdAt'].replace('Z', '+00:00')) >= time_threshold
-            ]
+            time_threshold_ms = int(time_threshold.timestamp() * 1000)  # Convert to milliseconds
+            solana_tokens = []
+            
+            for token_data in data:
+                if token_data.get('chainId') != 'solana':
+                    continue
+                
+                # Extract timestamp from openGraph URL
+                open_graph_url = token_data.get('openGraph', '')
+                timestamp_match = re.search(r'timestamp=(\d+)', open_graph_url)
+                if not timestamp_match:
+                    logger.warning(f"No timestamp found in openGraph URL for token {token_data.get('tokenAddress', 'unknown')}")
+                    continue
+                
+                token_timestamp_ms = int(timestamp_match.group(1))
+                if token_timestamp_ms < time_threshold_ms:
+                    continue
+                
+                solana_tokens.append(token_data)
             
             if not solana_tokens:
                 logger.warning("No recent Solana tokens found in API response")
@@ -1600,7 +1613,7 @@ async def fetch_latest_token() -> List[Dict[str, Any]]:
                     'socials': {link.get('type', link.get('label', 'website').lower()): link['url']
                                for link in token_data.get('links', [])},
                     'description': token_data.get('description', ''),
-                    'createdAt': token_data.get('createdAt', '')
+                    'openGraph': token_data.get('openGraph', '')
                 })
                 result_tokens.append(token)
             
@@ -1610,6 +1623,7 @@ async def fetch_latest_token() -> List[Dict[str, Any]]:
         except Exception as e:
             logger.error(f"Error fetching latest tokens: {str(e)}")
             return []
+
 
 def format_token_message(token: Dict[str, Any]) -> str:
     """Create formatted token message with improved social links."""
