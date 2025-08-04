@@ -14,7 +14,8 @@ from telegram.ext import (
     filters,
     JobQueue
 )
-from typing import Optional, Dict, Any
+from typing import Optional, List, Dict, Any
+
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
 from solders.keypair import Keypair
@@ -53,6 +54,8 @@ from eth_account import Account
 # FastAPI setup
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from .config import DEXSCREENER_NEW_TOKENS_API, db
+from .utils import format_token_message
 
 # Set up logging
 logging.basicConfig(
@@ -196,6 +199,7 @@ usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
 # DexScreener API endpoints
 DEXSCREENER_NEW_TOKENS_API = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
+
 
 # Bot states for conversation
 (SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
@@ -1541,60 +1545,71 @@ async def transfer_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"Invalid address: {str(e)}")
         return TRANSFER_ADDRESS
 
-async def fetch_latest_token() -> Optional[Dict[str, Any]]:
-    """Fetch latest Solana token from DexScreener APIs asynchronously."""
+async def fetch_latest_token() -> List[Dict[str, Any]]:
+    """Fetch all Solana tokens from DexScreener API that appeared in the last 30 seconds."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     }
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            # Fetch latest tokens
             logger.info("🌐 Fetching latest tokens from DexScreener")
             response = await client.get(DEXSCREENER_NEW_TOKENS_API, headers=headers)
             
             if response.status_code != 200:
                 logger.error(f"DexScreener API failed: {response.status_code} - {response.text}")
-                return None
+                return []
             
             data = response.json()
             logger.debug(f"API response: {json.dumps(data, indent=2)[:500]}...")
             
-            # Handle response format
             if not isinstance(data, list) or not data:
                 logger.warning("No tokens found in API response")
-                return None
+                return []
             
-            # Filter for Solana tokens
-            solana_tokens = [token for token in data if token.get('chainId') == 'solana']
+            # Filter for Solana tokens with timestamp within last 30 seconds
+            time_threshold = datetime.now() - timedelta(seconds=30)
+            solana_tokens = [
+                token for token in data
+                if token.get('chainId') == 'solana' and
+                   token.get('createdAt') and
+                   datetime.fromisoformat(token['createdAt'].replace('Z', '+00:00')) >= time_threshold
+            ]
+            
             if not solana_tokens:
-                logger.warning("No Solana tokens found in API response")
-                return None
+                logger.warning("No recent Solana tokens found in API response")
+                return []
             
-            # Get the first Solana token
-            token_data = solana_tokens[0]
-            contract_address = token_data.get('tokenAddress', '')
+            result_tokens = []
+            for token_data in solana_tokens:
+                contract_address = token_data.get('tokenAddress', '')
+                if not contract_address:
+                    continue
+                
+                # Fetch trading data for each token
+                token = await fetch_token_by_contract(contract_address)
+                if not token:
+                    logger.warning(f"Failed to fetch trading data for token {contract_address}")
+                    continue
+                
+                # Merge profile data with trading data
+                token.update({
+                    'name': token_data.get('name', token['name']),
+                    'symbol': token_data.get('symbol', token['symbol']),
+                    'image': token_data.get('icon', token['image']),
+                    'socials': {link.get('type', link.get('label', 'website').lower()): link['url']
+                               for link in token_data.get('links', [])},
+                    'description': token_data.get('description', ''),
+                    'createdAt': token_data.get('createdAt', '')
+                })
+                result_tokens.append(token)
             
-            # Fetch trading data for the token
-            token = await fetch_token_by_contract(contract_address)
-            if not token:
-                logger.warning(f"Failed to fetch trading data for token {contract_address}")
-                return None
-            
-            # Merge profile data with trading data
-            token.update({
-                'name': token_data.get('name', token['name']),
-                'symbol': token_data.get('symbol', token['symbol']),
-                'image': token_data.get('icon', token['image']),
-                'socials': {link.get('type', link.get('label', 'website').lower()): link['url'] 
-                           for link in token_data.get('links', [])},
-                'description': token_data.get('description', '')
-            })
-            
-            return token
+            logger.info(f"Fetched {len(result_tokens)} recent Solana tokens")
+            return result_tokens
+        
         except Exception as e:
-            logger.error(f"Error fetching latest token: {str(e)}")
-            return None
+            logger.error(f"Error fetching latest tokens: {str(e)}")
+            return []
 
 def format_token_message(token: Dict[str, Any]) -> str:
     """Create formatted token message with improved social links."""
@@ -1624,14 +1639,13 @@ def format_token_message(token: Dict[str, Any]) -> str:
         f"[📊 View Chart]({token.get('dexscreener_url', '')})"
     )
 
-async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
-    logger.debug("♥️ Job heartbeat - still running")
-    """Periodically update and send unique Solana token info."""
+async def update_token_info(context):
+    """Periodically update and send unique Solana token info for new tokens."""
     user_id = context.job.user_id
     logger.info(f"⏰ Job started for user {user_id} at {datetime.now()}")
     
     try:
-        user = users_collection.find_one({'user_id': user_id})
+        user = db.users.find_one({'user_id': user_id})
         if not user:
             logger.info(f"User {user_id} not found in database")
             context.job.schedule_removal()
@@ -1649,85 +1663,82 @@ async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
             logger.debug("Skipping due to rate limit")
             return
         
-        logger.info(f"🔍 Fetching token for user {user_id}")
-        token = await fetch_latest_token()
-        if not token:
-            logger.warning("Token fetch returned None")
+        logger.info(f"🔍 Fetching tokens for user {user_id}")
+        tokens = await fetch_latest_token()
+        if not tokens:
+            logger.warning("No new tokens fetched")
             return
         
-        logger.info(f"✅ Fetched token: {token['name']} ({token['contract_address']})")
-        
-        # Check for duplicates
-        if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
-            logger.debug("Token already posted globally")
-            return
+        for token in tokens:
+            logger.info(f"Processing token: {token['name']} ({token['contract_address']})")
             
-        if token['contract_address'] in user.get('posted_tokens', []):
-            logger.debug("User already saw this token")
-            return
-        
-        # Format token info
-        message = format_token_message(token)
-        is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
-        warning = "⚠️ *LOW LIQUIDITY - Trade with caution!*\n" if is_suspicious else ""
-        
-        # Create buttons
-        keyboard = [
-            [InlineKeyboardButton("💰 Buy", callback_data=f"buy_{token['contract_address']}"),
-             InlineKeyboardButton("💸 Sell", callback_data=f"sell_{token['contract_address']}")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Send to user
-        try:
-            if token.get('image'):
-                await context.bot.send_photo(
-                    chat_id=user_id,
-                    photo=token['image'],
-                    caption=warning + message,
-                    parse_mode='Markdown',
-                    reply_markup=reply_markup
-                )
-            else:
+            # Check if user has already seen this token
+            if token['contract_address'] in user.get('posted_tokens', []):
+                logger.debug(f"User {user_id} already saw token {token['contract_address']}")
+                continue
+            
+            # Format token info
+            message = format_token_message(token)
+            is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
+            warning = "⚠️ *LOW LIQUIDITY - Trade with caution!*\n" if is_suspicious else ""
+            
+            # Create buttons
+            keyboard = [
+                [InlineKeyboardButton("💰 Buy", callback_data=f"buy_{token['contract_address']}"),
+                 InlineKeyboardButton("💸 Sell", callback_data=f"sell_{token['contract_address']}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Send to user
+            try:
+                if token.get('image'):
+                    await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=token['image'],
+                        caption=warning + message,
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=warning + message,
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
+                    )
+            except Exception as e:
+                logger.error(f"Error sending token {token['contract_address']}: {str(e)}")
                 await context.bot.send_message(
-                    chat_id=user_id,
-                    text=warning + message,
+                    user_id,
+                    warning + message,
                     parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
-        except Exception as e:
-            logger.error(f"Error sending token: {str(e)}")
-            await context.bot.send_message(
-                user_id,
-                warning + message,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
-            )
-        
-        # Update records
-        try:
-            db.global_posted_tokens.insert_one({
-                'contract_address': token['contract_address'],
-                'timestamp': datetime.now(),
-                'name': token.get('name', ''),
-                'symbol': token.get('symbol', '')
-            })
             
-            users_collection.update_one(
-                {'user_id': user_id},
-                {
-                    '$set': {'last_api_call': current_time},
-                    '$addToSet': {'posted_tokens': token['contract_address']}
-                }
-            )
-            logger.info("Token records updated")
-        except Exception as e:
-            logger.error(f"Error updating token records: {str(e)}")
-        
-        # Auto trade if enabled
-        if user.get('trading_mode') == 'automatic':
-            await auto_trade(context, user_id, token)
+            # Update records
+            try:
+                db.global_posted_tokens.insert_one({
+                    'contract_address': token['contract_address'],
+                    'timestamp': datetime.now(),
+                    'name': token.get('name', ''),
+                    'symbol': token.get('symbol', '')
+                })
+                
+                db.users.update_one(
+                    {'user_id': user_id},
+                    {
+                        '$set': {'last_api_call': current_time},
+                        '$addToSet': {'posted_tokens': token['contract_address']}
+                    }
+                )
+                logger.info(f"Token records updated for {token['contract_address']}")
+            except Exception as e:
+                logger.error(f"Error updating token records for {token['contract_address']}: {str(e)}")
             
+            # Auto trade if enabled
+            if user.get('trading_mode') == 'automatic':
+                await auto_trade(context, user_id, token)
+        
     except Exception as e:
         logger.error(f"🔥 Error in auto token update: {str(e)}", exc_info=True)
     finally:
