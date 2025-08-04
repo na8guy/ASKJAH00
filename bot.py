@@ -11,7 +11,8 @@ from telegram.ext import (
     ContextTypes, 
     ConversationHandler, 
     MessageHandler, 
-    filters
+    filters,
+    JobQueue
 )
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
@@ -510,7 +511,7 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"Error in manual token fetch: {str(e)}", exc_info=True)
         await update.message.reply_text("An error occurred while fetching tokens. Please try again.")
-        
+
 async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = users_collection.find_one({'user_id': user_id})
@@ -528,7 +529,21 @@ async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Use /fetch_tokens to manually check for new tokens."
     )
     
-    await update.message.reply_text(status, parse_mode='Markdown')    
+    await update.message.reply_text(status, parse_mode='Markdown')  
+
+async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Schedule periodic token updates for the subscribed user."""
+    if context.job_queue:
+        # Schedule token updates every 5 minutes (adjust interval as needed)
+        context.job_queue.run_repeating(
+            update_token_info,
+            interval=30,  # 300 seconds = 5 minutes
+            first=0,
+            user_id=user_id,
+            name=f"token_updates_{user_id}"
+        )
+    else:
+        logger.error("JobQueue is not initialized for token updates.")  
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1126,7 +1141,7 @@ async def fetch_token_by_contract(contract_address: str):
         try:
             # Fetch token pair details directly
             logger.debug(f"Fetching token by contract: {contract_address}")
-            pair_url = DEXSCREENER_PAIR_API.format(token_address=contract_address)
+            pair_url = DEXSCREENER_TOKEN_API.format(token_address=contract_address)
             pair_response = await client.get(pair_url, headers=headers)
             logger.debug(f"Pair API status: {pair_response.status_code}")
             
@@ -1159,7 +1174,7 @@ async def fetch_token_by_contract(contract_address: str):
             # Try to get social links from profile API
             try:
                 logger.debug("Trying to fetch profile for social links")
-                profile_url = f"{DEXSCREENER_LATEST_API}?tokenAddress={contract_address}"
+                profile_url = f"{DEXSCREENER_PROFILE_API}?tokenAddress={contract_address}"
                 profile_response = await client.get(profile_url, headers=headers)
                 if profile_response.status_code == 200:
                     profile_data = profile_response.json()
