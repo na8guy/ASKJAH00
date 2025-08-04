@@ -2125,60 +2125,92 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
     application.add_handler(CommandHandler("force_fetch", force_token_fetch))
     application.add_handler(CommandHandler("trade_status", trade_status))
-    application.add_handler(CommandHandler("debug", debug))
     application.add_handler(CallbackQueryHandler(handle_token_button, pattern='^(buy|sell)_'))
+    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(CommandHandler("reset_tokens", reset_tokens))
+    application.add_handler(CommandHandler("debug", debug))
     
-    application.add_handler(ConversationHandler(
+    # Add error handler correctly
+    application.add_error_handler(error_handler)
+
+    # Conversation handlers with per_message=True to prevent warnings
+    generate_wallet_handler = ConversationHandler(
         entry_points=[CommandHandler("generate_wallet", wrap_conversation_entry(generate_wallet))],
         states={
-            CONFIRM_NEW_WALLET: [CallbackQueryHandler(wrap_conversation_state(confirm_generate_wallet), pattern='^(confirm_new_wallet|cancel_new_wallet)$')]
+            CONFIRM_NEW_WALLET: [CallbackQueryHandler(wrap_conversation_state(confirm_generate_wallet), 
+                                                    pattern='^(confirm_new_wallet|cancel_new_wallet)$')]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=True
-    ))
-    application.add_handler(ConversationHandler(
+    )
+    application.add_handler(generate_wallet_handler)
+
+    set_wallet_handler = ConversationHandler(
         entry_points=[CommandHandler("set_wallet", wrap_conversation_entry(set_wallet))],
         states={
-            SET_WALLET_METHOD: [CallbackQueryHandler(wrap_conversation_state(set_wallet_method), pattern='^(mnemonic|private_key)$')],
-            INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_conversation_state(input_mnemonic))],
-            INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_conversation_state(input_private_key))],
-            CONFIRM_SET_WALLET: [CallbackQueryHandler(wrap_conversation_state(confirm_set_wallet), pattern='^(confirm_set_wallet|cancel_set_wallet)$')]
+            SET_WALLET_METHOD: [CallbackQueryHandler(wrap_conversation_state(set_wallet_method), 
+                                                   pattern='^(mnemonic|private_key)$')],
+            INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                          wrap_conversation_state(input_mnemonic))],
+            INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                            wrap_conversation_state(input_private_key))],
+            CONFIRM_SET_WALLET: [CallbackQueryHandler(wrap_conversation_state(confirm_set_wallet), 
+                                                    pattern='^(confirm_set_wallet|cancel_set_wallet)$')]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=True
-    ))
-    application.add_handler(ConversationHandler(
+    )
+    application.add_handler(set_wallet_handler)
+
+    set_mode_handler = ConversationHandler(
         entry_points=[CommandHandler("setmode", wrap_conversation_entry(set_mode))],
         states={
-            SET_TRADING_MODE: [CallbackQueryHandler(wrap_conversation_state(mode_callback), pattern='^(manual|automatic)$')],
-            SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_conversation_state(set_auto_buy_amount))],
-            SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_conversation_state(set_sell_percentage))],
-            SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_conversation_state(set_loss_percentage))]
+            SET_TRADING_MODE: [CallbackQueryHandler(wrap_conversation_state(mode_callback), 
+                                                  pattern='^(manual|automatic)$')],
+            SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                               wrap_conversation_state(set_auto_buy_amount))],
+            SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                               wrap_conversation_state(set_sell_percentage))],
+            SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                               wrap_conversation_state(set_loss_percentage))]
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
-    ))
-    application.add_handler(ConversationHandler(
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True
+    )
+    application.add_handler(set_mode_handler)
+
+    trade_handler = ConversationHandler(
         entry_points=[CommandHandler("trade", wrap_conversation_entry(trade))],
         states={
-            INPUT_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_conversation_state(input_contract))],
-            SELECT_TOKEN_ACTION: [CallbackQueryHandler(wrap_conversation_state(handle_token_button), pattern='^(buy|sell)_')],
-            BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_conversation_state(buy_amount))],
-            SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_conversation_state(sell_amount))],
-            CONFIRM_TRADE: [CallbackQueryHandler(wrap_conversation_state(confirm_trade), pattern='^(confirm_trade|cancel_trade)$')]
+            INPUT_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                         wrap_conversation_state(input_contract))],
+            SELECT_TOKEN_ACTION: [CallbackQueryHandler(wrap_conversation_state(handle_token_button), 
+                                                     pattern='^(buy|sell)_')],
+            BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                      wrap_conversation_state(buy_amount))],
+            SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                       wrap_conversation_state(sell_amount))],
+            CONFIRM_TRADE: [CallbackQueryHandler(wrap_conversation_state(confirm_trade), 
+                          pattern='^(confirm_trade|cancel_trade)$')]
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
-    ))
-    application.add_handler(ConversationHandler(
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True
+    )
+    application.add_handler(trade_handler)
+
+    transfer_handler = ConversationHandler(
         entry_points=[CommandHandler("transfer", wrap_conversation_entry(transfer))],
         states={
             TRANSFER_TOKEN: [CallbackQueryHandler(wrap_conversation_state(transfer_token))],
-            TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_conversation_state(transfer_amount))],
-            TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_conversation_state(transfer_address))]
+            TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                           wrap_conversation_state(transfer_amount))],
+            TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                           wrap_conversation_state(transfer_address))]
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
-    ))
-    application.add_handler(CommandHandler("balance", balance))
-    application.add_handler(CommandHandler("reset_tokens", reset_tokens))
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True
+    )
+    application.add_handler(transfer_handler)
     application.add_handler(error_handler)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
