@@ -582,6 +582,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         # Start token updates after setting up payment
+        logger.debug(f"Attempting to start token updates for user {user_id}")
         await start_token_updates(context, user_id)
         logger.info(f"Started token updates for user {user_id}")
         
@@ -1678,7 +1679,7 @@ def format_token_message(token):
 async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
     """Periodically update and send unique Solana token info."""
     user_id = context.job.user_id
-    logger.debug(f"Starting auto token fetch for user {user_id}")
+    logger.debug(f"Executing update_token_info for user {user_id} at {datetime.now()}")
     
     try:
         user = users_collection.find_one({'user_id': user_id})
@@ -2034,8 +2035,10 @@ def setup_handlers(application: Application):
         states={
             CONFIRM_NEW_WALLET: [CallbackQueryHandler(confirm_generate_wallet, pattern='^(confirm_new_wallet|cancel_new_wallet)$')]
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True  # Add this line
     ))
+    # Repeat for other ConversationHandlers with per_message=True
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("set_wallet", set_wallet)],
         states={
@@ -2044,7 +2047,8 @@ def setup_handlers(application: Application):
             INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_private_key)],
             CONFIRM_SET_WALLET: [CallbackQueryHandler(confirm_set_wallet, pattern='^(confirm_set_wallet|cancel_set_wallet)$')]
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True
     ))
     application.add_handler(CommandHandler("reset_tokens", reset_tokens))
     application.add_handler(ConversationHandler(
@@ -2056,6 +2060,7 @@ def setup_handlers(application: Application):
             SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_loss_percentage)]
         },
         fallbacks=[CommandHandler("cancel", cancel)]
+        
     ))
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("trade", trade)],
