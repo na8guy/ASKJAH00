@@ -360,12 +360,21 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
             logger.warning(f"Invalid or unencrypted data for user {user_id}: {field}")
             return field if isinstance(field, str) else "[Invalid Data]"
 
+    # Ensure all fields exist before trying to decrypt
+    decrypted_user.setdefault('mnemonic', '')
+    if 'solana' not in decrypted_user:
+        decrypted_user['solana'] = {'private_key': ''}
+    if 'eth' not in decrypted_user:
+        decrypted_user['eth'] = {'private_key': ''}
+    if 'bsc' not in decrypted_user:
+        decrypted_user['bsc'] = {'private_key': ''}
+
     decrypted_user['mnemonic'] = safe_decrypt(user.get('mnemonic', {}))
-    decrypted_user['solana']['private_key'] = safe_decrypt(user.get('solana', {}).get('private_key', {}))
+    decrypted_user['solana']['private_key'] = safe_decrypt(user.get('solana', {}).get('private_key', ''))
     if user.get('eth'):
-        decrypted_user['eth']['private_key'] = safe_decrypt(user.get('eth', {}).get('private_key', {}))
+        decrypted_user['eth']['private_key'] = safe_decrypt(user.get('eth', {}).get('private_key', ''))
     if user.get('bsc'):
-        decrypted_user['bsc']['private_key'] = safe_decrypt(user.get('bsc', {}).get('private_key', {}))
+        decrypted_user['bsc']['private_key'] = safe_decrypt(user.get('bsc', {}).get('private_key', ''))
     return decrypted_user
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,6 +400,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mnemo = Mnemonic("english")
             mnemonic = mnemo.generate(strength=256)
             user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
+            # Ensure the structure has all required fields
+            user_data.setdefault('solana', {})
+            user_data.setdefault('eth', None)
+            user_data.setdefault('bsc', None)
+            user_data.setdefault('portfolio', {})
+            user_data.setdefault('posted_tokens', [])
+            user_data.setdefault('subscription_status', 'inactive')
             users_collection.insert_one(user_data)
             
             decrypted_user = await decrypt_user_wallet(user_id, user_data)
@@ -421,6 +437,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             logger.info(f"Existing user {user_id} started bot")
+            # Ensure existing user has all required fields
+            update_fields = {}
+            if 'solana' not in user:
+                update_fields['solana'] = {'public_key': '', 'private_key': ''}
+            if 'eth' not in user:
+                update_fields['eth'] = None
+            if 'bsc' not in user:
+                update_fields['bsc'] = None
+            if 'portfolio' not in user:
+                update_fields['portfolio'] = {}
+            if 'posted_tokens' not in user:
+                update_fields['posted_tokens'] = []
+            if 'subscription_status' not in user:
+                update_fields['subscription_status'] = 'inactive'
+                
+            if update_fields:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': update_fields}
+                )
+                user = users_collection.find_one({'user_id': user_id})
+            
             decrypted_user = await decrypt_user_wallet(user_id, user)
             eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
             subscription_message = await get_subscription_status_message(user)
