@@ -397,8 +397,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     logger.debug(f"Start command from user {user_id}")
     
-    context.user_data[f'conversation_state_{user_id}'] = None
-    # This will automatically create a trial subscription if new user
+    # Clear any existing conversation state
+    context.user_data.clear()
+    
+    # Check/grant subscription (this creates user record if new)
     if not await check_subscription(user_id):
         await update.message.reply_text(
             "There was an issue setting up your free trial. Please contact support."
@@ -406,53 +408,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user = users_collection.find_one({'user_id': user_id})
-    
-    if not user or not user.get('solana') or not user['solana'].get('public_key'):
-        # New user or no wallet exists
-        keyboard = [
-            [InlineKeyboardButton("Generate New Wallet", callback_data='generate_wallet')],
-            [InlineKeyboardButton("Import Existing Wallet", callback_data='import_wallet')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "👋 Welcome to the Multi-Chain Trading Bot!\n\n"
-            "You have a 1-day free trial to test all features.\n\n"
-            "Would you like to:\n"
-            "1. Generate a new wallet (recommended for beginners)\n"
-            "2. Import an existing wallet?",
-            reply_markup=reply_markup
-        )
-        return WALLET_SETUP_CHOICE
-    else:
-        pass
     if not user:
-        # Create new user with all required fields
-        user_data = {
-            'user_id': user_id,
-            'chat_id': chat_id,
-            'solana': {
-                'public_key': '',
-                'private_key': ''
-            },
-            'eth': None,
-            'bsc': None,
-            'trading_mode': 'manual',
-            'auto_buy_amount': 0.0,
-            'sell_percentage': 0.0,
-            'loss_percentage': 0.0,
-            'portfolio': {},
-            'last_api_call': 0,
-            'posted_tokens': [],
-            'subscription_status': 'trial',
-            'subscription_expiry': (datetime.now() + timedelta(days=1)).isoformat(),
-            'payment_address': None,
-            'expected_amount': None,
-            'payment_deadline': None
-        }
-        users_collection.insert_one(user_data)
-        
-        # Ask if they want to generate or import wallet
+        await update.message.reply_text("Account setup failed. Please try again.")
+        return
+
+    # Check if wallet is set up
+    has_wallet = user.get('solana') and user['solana'].get('public_key')
+    
+    if not has_wallet:
+        # No wallet exists - show setup options
         keyboard = [
             [InlineKeyboardButton("Generate New Wallet", callback_data='generate_wallet')],
             [InlineKeyboardButton("Import Existing Wallet", callback_data='import_wallet')]
@@ -462,55 +426,60 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "👋 Welcome to the Multi-Chain Trading Bot!\n\n"
             "You have a 1-day free trial to test all features.\n\n"
-            "Would you like to:\n"
-            "1. Generate a new wallet (recommended for beginners)\n"
-            "2. Import an existing wallet?",
+            "First, set up your wallet:\n"
+            "1. Generate new wallet (recommended)\n"
+            "2. Import existing wallet",
             reply_markup=reply_markup
         )
         return WALLET_SETUP_CHOICE
     else:
-        # Ensure existing user has all required fields
-        update_fields = {}
-        if 'solana' not in user:
-            update_fields['solana'] = {'public_key': '', 'private_key': ''}
-        if 'eth' not in user:
-            update_fields['eth'] = None
-        if 'bsc' not in user:
-            update_fields['bsc'] = None
-        if 'portfolio' not in user:
-            update_fields['portfolio'] = {}
-        if 'posted_tokens' not in user:
-            update_fields['posted_tokens'] = []
-        if 'subscription_status' not in user:
-            update_fields['subscription_status'] = 'inactive'
-            
-        if update_fields:
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': update_fields}
-            )
-            user = users_collection.find_one({'user_id': user_id})
-        
-        # Show existing user their wallet info
-        decrypted_user = await decrypt_user_wallet(user_id, user)
+        # Wallet exists - show main menu
         eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
-        subscription_message = await get_subscription_status_message(user)
         
+        # Create main menu keyboard
+        keyboard = [
+            [InlineKeyboardButton("🔄 Fetch Tokens", callback_data='fetch_tokens')],
+            [InlineKeyboardButton("💰 Wallet Balance", callback_data='show_balance')],
+            [InlineKeyboardButton("⚙️ Settings", callback_data='settings')],
+            [InlineKeyboardButton("🔍 Trade Status", callback_data='trade_status')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        subscription_msg = await get_subscription_status_message(user)
         message = (
-            f"👋 *Welcome back!*\n\n"
+            f"👋 *Main Menu*\n\n"
             f"🔑 *Solana Address*: `{user['solana']['public_key']}`\n"
             f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
-            f"{subscription_message}\n\n"
-            f"🔧 *Commands:*\n"
-            f"- /generate_wallet - Create a new wallet\n"
-            f"- /set_wallet - Import an existing wallet"
+            f"{subscription_msg}"
         )
-            
-        await update.message.reply_text(message, parse_mode='Markdown')
         
+        await update.message.reply_text(
+            message,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+        
+        # Start token updates if subscribed
         if await check_subscription(user_id):
-            logger.info(f"📡 Starting token updates for existing subscriber {user_id}")
             await start_token_updates(context, user_id)
+
+
+async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'fetch_tokens':
+        await fetch_tokens_manual(update, context)
+    elif query.data == 'show_balance':
+        await balance(update, context)
+    elif query.data == 'settings':
+        await show_settings(update, context)
+    elif query.data == 'trade_status':
+        await trade_status(update, context)
+    
+    # Return to main menu
+    await start(update, context)
+
 
 async def get_subscription_status_message(user: dict) -> str:
     status = user.get('subscription_status')
@@ -2345,25 +2314,29 @@ def setup_handlers(application: Application):
             return await entry_handler(update, context)
         return wrapped
 
-    def wrap_conversation_state(state_handler):
-        async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            user_id = update.effective_user.id
-            context.user_data[f'last_activity_{user_id}'] = datetime.now()
-            for job in context.job_queue.jobs():
-                if job.name == f"timeout_check_{user_id}":
-                    job.data['last_activity'] = datetime.now()
+def wrap_conversation_state(state_handler):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user_id = update.effective_user.id
+        try:
             result = await state_handler(update, context)
-            # Resume jobs if conversation ends
             if result == ConversationHandler.END:
-                context.user_data[f'conversation_state_{user_id}'] = None
-                for job in context.job_queue.jobs():
-                    if job.name == f"timeout_check_{user_id}":
-                        job.schedule_removal()
-                        logger.debug(f"Removed timeout_check_{user_id} after conversation end")
-                if await check_subscription(user_id):
-                    await start_token_updates(context, user_id)
+                # Clear conversation state
+                keys = list(context.user_data.keys())
+                for key in keys:
+                    if str(user_id) in key:
+                        del context.user_data[key]
+                logger.debug(f"Cleared conversation state for user {user_id}")
             return result
-        return wrapped
+        except Exception as e:
+            logger.error(f"Error in state handler: {str(e)}")
+            # Clean up on error
+            keys = list(context.user_data.keys())
+            for key in keys:
+                if str(user_id) in key:
+                    del context.user_data[key]
+            await update.message.reply_text("An error occurred. Please try /start again.")
+            return ConversationHandler.END
+    return wrapped
 
     # Add all command handlers
     application.add_handler(CommandHandler("subscribe", subscribe))
@@ -2374,6 +2347,7 @@ def setup_handlers(application: Application):
     application.add_handler(CallbackQueryHandler(handle_token_button, pattern='^(buy|sell)_'))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("reset_tokens", reset_tokens))
+    application.add_handler(CallbackQueryHandler(handle_main_menu, pattern='^(fetch_tokens|show_wallet|settings)$'))
     application.add_handler(CommandHandler("debug", debug))
     
     # Add error handler
