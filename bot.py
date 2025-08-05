@@ -226,7 +226,7 @@ DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_add
 (SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
  SELECT_TOKEN, BUY_AMOUNT, CONFIRM_TRADE, TRANSFER_TOKEN, TRANSFER_AMOUNT, TRANSFER_ADDRESS,
  CONFIRM_NEW_WALLET, SET_WALLET_METHOD, INPUT_MNEMONIC, INPUT_PRIVATE_KEY, CONFIRM_SET_WALLET,
- SELECT_TOKEN_ACTION, SELL_AMOUNT,INPUT_CONTRACT) = range(18)
+ SELECT_TOKEN_ACTION, SELL_AMOUNT,INPUT_CONTRACT,WALLET_SETUP_CHOICE) = range(19)
 
 def derive_user_key(user_id: int) -> bytes:
     kdf = PBKDF2HMAC(
@@ -258,22 +258,29 @@ async def check_subscription(user_id: int) -> bool:
     if not user:
         logger.debug(f"No user found for user_id {user_id}")
         return False
-    if user.get('subscription_status') != 'active':
+        
+    status = user.get('subscription_status')
+    if status not in ['active', 'trial']:
         logger.debug(f"User {user_id} subscription is inactive")
         return False
+        
     expiry = user.get('subscription_expiry')
     if not expiry:
         logger.debug(f"User {user_id} has no subscription expiry")
         return False
+        
     if isinstance(expiry, str):
         expiry = datetime.fromisoformat(expiry)
+        
     if datetime.now() >= expiry:
-        logger.debug(f"User {user_id} subscription expired at {expiry}")
+        new_status = 'inactive' if status == 'active' else 'expired_trial'
         users_collection.update_one(
             {'user_id': user_id},
-            {'$set': {'subscription_status': 'inactive', 'subscription_expiry': None}}
+            {'$set': {'subscription_status': new_status, 'subscription_expiry': None}}
         )
+        logger.debug(f"User {user_id} subscription expired at {expiry}")
         return False
+        
     logger.debug(f"User {user_id} has active subscription until {expiry}")
     return True
 
@@ -392,73 +399,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     user = users_collection.find_one({'user_id': user_id})
-    user_data = None
     
     try:
         if not user:
-            logger.info(f"Creating new wallet for user {user_id}")
-            mnemo = Mnemonic("english")
-            mnemonic = mnemo.generate(strength=256)
-            user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
-            # Ensure the structure has all required fields
-            user_data.setdefault('solana', {})
-            user_data.setdefault('eth', None)
-            user_data.setdefault('bsc', None)
-            user_data.setdefault('portfolio', {})
-            user_data.setdefault('posted_tokens', [])
-            user_data.setdefault('subscription_status', 'inactive')
-            users_collection.insert_one(user_data)
-            
-            decrypted_user = await decrypt_user_wallet(user_id, user_data)
-            eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
-            
-            message = (
-                f"🚀 *Welcome to the Multi-Chain Trading Bot!*\n\n"
-                f"✨ A new wallet has been created for you\n"
-                f"🔐 *Mnemonic*: `{decrypted_user['mnemonic']}`\n"
-                f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
-                f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
-                f"⚠️ *SECURITY WARNING*\n"
-                f"1️⃣ Never share your mnemonic or private keys\n"
-                f"2️⃣ Store them securely offline\n"
-                f"3️⃣ This message will auto-delete in 30 seconds\n"
-                f"4️⃣ Use for small amounts only\n\n"
-                f"💎 *Get started:*\n"
-                f"- /subscribe - Activate trading features\n"
-                f"- /set_wallet - Import existing wallet"
+            # New user - give 1 day free trial
+            expiry = datetime.now() + timedelta(days=1)
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    'subscription_status': 'trial',
+                    'subscription_expiry': expiry.isoformat()
+                }},
+                upsert=True
             )
             
-            msg = await update.message.reply_text(message, parse_mode='Markdown')
+            # Ask if they want to import or generate wallet
+            keyboard = [
+                [InlineKeyboardButton("Generate New Wallet", callback_data='generate_wallet')],
+                [InlineKeyboardButton("Import Existing Wallet", callback_data='import_wallet')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             
-            context.job_queue.run_once(
-                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=msg.message_id),
-                30,
-                user_id=user_id
+            await update.message.reply_text(
+                "👋 Welcome to the Multi-Chain Trading Bot!\n\n"
+                "You have a 1-day free trial to test all features.\n\n"
+                "Would you like to:\n"
+                "1. Generate a new wallet (recommended for beginners)\n"
+                "2. Import an existing wallet?",
+                reply_markup=reply_markup
             )
+            return WALLET_SETUP_CHOICE
         else:
-            logger.info(f"Existing user {user_id} started bot")
-            # Ensure existing user has all required fields
-            update_fields = {}
-            if 'solana' not in user:
-                update_fields['solana'] = {'public_key': '', 'private_key': ''}
-            if 'eth' not in user:
-                update_fields['eth'] = None
-            if 'bsc' not in user:
-                update_fields['bsc'] = None
-            if 'portfolio' not in user:
-                update_fields['portfolio'] = {}
-            if 'posted_tokens' not in user:
-                update_fields['posted_tokens'] = []
-            if 'subscription_status' not in user:
-                update_fields['subscription_status'] = 'inactive'
-                
-            if update_fields:
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$set': update_fields}
-                )
-                user = users_collection.find_one({'user_id': user_id})
-            
+            # Existing user flow
             decrypted_user = await decrypt_user_wallet(user_id, user)
             eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
             subscription_message = await get_subscription_status_message(user)
@@ -474,10 +446,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
                 
             await update.message.reply_text(message, parse_mode='Markdown')
-        
-        if await check_subscription(user_id):
-            logger.info(f"📡 Starting token updates for existing subscriber {user_id}")
-            await start_token_updates(context, user_id)
+            
+            if await check_subscription(user_id):
+                logger.info(f"📡 Starting token updates for existing subscriber {user_id}")
+                await start_token_updates(context, user_id)
             
     except Exception as e:
         logger.error(f"Error in start for user {user_id}: {str(e)}", exc_info=True)
@@ -504,6 +476,55 @@ async def get_subscription_status_message(user: dict) -> str:
         )
         return "Your subscription has expired. Use /subscribe to renew."
 
+
+async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    if query.data == 'generate_wallet':
+        # Generate new wallet flow
+        mnemo = Mnemonic("english")
+        mnemonic = mnemo.generate(strength=256)
+        user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
+        users_collection.insert_one(user_data)
+        
+        decrypted_user = await decrypt_user_wallet(user_id, user_data)
+        eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
+        
+        message = (
+            f"✨ *New Wallet Generated!*\n\n"
+            f"🔐 *Mnemonic*: `{decrypted_user['mnemonic']}`\n"
+            f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
+            f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
+            f"⚠️ *SECURITY WARNING*\n"
+            f"1️⃣ Never share your mnemonic or private keys\n"
+            f"2️⃣ Store them securely offline\n"
+            f"3️⃣ This message will auto-delete in 30 seconds\n\n"
+            f"🎉 You have a 1-day free trial to test all features!"
+        )
+        
+        msg = await query.message.reply_text(message, parse_mode='Markdown')
+        context.job_queue.run_once(
+            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=msg.message_id),
+            30,
+            user_id=user_id
+        )
+        
+        # Start token updates after wallet is set up
+        await start_token_updates(context, user_id)
+        return ConversationHandler.END
+        
+    elif query.data == 'import_wallet':
+        # Redirect to set_wallet flow
+        await query.message.reply_text(
+            "Choose how to import your wallet:\n"
+            "- Mnemonic: Enter your 24-word BIP-39 mnemonic phrase\n"
+            "- Private Key: Enter your Solana or ETH/BSC private key\n\n"
+            "⚠️ Your input will auto-delete in 30 seconds for security."
+        )
+        return await set_wallet_method(update, context)
+    
 
 async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -632,37 +653,37 @@ async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Schedule periodic token updates for the subscribed user."""
-    if not context.job_queue:
-        logger.error("JobQueue is not initialized for token updates.")
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
         return
-    
-    # Check subscription status
-    if not await check_subscription(user_id):
-        logger.debug(f"User {user_id} is not subscribed, skipping token updates")
-        return
-    
-    # Check if user is in a conversation state
-    if context.user_data.get(f'conversation_state_{user_id}'):
-        logger.debug(f"User {user_id} is in a conversation state, not scheduling token updates")
-        return
-    
+        
     # Remove any existing jobs for this user
     for job in context.job_queue.jobs():
-        if job.name == f"token_updates_{user_id}":
+        if job.name.startswith(f"user_{user_id}_"):
             job.schedule_removal()
-            logger.debug(f"Removed existing job token_updates_{user_id}")
     
-    # Schedule token updates every 30 seconds
-    context.job_queue.run_repeating(
-        update_token_info,
-        interval=30,
-        first=5,
-        user_id=user_id,
-        name=f"token_updates_{user_id}",
-        data={'last_activity': datetime.now()}
-    )
-    logger.info(f"✅ Scheduled token updates for user {user_id}. Current jobs: {[job.name for job in context.job_queue.jobs()]}")
-
+    if await check_subscription(user_id):
+        # Schedule token updates
+        context.job_queue.run_repeating(
+            update_token_info,
+            interval=30,
+            first=5,
+            user_id=user_id,
+            name=f"user_{user_id}_token_updates",
+            data={'last_activity': datetime.now()}
+        )
+        
+        # Schedule trial ending notification if applicable
+        if user.get('subscription_status') == 'trial':
+            expiry = datetime.fromisoformat(user['subscription_expiry'])
+            notify_time = expiry - timedelta(hours=1)
+            
+            context.job_queue.run_once(
+                notify_trial_ending,
+                when=notify_time,
+                user_id=user_id,
+                name=f"user_{user_id}_trial_ending"
+            )
 
 async def check_conversation_timeout(context: ContextTypes.DEFAULT_TYPE):
     """Check for inactive conversation states and resume jobs."""
@@ -684,12 +705,14 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"Subscribe command from user {user_id}")
     context.user_data[f'conversation_state_{user_id}'] = None  # Clear conversation state
+    
     user = users_collection.find_one({'user_id': user_id})
     if not user:
         await update.message.reply_text("No wallet found. Please use /start to create a wallet.")
         return
 
-    if await check_subscription(user_id):
+    status = user.get('subscription_status')
+    if status == 'active':
         expiry = user.get('subscription_expiry')
         if isinstance(expiry, str):
             expiry = datetime.fromisoformat(expiry)
@@ -698,9 +721,17 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await start_token_updates(context, user_id)
         return
+    elif status == 'trial':
+        expiry = datetime.fromisoformat(user['subscription_expiry'])
+        time_left = expiry - datetime.now()
+        await update.message.reply_text(
+            f"You're currently on a free trial (expires in {time_left}).\n\n"
+            f"To continue after your trial ends, the subscription is $5/week."
+        )
+        return
 
     try:
-        usdt_amount = 1.0
+        usdt_amount = 5.0  # $5/week
         usdt_amount_wei = int(usdt_amount * 10**6)
 
         user_key = derive_user_key(user_id)
@@ -719,14 +750,11 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         )
 
-        logger.debug(f"Attempting to start token updates for user {user_id}")
-        await start_token_updates(context, user_id)
-        
         await update.message.reply_text(
             f"To subscribe ($5/week), send {usdt_amount:.6f} USDT to:\n"
             f"Address: {payment_address}\n"
             f"Network: Ethereum\n"
-            f"Deadline: {payment_deadline.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Deadline: {payment_deadline.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             f"Your subscription will activate automatically after payment is confirmed."
         )
     except Exception as e:
@@ -2046,6 +2074,23 @@ async def execute_transfer(user_id, recipient, token_contract, amount, chain):
     logger.info(f"Transferring {amount} SOL worth of {token_contract} to {recipient} ({chain})")
     return True
 
+
+async def notify_trial_ending(context: ContextTypes.DEFAULT_TYPE):
+    """Notify users 1 hour before their trial ends"""
+    user_id = context.job.user_id
+    user = users_collection.find_one({'user_id': user_id})
+    
+    if user and user.get('subscription_status') == 'trial':
+        expiry = datetime.fromisoformat(user['subscription_expiry'])
+        time_left = expiry - datetime.now()
+        
+        if timedelta(hours=1) >= time_left > timedelta(0):
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⏳ Your free trial ends in about 1 hour!\n\n"
+                     f"To continue using the bot after your trial, use /subscribe"
+            )
+
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int, token: dict):
     logger.info(f"🤖 Auto-trading for user {user_id} - {token['name']}")
     user = users_collection.find_one({'user_id': user_id})
@@ -2157,8 +2202,7 @@ def setup_handlers(application: Application):
             return result
         return wrapped
 
-   # Add all handlers
-    application.add_handler(CommandHandler("start", start))
+    # Add all command handlers
     application.add_handler(CommandHandler("subscribe", subscribe))
     application.add_handler(CommandHandler("job_status", job_status))
     application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
@@ -2169,39 +2213,52 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("reset_tokens", reset_tokens))
     application.add_handler(CommandHandler("debug", debug))
     
-    # Add error handler correctly
+    # Add error handler
     application.add_error_handler(error_handler)
 
-    # Conversation handlers with proper per_message setting
-    # For command-based conversations, per_message=False is appropriate
+    # Start Command Handler (with wallet setup choice)
+    start_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", wrap_conversation_entry(start))],
+        states={
+            WALLET_SETUP_CHOICE: [CallbackQueryHandler(wrap_conversation_state(handle_wallet_choice), 
+                                 pattern='^(generate_wallet|import_wallet)$')],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False
+    )
+    application.add_handler(start_handler)
+
+    # Generate Wallet Handler
     generate_wallet_handler = ConversationHandler(
         entry_points=[CommandHandler("generate_wallet", wrap_conversation_entry(generate_wallet))],
         states={
             CONFIRM_NEW_WALLET: [CallbackQueryHandler(wrap_conversation_state(confirm_generate_wallet), 
-                                  pattern='^(confirm_new_wallet|cancel_new_wallet)$')]
+                                pattern='^(confirm_new_wallet|cancel_new_wallet)$')]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False  # Commands are not message-based
+        per_message=False
     )
     application.add_handler(generate_wallet_handler)
 
+    # Set Wallet Handler
     set_wallet_handler = ConversationHandler(
         entry_points=[CommandHandler("set_wallet", wrap_conversation_entry(set_wallet))],
         states={
             SET_WALLET_METHOD: [CallbackQueryHandler(wrap_conversation_state(set_wallet_method), 
-                                pattern='^(mnemonic|private_key)$')],
+                               pattern='^(mnemonic|private_key)$')],
             INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                          wrap_conversation_state(input_mnemonic))],
+                                         wrap_conversation_state(input_mnemonic))],
             INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
                                             wrap_conversation_state(input_private_key))],
             CONFIRM_SET_WALLET: [CallbackQueryHandler(wrap_conversation_state(confirm_set_wallet), 
                                  pattern='^(confirm_set_wallet|cancel_set_wallet)$')]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False  # Command-based entry point
+        per_message=False
     )
     application.add_handler(set_wallet_handler)
 
+    # Set Mode Handler
     set_mode_handler = ConversationHandler(
         entry_points=[CommandHandler("setmode", wrap_conversation_entry(set_mode))],
         states={
@@ -2215,10 +2272,11 @@ def setup_handlers(application: Application):
                                                wrap_conversation_state(set_loss_percentage))]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False  # Command-based entry point
+        per_message=False
     )
     application.add_handler(set_mode_handler)
 
+    # Trade Handler
     trade_handler = ConversationHandler(
         entry_points=[CommandHandler("trade", wrap_conversation_entry(trade))],
         states={
@@ -2234,10 +2292,11 @@ def setup_handlers(application: Application):
                             pattern='^(confirm_trade|cancel_trade)$')]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False  # Command-based entry point
+        per_message=False
     )
     application.add_handler(trade_handler)
 
+    # Transfer Handler
     transfer_handler = ConversationHandler(
         entry_points=[CommandHandler("transfer", wrap_conversation_entry(transfer))],
         states={
@@ -2248,9 +2307,11 @@ def setup_handlers(application: Application):
                                            wrap_conversation_state(transfer_address))]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False  # Command-based entry point
+        per_message=False
     )
     application.add_handler(transfer_handler)
+
+  
    
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
