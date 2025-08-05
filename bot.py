@@ -513,19 +513,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await start_token_updates(context, user_id)
 
 async def get_subscription_status_message(user: dict) -> str:
-    if user.get('subscription_status') != 'active':
-        return "You do not have an active subscription. Use /subscribe to start a weekly subscription."
+    status = user.get('subscription_status')
     expiry = user.get('subscription_expiry')
-    if isinstance(expiry, str):
-        expiry = datetime.fromisoformat(expiry)
-    if expiry and expiry > datetime.now():
-        return f"Your subscription is active until {expiry.strftime('%Y-%m-%d %H:%M:%S')}."
+    
+    if status == 'trial':
+        if isinstance(expiry, str):
+            expiry = datetime.fromisoformat(expiry)
+        time_left = expiry - datetime.now()
+        hours = int(time_left.total_seconds() // 3600)
+        return f"⏳ You're on a free trial ({hours} hours remaining)"
+    elif status == 'active':
+        if isinstance(expiry, str):
+            expiry = datetime.fromisoformat(expiry)
+        return f"✅ Active subscription until {expiry.strftime('%Y-%m-%d %H:%M')}"
     else:
-        users_collection.update_one(
-            {'user_id': user['user_id']},
-            {'$set': {'subscription_status': 'inactive', 'subscription_expiry': None}}
-        )
-        return "Your subscription has expired. Use /subscribe to renew."
+        return "❌ No active subscription. Use /subscribe to start."
 
 
 async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -764,12 +766,28 @@ async def check_conversation_timeout(context: ContextTypes.DEFAULT_TYPE):
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"Subscribe command from user {user_id}")
-    context.user_data[f'conversation_state_{user_id}'] = None  # Clear conversation state
-    
     user = users_collection.find_one({'user_id': user_id})
+    
     if not user:
-        await update.message.reply_text("No wallet found. Please use /start to create a wallet.")
+        await update.message.reply_text("Please use /start first to initialize your account.")
+        return
+    
+    status = user.get('subscription_status')
+    
+    if status == 'trial':
+        expiry = datetime.fromisoformat(user['subscription_expiry'])
+        time_left = expiry - datetime.now()
+        hours = int(time_left.total_seconds() // 3600)
+        
+        await update.message.reply_text(
+            f"⏳ You're currently on a free trial ({hours} hours remaining).\n\n"
+            f"After your trial ends, you can subscribe for $5/week to continue using the bot.\n\n"
+            f"Would you like to subscribe now? (Your trial will still continue until it expires)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Subscribe Now", callback_data='subscribe_now')],
+                [InlineKeyboardButton("Later", callback_data='subscribe_later')]
+            ])
+        )
         return
 
     status = user.get('subscription_status')
