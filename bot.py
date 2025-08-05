@@ -256,33 +256,37 @@ def decrypt_data(encrypted_data: dict, key: bytes) -> str:
 async def check_subscription(user_id: int) -> bool:
     user = users_collection.find_one({'user_id': user_id})
     if not user:
-        logger.debug(f"No user found for user_id {user_id}")
-        return False
-        
-    status = user.get('subscription_status')
-    if status not in ['active', 'trial']:
-        logger.debug(f"User {user_id} subscription is inactive")
-        return False
-        
-    expiry = user.get('subscription_expiry')
-    if not expiry:
-        logger.debug(f"User {user_id} has no subscription expiry")
-        return False
-        
-    if isinstance(expiry, str):
-        expiry = datetime.fromisoformat(expiry)
-        
-    if datetime.now() >= expiry:
-        new_status = 'inactive' if status == 'active' else 'expired_trial'
+        # New user - grant them a trial automatically
+        expiry = datetime.now() + timedelta(days=1)
         users_collection.update_one(
             {'user_id': user_id},
-            {'$set': {'subscription_status': new_status, 'subscription_expiry': None}}
+            {'$set': {
+                'subscription_status': 'trial',
+                'subscription_expiry': expiry.isoformat()
+            }},
+            upsert=True
         )
-        logger.debug(f"User {user_id} subscription expired at {expiry}")
-        return False
+        return True
         
-    logger.debug(f"User {user_id} has active subscription until {expiry}")
-    return True
+    status = user.get('subscription_status')
+    if status in ['active', 'trial']:
+        expiry = user.get('subscription_expiry')
+        if isinstance(expiry, str):
+            expiry = datetime.fromisoformat(expiry)
+        
+        if expiry and datetime.now() < expiry:
+            return True
+            
+        # Subscription expired
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {
+                'subscription_status': 'inactive',
+                'subscription_expiry': None
+            }}
+        )
+    
+    return False
 
 async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None) -> dict:
     user_key = derive_user_key(user_id)
@@ -382,15 +386,46 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
     
     return decrypted_user
 
+
+    
+  
+    
+    
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     logger.debug(f"Start command from user {user_id}")
     
     context.user_data[f'conversation_state_{user_id}'] = None
+    # This will automatically create a trial subscription if new user
+    if not await check_subscription(user_id):
+        await update.message.reply_text(
+            "There was an issue setting up your free trial. Please contact support."
+        )
+        return
     
-    # Check if user exists and has all required fields
     user = users_collection.find_one({'user_id': user_id})
+    
+    if not user or not user.get('solana') or not user['solana'].get('public_key'):
+        # New user or no wallet exists
+        keyboard = [
+            [InlineKeyboardButton("Generate New Wallet", callback_data='generate_wallet')],
+            [InlineKeyboardButton("Import Existing Wallet", callback_data='import_wallet')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "👋 Welcome to the Multi-Chain Trading Bot!\n\n"
+            "You have a 1-day free trial to test all features.\n\n"
+            "Would you like to:\n"
+            "1. Generate a new wallet (recommended for beginners)\n"
+            "2. Import an existing wallet?",
+            reply_markup=reply_markup
+        )
+        return WALLET_SETUP_CHOICE
+    else:
+        pass
     if not user:
         # Create new user with all required fields
         user_data = {
@@ -791,8 +826,11 @@ async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
     logger.debug(f"Generate wallet command from user {user_id}")
     
+    # Check subscription (this will automatically grant trial to new users)
     if not await check_subscription(user_id):
-        await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
+        await update.message.reply_text(
+            "Your free trial has expired. Please /subscribe to continue using the bot."
+        )
         return ConversationHandler.END
     
     user = users_collection.find_one({'user_id': user_id})
@@ -2265,7 +2303,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 logger.error(f"Failed to send error message: {str(e)}")
-                
+
 def setup_handlers(application: Application):
     def wrap_conversation_entry(entry_handler):
         async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
