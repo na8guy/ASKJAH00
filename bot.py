@@ -223,10 +223,10 @@ DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_add
 
 
 # Bot states for conversation
-(SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
+(WALLET_SETUP_CHOICE, SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
  SELECT_TOKEN, BUY_AMOUNT, CONFIRM_TRADE, TRANSFER_TOKEN, TRANSFER_AMOUNT, TRANSFER_ADDRESS,
  CONFIRM_NEW_WALLET, SET_WALLET_METHOD, INPUT_MNEMONIC, INPUT_PRIVATE_KEY, CONFIRM_SET_WALLET,
- SELECT_TOKEN_ACTION, SELL_AMOUNT,INPUT_CONTRACT,WALLET_SETUP_CHOICE) = range(19)
+ SELECT_TOKEN_ACTION, SELL_AMOUNT, INPUT_CONTRACT) = range(19)
 
 def derive_user_key(user_id: int) -> bytes:
     kdf = PBKDF2HMAC(
@@ -367,14 +367,11 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
             logger.warning(f"Invalid or unencrypted data for user {user_id}: {field}")
             return field if isinstance(field, str) else "[Invalid Data]"
 
-    # Ensure all fields exist before trying to decrypt
+    # Ensure all required fields exist
     decrypted_user.setdefault('mnemonic', '')
-    if 'solana' not in decrypted_user:
-        decrypted_user['solana'] = {'private_key': ''}
-    if 'eth' not in decrypted_user:
-        decrypted_user['eth'] = {'private_key': ''}
-    if 'bsc' not in decrypted_user:
-        decrypted_user['bsc'] = {'private_key': ''}
+    decrypted_user.setdefault('solana', {'private_key': ''})
+    decrypted_user.setdefault('eth', {'private_key': ''})
+    decrypted_user.setdefault('bsc', {'private_key': ''})
 
     decrypted_user['mnemonic'] = safe_decrypt(user.get('mnemonic', {}))
     decrypted_user['solana']['private_key'] = safe_decrypt(user.get('solana', {}).get('private_key', ''))
@@ -382,6 +379,7 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
         decrypted_user['eth']['private_key'] = safe_decrypt(user.get('eth', {}).get('private_key', ''))
     if user.get('bsc'):
         decrypted_user['bsc']['private_key'] = safe_decrypt(user.get('bsc', {}).get('private_key', ''))
+    
     return decrypted_user
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -389,77 +387,95 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     logger.debug(f"Start command from user {user_id}")
     
-    context.user_data[f'conversation_state_{user_id}'] = None  # Clear conversation state
+    context.user_data[f'conversation_state_{user_id}'] = None
     
-    # Update chat_id for the user
-    users_collection.update_one(
-        {'user_id': user_id},
-        {'$set': {'chat_id': chat_id}},
-        upsert=True
-    )
-    
+    # Check if user exists and has all required fields
     user = users_collection.find_one({'user_id': user_id})
-    
-    try:
-        if not user:
-            # New user - give 1 day free trial
-            expiry = datetime.now() + timedelta(days=1)
+    if not user:
+        # Create new user with all required fields
+        user_data = {
+            'user_id': user_id,
+            'chat_id': chat_id,
+            'solana': {
+                'public_key': '',
+                'private_key': ''
+            },
+            'eth': None,
+            'bsc': None,
+            'trading_mode': 'manual',
+            'auto_buy_amount': 0.0,
+            'sell_percentage': 0.0,
+            'loss_percentage': 0.0,
+            'portfolio': {},
+            'last_api_call': 0,
+            'posted_tokens': [],
+            'subscription_status': 'trial',
+            'subscription_expiry': (datetime.now() + timedelta(days=1)).isoformat(),
+            'payment_address': None,
+            'expected_amount': None,
+            'payment_deadline': None
+        }
+        users_collection.insert_one(user_data)
+        
+        # Ask if they want to generate or import wallet
+        keyboard = [
+            [InlineKeyboardButton("Generate New Wallet", callback_data='generate_wallet')],
+            [InlineKeyboardButton("Import Existing Wallet", callback_data='import_wallet')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "👋 Welcome to the Multi-Chain Trading Bot!\n\n"
+            "You have a 1-day free trial to test all features.\n\n"
+            "Would you like to:\n"
+            "1. Generate a new wallet (recommended for beginners)\n"
+            "2. Import an existing wallet?",
+            reply_markup=reply_markup
+        )
+        return WALLET_SETUP_CHOICE
+    else:
+        # Ensure existing user has all required fields
+        update_fields = {}
+        if 'solana' not in user:
+            update_fields['solana'] = {'public_key': '', 'private_key': ''}
+        if 'eth' not in user:
+            update_fields['eth'] = None
+        if 'bsc' not in user:
+            update_fields['bsc'] = None
+        if 'portfolio' not in user:
+            update_fields['portfolio'] = {}
+        if 'posted_tokens' not in user:
+            update_fields['posted_tokens'] = []
+        if 'subscription_status' not in user:
+            update_fields['subscription_status'] = 'inactive'
+            
+        if update_fields:
             users_collection.update_one(
                 {'user_id': user_id},
-                {'$set': {
-                    'subscription_status': 'trial',
-                    'subscription_expiry': expiry.isoformat()
-                }},
-                upsert=True
+                {'$set': update_fields}
             )
-            
-            # Ask if they want to import or generate wallet
-            keyboard = [
-                [InlineKeyboardButton("Generate New Wallet", callback_data='generate_wallet')],
-                [InlineKeyboardButton("Import Existing Wallet", callback_data='import_wallet')]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(
-                "👋 Welcome to the Multi-Chain Trading Bot!\n\n"
-                "You have a 1-day free trial to test all features.\n\n"
-                "Would you like to:\n"
-                "1. Generate a new wallet (recommended for beginners)\n"
-                "2. Import an existing wallet?",
-                reply_markup=reply_markup
-            )
-            return WALLET_SETUP_CHOICE
-        else:
-            # Existing user flow
-            decrypted_user = await decrypt_user_wallet(user_id, user)
-            eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
-            subscription_message = await get_subscription_status_message(user)
-            
-            message = (
-                f"👋 *Welcome back!*\n\n"
-                f"🔑 *Solana Address*: `{user['solana']['public_key']}`\n"
-                f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
-                f"{subscription_message}\n\n"
-                f"🔧 *Commands:*\n"
-                f"- /generate_wallet - Create a new wallet\n"
-                f"- /set_wallet - Import an existing wallet"
-            )
-                
-            await update.message.reply_text(message, parse_mode='Markdown')
-            
-            if await check_subscription(user_id):
-                logger.info(f"📡 Starting token updates for existing subscriber {user_id}")
-                await start_token_updates(context, user_id)
-            
-    except Exception as e:
-        logger.error(f"Error in start for user {user_id}: {str(e)}", exc_info=True)
-        error_msg = (
-            f"❌ Error accessing wallet data: {str(e)}\n\n"
-            f"Please try:\n"
-            f"- /generate_wallet to create a new wallet\n"
-            f"- /set_wallet to import an existing wallet"
+            user = users_collection.find_one({'user_id': user_id})
+        
+        # Show existing user their wallet info
+        decrypted_user = await decrypt_user_wallet(user_id, user)
+        eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
+        subscription_message = await get_subscription_status_message(user)
+        
+        message = (
+            f"👋 *Welcome back!*\n\n"
+            f"🔑 *Solana Address*: `{user['solana']['public_key']}`\n"
+            f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
+            f"{subscription_message}\n\n"
+            f"🔧 *Commands:*\n"
+            f"- /generate_wallet - Create a new wallet\n"
+            f"- /set_wallet - Import an existing wallet"
         )
-        await update.message.reply_text(error_msg)
+            
+        await update.message.reply_text(message, parse_mode='Markdown')
+        
+        if await check_subscription(user_id):
+            logger.info(f"📡 Starting token updates for existing subscriber {user_id}")
+            await start_token_updates(context, user_id)
 
 async def get_subscription_status_message(user: dict) -> str:
     if user.get('subscription_status') != 'active':
@@ -487,7 +503,17 @@ async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         mnemo = Mnemonic("english")
         mnemonic = mnemo.generate(strength=256)
         user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
-        users_collection.insert_one(user_data)
+        
+        # Update the existing user document
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {
+                'solana': user_data['solana'],
+                'eth': user_data['eth'],
+                'bsc': user_data['bsc'],
+                'mnemonic': user_data['mnemonic']
+            }}
+        )
         
         decrypted_user = await decrypt_user_wallet(user_id, user_data)
         eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
