@@ -54,6 +54,9 @@ import os
 from dotenv import load_dotenv
 from web3 import Web3
 from eth_account import Account
+from eth_account.hdaccount import ETHEREUM_DEFAULT_PATH
+from eth_account.hdaccount import generate_mnemonic
+from eth_account.hdaccount import key_from_seed
 
 # FastAPI setup
 from fastapi import FastAPI, Request, HTTPException
@@ -331,6 +334,7 @@ async def check_subscription(user_id: int) -> bool:
     return False
 
 async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None) -> dict:
+    Account.enable_unaudited_hdwallet_features()
     user_key = derive_user_key(user_id)
     
     if mnemonic:
