@@ -63,16 +63,6 @@ from eth_account.hdaccount import key_from_seed
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-# Enhanced logging configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - User:%(user_id)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("bot_activity.log")
-    ]
-)
-logger = logging.getLogger(__name__)
 
 # Custom filter to add user_id to logs
 class UserFilter(logging.Filter):
@@ -80,17 +70,28 @@ class UserFilter(logging.Filter):
         record.user_id = getattr(record, 'user_id', 'SYSTEM')
         return True
 
-logger.addFilter(UserFilter())
+# Set up handlers with the filter
+stream_handler = logging.StreamHandler()
+stream_handler.addFilter(UserFilter())
 
+file_handler = logging.FileHandler("bot_activity.log")
+file_handler.addFilter(UserFilter())
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - User:%(user_id)s - %(message)s',
+    handlers=[stream_handler, file_handler]
+)
+
+# Your module's logger
+logger = logging.getLogger(__name__)
+
+# Example usage remains unchanged
 def log_user_action(user_id: int, action: str, details: str = "", level: str = "info"):
-    """Enhanced logging function for user actions"""
     extra = {'user_id': user_id}
     log_method = getattr(logger, level.lower(), logger.info)
     log_method(f"👤 USER ACTION: {action} - {details}", extra=extra)
-
-# Reduce noise from HTTP libraries
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 # Load environment variables
 load_dotenv()
