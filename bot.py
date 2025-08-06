@@ -18,6 +18,7 @@ from typing import Optional, List, Dict, Any
 import re
 import hashlib
 import hmac
+from typing import Optional
 from typing import Tuple
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
@@ -58,6 +59,35 @@ from eth_account import Account
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
+
+
+# Configure root logger first
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(), logging.FileHandler("bot_activity.log")]
+)
+
+# Create formatter with safe user_id handling
+class SafeFormatter(logging.Formatter):
+    def format(self, record):
+        if not hasattr(record, 'user_id'):
+            record.user_id = 'SYSTEM'
+        return super().format(record)
+
+formatter = SafeFormatter(
+    '%(asctime)s - %(name)s - %(levelname)s - User:%(user_id)s - %(message)s'
+)
+
+# Apply formatter to all handlers
+for handler in logging.root.handlers:
+    handler.setFormatter(formatter)
+
+# Custom logging functions
+def log_user_action(user_id: int, action: str, details: str = ""):
+    logger.info(f"ACTION: {action} - {details}", extra={'user_id': user_id})
+
+def log_http_request(method: str, url: str, status: int):
+    logger.debug(f"HTTP {method} {url} - {status}", extra={'user_id': 'HTTP'})
 # Enhanced logging configuration
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - User:%(user_id)s - %(message)s',
@@ -81,6 +111,9 @@ def log_user_action(user_id: int, action: str, details: str = ""):
     extra = {'user_id': user_id}
     logger.info(f"ACTION: {action} - {details}", extra=extra)
 
+
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 # Load environment variables
 load_dotenv()
 
@@ -781,6 +814,82 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error creating subscription for user {user_id}: {str(e)}")
         await update.message.reply_text("Error initiating subscription. Please try again later.")
 
+
+
+def mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
+    """
+    Convert BIP-39 mnemonic to seed (works for 12 or 24 words).
+    """
+    mnemonic_bytes = mnemonic.encode('utf-8')
+    salt = ("mnemonic" + passphrase).encode('utf-8')
+    return hashlib.pbkdf2_hmac('sha512', mnemonic_bytes, salt, PBKDF2_ROUNDS)
+
+def validate_mnemonic(mnemonic: str) -> bool:
+    """
+    Check if a mnemonic is valid (supports 12 & 24 words).
+    """
+    words = mnemonic.strip().split()
+    if len(words) not in [12, 24]:
+        return False
+
+    try:
+        # Load BIP-39 wordlist (ensure you have 'bip39_english.txt')
+        with open('bip39_english.txt', 'r') as f:
+            wordlist = [word.strip() for word in f.readlines()]
+
+        # Convert mnemonic back to entropy + checksum
+        bits = []
+        for word in words:
+            index = wordlist.index(word)
+            bits.append(bin(index)[2:].zfill(11))
+        bits = ''.join(bits)
+
+        # Split into entropy and checksum
+        total_length = len(bits)
+        entropy_length = 32 * total_length // 33  # 128 or 256 bits
+        entropy_bits = bits[:entropy_length]
+        checksum_bits = bits[entropy_length:]
+
+        # Verify checksum
+        entropy = int(entropy_bits, 2).to_bytes(entropy_length // 8, 'big')
+        hash_bytes = hashlib.sha256(entropy).digest()
+        hash_bits = bin(int.from_bytes(hash_bytes, 'big'))[2:].zfill(256)
+        expected_checksum = hash_bits[:total_length - entropy_length]
+
+        return checksum_bits == expected_checksum
+    except (ValueError, IndexError):
+        return False
+
+def mnemonic_to_eth_account(mnemonic: str) -> Tuple[str, str]:
+    """
+    Convert a BIP-39 mnemonic (12 or 24 words) to an Ethereum private key & address.
+    Returns: (private_key_hex, eth_address)
+    """
+    if not validate_mnemonic(mnemonic):
+        raise ValueError("Invalid BIP-39 mnemonic")
+
+    # Derive seed (BIP-39)
+    seed = mnemonic_to_seed(mnemonic)
+
+    # Derive private key (BIP-32, but simplified here)
+    # Note: For full BIP-32/44 support, use `bip44` or `hdwallets` library
+    private_key = seed[:32]  # First 32 bytes of seed (simplified approach)
+    private_key_hex = private_key.hex()
+
+    # Get Ethereum address
+    account = Account.from_key(private_key_hex)
+    eth_address = account.address
+
+    return private_key_hex, eth_address
+
+# Example: Import MetaMask 12-word wallet
+mnemonic = "your twelve word MetaMask mnemonic goes here"
+private_key, eth_address = mnemonic_to_eth_account(mnemonic)
+
+print("Private Key (Hex):", private_key)
+print("Ethereum Address:", eth_address)
+
+
 async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     log_user_action(user_id, "WALLET_GENERATE_INITIATED")
@@ -814,6 +923,8 @@ async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         log_user_action(user_id, "WALLET_GENERATE_START")
         return await confirm_generate_wallet(update, context, new_user=True)
+    
+
 
 async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE, new_user=False) -> int:
     user_id = update.effective_user.id if new_user else update.callback_query.from_user.id
