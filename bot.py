@@ -2080,7 +2080,7 @@ async def handle_token_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         return SELL_AMOUNT
 
 async def buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle buy amount input"""
+    """Handle buy amount input with balance check and trade execution"""
     user_id = update.effective_user.id
     try:
         amount = float(update.message.text)
@@ -2088,40 +2088,77 @@ async def buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await update.message.reply_text("❌ Please enter a positive amount.")
             return BUY_AMOUNT
         
+        # Get token from context
+        token = context.user_data.get('current_token')
+        if not token:
+            await update.message.reply_text("❌ Token information missing. Please start the trade again.")
+            return ConversationHandler.END
+        
+        # Check SOL balance
         balance = await check_balance(user_id, 'solana')
         if balance < amount:
             await update.message.reply_text(
-                f"❌ Insufficient balance. Your SOL balance: {balance:.4f} SOL"
+                f"❌ Insufficient SOL balance. Your balance: {balance:.4f} SOL\n"
+                f"You need at least {amount:.4f} SOL to execute this trade."
             )
             log_user_action(user_id, "INSUFFICIENT_BALANCE", f"Needed: {amount}, Had: {balance}", level="warning")
             return ConversationHandler.END
         
-        token = context.user_data['current_token']
-        context.user_data['buy_amount'] = amount
-        keyboard = [
-            [InlineKeyboardButton("✅ Confirm", callback_data='confirm_trade')],
-            [InlineKeyboardButton("❌ Cancel", callback_data='cancel_trade')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        # Execute trade immediately
+        await update.message.reply_text(f"⏳ Executing buy order for {amount:.4f} SOL worth of {token['name']}...")
+        success = await execute_trade(user_id, token['contract_address'], amount, 'buy', 'solana', token)
         
-        await update.message.reply_text(
-            f"💰 *Confirm Buy Order*\n\n"
-            f"🔹 Token: {token['name']} ({token['symbol']})\n"
-            f"🔹 Amount: {amount:.4f} SOL\n"
-            f"🔹 Contract: `{token['contract_address']}`\n"
-            f"🔹 Price: ${token['price_usd']:.6f}\n"
-            f"🔹 Market Cap: ${token['market_cap']:,.2f}\n\n"
-            f"[📊 View Chart]({token['dexscreener_url']})",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return CONFIRM_TRADE
+        if success:
+            # Update portfolio
+            user = users_collection.find_one({'user_id': user_id})
+            portfolio = user.get('portfolio', {})
+            current_holdings = portfolio.get(token['contract_address'], {
+                'name': token['name'],
+                'symbol': token['symbol'],
+                'amount': 0.0,
+                'buy_price': token['price_usd']
+            })
+            
+            # Add new purchase to portfolio
+            new_amount = current_holdings['amount'] + amount
+            new_avg_price = (
+                (current_holdings['amount'] * current_holdings['buy_price'] + 
+                 amount * token['price_usd'])
+                / new_amount if new_amount > 0 else token['price_usd']
+            )
+            
+            update_result = users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    f'portfolio.{token["contract_address"]}': {
+                        'name': token['name'],
+                        'symbol': token['symbol'],
+                        'amount': new_amount,
+                        'buy_price': new_avg_price
+                    }
+                }},
+                upsert=True
+            )
+            
+            log_user_action(user_id, "TRADE_EXECUTED", f"Bought {amount} SOL worth of {token['name']}")
+            await update.message.reply_text(
+                f"✅ Successfully bought {amount:.4f} SOL worth of {token['name']} at ${token['price_usd']:.6f}.\n"
+                f"📊 You now hold {new_amount:.4f} SOL worth of {token['symbol']}."
+            )
+        else:
+            log_user_action(user_id, "TRADE_FAILED", f"Buy {amount} SOL of {token['name']}", level="error")
+            await update.message.reply_text("❌ Trade failed. Please try again later.")
+        
+        return ConversationHandler.END
+        
     except ValueError:
         await update.message.reply_text("❌ Invalid amount. Please enter a number.")
         return BUY_AMOUNT
 
+
+
 async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle sell amount input"""
+    """Handle sell amount input with balance check and trade execution"""
     user_id = update.effective_user.id
     try:
         amount = float(update.message.text)
@@ -2129,38 +2166,64 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             await update.message.reply_text("❌ Please enter a positive amount.")
             return SELL_AMOUNT
         
-        token = context.user_data['current_token']
+        # Get token from context
+        token = context.user_data.get('current_token')
+        if not token:
+            await update.message.reply_text("❌ Token information missing. Please start the trade again.")
+            return ConversationHandler.END
+        
+        # Check token holdings
         user = users_collection.find_one({'user_id': user_id})
         portfolio = user.get('portfolio', {})
         if token['contract_address'] not in portfolio:
             await update.message.reply_text(f"❌ You don't hold any {token['name']} tokens to sell.")
             return ConversationHandler.END
             
-        if amount > portfolio[token['contract_address']]['amount']:
+        token_data = portfolio[token['contract_address']]
+        if amount > token_data['amount']:
             await update.message.reply_text(
-                f"❌ Insufficient token balance. Available: {portfolio[token['contract_address']]['amount']:.4f} SOL worth"
+                f"❌ Insufficient token balance. Available: {token_data['amount']:.4f} SOL worth\n"
+                f"You requested to sell {amount:.4f} SOL worth."
             )
             return SELL_AMOUNT
         
-        context.user_data['sell_amount'] = amount
-        keyboard = [
-            [InlineKeyboardButton("✅ Confirm", callback_data='confirm_trade')],
-            [InlineKeyboardButton("❌ Cancel", callback_data='cancel_trade')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        # Execute trade immediately
+        await update.message.reply_text(f"⏳ Executing sell order for {amount:.4f} SOL worth of {token['name']}...")
+        success = await execute_trade(user_id, token['contract_address'], amount, 'sell', 'solana', token)
         
-        await update.message.reply_text(
-            f"💸 *Confirm Sell Order*\n\n"
-            f"🔹 Token: {token['name']} ({token['symbol']})\n"
-            f"🔹 Amount: {amount:.4f} SOL worth\n"
-            f"🔹 Contract: `{token['contract_address']}`\n"
-            f"🔹 Current Price: ${token['price_usd']:.6f}\n"
-            f"🔹 Bought At: ${portfolio[token['contract_address']]['buy_price']:.6f}\n\n"
-            f"[📊 View Chart]({token['dexscreener_url']})",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return CONFIRM_TRADE
+        if success:
+            # Update portfolio
+            new_amount = token_data['amount'] - amount
+            
+            if new_amount <= 0.001:  # Consider dust amounts as zero
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
+                )
+                log_user_action(user_id, "POSITION_CLOSED", f"Sold all {token['name']}")
+            else:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {f'portfolio.{token["contract_address"]}.amount': new_amount}}
+                )
+            
+            # Calculate profit/loss
+            buy_price = token_data['buy_price']
+            current_price = token['price_usd']
+            price_change = ((current_price - buy_price) / buy_price) * 100
+            profit_loss = "profit" if price_change >= 0 else "loss"
+            
+            log_user_action(user_id, "TRADE_EXECUTED", f"Sold {amount} SOL worth of {token['name']}")
+            await update.message.reply_text(
+                f"✅ Successfully sold {amount:.4f} SOL worth of {token['name']} at ${token['price_usd']:.6f}.\n"
+                f"📈 This trade resulted in a {abs(price_change):.2f}% {profit_loss}.\n"
+                f"📊 You now hold {new_amount:.4f} SOL worth of {token['symbol']}."
+            )
+        else:
+            log_user_action(user_id, "TRADE_FAILED", f"Sell {amount} SOL of {token['name']}", level="error")
+            await update.message.reply_text("❌ Trade failed. Please try again later.")
+        
+        return ConversationHandler.END
     except ValueError:
         await update.message.reply_text("❌ Invalid amount. Please enter a number.")
         return SELL_AMOUNT
@@ -2620,7 +2683,7 @@ async def check_balance(user_id, chain):
         logger.error(f"Error checking {chain} balance: {str(e)}")
         return 0.0
 
-async def execute_trade(user_id, contract_address, amount, action, chain, token_info=None):
+async def execute_trade(user_id, contract_address, amount, action, chain, token_info):
     """Execute a trade on the specified chain using GMGN API"""
     logger.info(f"🏁 Starting {action} trade for {amount} SOL of {contract_address}")
     
@@ -2644,12 +2707,6 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         from_address = str(keypair.pubkey())
         
-        # Check balance
-        balance = await check_balance(user_id, 'solana')
-        if action == 'buy' and balance < amount:
-            logger.error(f"Insufficient balance for user {user_id}: {balance} SOL available, {amount} SOL required")
-            return False
-        
         # Set token_in and token_out based on trade action
         if action == 'buy':
             token_in = 'So11111111111111111111111111111111111111112'  # SOL
@@ -2659,25 +2716,28 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         else:  # Sell
             token_in = contract_address
             token_out = 'So11111111111111111111111111111111111111112'  # SOL
-            # For sells, we need to use token amount instead of SOL value
-            # This requires knowing token decimals - we'll assume 9 decimals for simplicity
-            # In a real implementation, you'd fetch token metadata
-            in_amount = int(amount * 1_000_000_000)  # Using same as SOL for simplicity
-            swap_mode = 'ExactIn'
+            out_amount = int(amount * 1_000_000_000)  # Convert SOL to lamports
+            swap_mode = 'ExactOut'
         
-        # Get swap quote from GMGN
+        # Prepare API request
         quote_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_swap_route"
         params = {
             'token_in_address': token_in,
             'token_out_address': token_out,
-            'in_amount': str(in_amount),
             'from_address': from_address,
-            'slippage': '0.5',  # 0.5% slippage
+            'slippage': '1.0',  # 1% slippage
             'swap_mode': swap_mode
         }
         
+        # Add amount based on trade type
+        if action == 'buy':
+            params['in_amount'] = str(in_amount)
+        else:
+            params['out_amount'] = str(out_amount)
+        
         logger.debug(f"🔄 GMGN API params: {params}")
         async with httpx.AsyncClient(timeout=30.0) as client:
+            # Get swap quote
             response = await client.get(quote_url, params=params)
             logger.debug(f"🔁 GMGN API response: {response.status_code} - {response.text[:200]}...")
             
