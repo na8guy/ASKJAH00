@@ -286,20 +286,13 @@ def derive_user_key(user_id: int) -> bytes:
     return kdf.derive(master_key)
 
 def encrypt_data(data: str, key: bytes) -> dict:
-    iv = os.urandom(16)
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-    encryptor = cipher.encryptor()
-    padded_data = data.encode() + b'\0' * (16 - len(data.encode()) % 16)
-    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
-    return {'iv': base64_cryptography.b64encode(iv).decode(), 'ciphertext': base64_cryptography.b64encode(ciphertext).decode()}
+    fernet = Fernet(base64.urlsafe_b64encode(key))
+    ciphertext = fernet.encrypt(data.encode())
+    return {'ciphertext': ciphertext.decode()}
 
 def decrypt_data(encrypted_data: dict, key: bytes) -> str:
-    iv = base64_cryptography.b64decode(encrypted_data['iv'])
-    ciphertext = base64_cryptography.b64decode(encrypted_data['ciphertext'])
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-    decryptor = cipher.decryptor()
-    padded_data = decryptor.update(ciphertext) + decryptor.finalize()
-    return padded_data.rstrip(b'\0').decode()
+    fernet = Fernet(base64.urlsafe_b64encode(key))
+    return fernet.decrypt(encrypted_data['ciphertext'].encode()).decode()
 
 async def check_subscription(user_id: int) -> bool:
     user = users_collection.find_one({'user_id': user_id})
@@ -335,41 +328,39 @@ async def check_subscription(user_id: int) -> bool:
     return False
 
 async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None) -> dict:
-    Account.enable_unaudited_hdwallet_features()  # Enable mnemonic features
+    logger.info(f"Setting wallet for user {user_id}", extra={'user_id': user_id})
     user_key = derive_user_key(user_id)
     
-    if mnemonic:
-        mnemo = Mnemonic("english")
-        if not mnemo.check(mnemonic):
-            raise ValueError("Invalid mnemonic phrase.")
-        
-        # Handle both 12-word and 24-word mnemonics
-        word_count = len(mnemonic.split())
-        if word_count not in [12, 24]:
-            raise ValueError("Mnemonic must be 12 or 24 words")
+    try:
+        if mnemonic:
+            if not validate_mnemonic(mnemonic):
+                raise ValueError("Invalid mnemonic phrase.")
             
-        # Determine entropy strength based on word count
-        strength = 128 if word_count == 12 else 256
-        
-        # Create Ethereum account
-        eth_account = Account.from_mnemonic(mnemonic)
-        eth_address = eth_account.address
-        eth_private_key = eth_account.key.hex()
-        
-        # Create Solana keypair
-        seed = mnemo.to_seed(mnemonic)
-        solana_keypair = Keypair.from_seed(seed[:32])
-        solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
-        
-    elif private_key:
-        try:
-            # Try Solana private key first (base58)
+            word_count = len(mnemonic.split())
+            if word_count not in [12, 24]:
+                raise ValueError(f"Mnemonic must be 12 or 24 words, got {word_count}")
+            
+            # Derive Ethereum account
+            eth_private_key, eth_address = mnemonic_to_eth_account(mnemonic)
+            logger.info(f"Derived Ethereum address: {eth_address}", extra={'user_id': user_id})
+            
+            # Derive Solana keypair
+            mnemo = Mnemonic("english")
+            seed = mnemo.to_seed(mnemonic)[:32]
+            solana_keypair = Keypair.from_seed(seed)
+            solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
+            solana_public_key = str(solana_keypair.pubkey())
+            logger.info(f"Derived Solana public key: {solana_public_key}", extra={'user_id': user_id})
+            
+        elif private_key:
             try:
+                # Try Solana private key (base58)
                 solana_keypair = Keypair.from_bytes(base58.b58decode(private_key))
                 solana_private_key = private_key
-                eth_account = None
+                solana_public_key = str(solana_keypair.pubkey())
                 eth_address = None
                 eth_private_key = None
+                logger.info(f"Derived Solana public key from private key: {solana_public_key}", extra={'user_id': user_id})
             except:
                 # Try Ethereum private key (hex)
                 if not private_key.startswith('0x'):
@@ -379,60 +370,65 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
                 eth_private_key = eth_account.key.hex()
                 solana_keypair = Keypair.from_seed(bytes.fromhex(private_key[2:])[:32])
                 solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
-        except Exception as e:
-            raise ValueError(f"Invalid private key: {str(e)}")
-    else:
-        raise ValueError("Either mnemonic or private key must be provided.")
-
-    # Encrypt all sensitive data
-    encrypted_mnemonic = encrypt_data(mnemonic if mnemonic else 'Imported via private key', user_key)
-    encrypted_solana_private_key = encrypt_data(solana_private_key, user_key)
-    encrypted_eth_private_key = encrypt_data(eth_private_key, user_key) if eth_private_key else None
-    encrypted_bsc_private_key = encrypt_data(eth_private_key, user_key) if eth_private_key else None
-
-    return {
-        'user_id': user_id,
-        'mnemonic': encrypted_mnemonic,
-        'solana': {
-            'public_key': str(solana_keypair.pubkey()),
-            'private_key': encrypted_solana_private_key
-        },
-        'eth': {
-            'address': eth_address,
-            'private_key': encrypted_eth_private_key
-        } if eth_address else None,
-        'bsc': {
-            'address': eth_address,
-            'private_key': encrypted_bsc_private_key
-        } if eth_address else None,
-        'trading_mode': 'manual',
-        'auto_buy_amount': 0.0,
-        'sell_percentage': 0.0,
-        'loss_percentage': 0.0,
-        'portfolio': {},
-        'last_api_call': 0,
-        'posted_tokens': [],
-        'subscription_status': 'inactive',
-        'subscription_expiry': None,
-        'payment_address': None,
-        'expected_amount': None,
-        'payment_deadline': None
-    }
+                solana_public_key = str(solana_keypair.pubkey())
+                logger.info(f"Derived Ethereum address: {eth_address} and Solana public key: {solana_public_key}", extra={'user_id': user_id})
+        else:
+            raise ValueError("Either mnemonic or private key must be provided.")
+        
+        # Encrypt sensitive data
+        encrypted_mnemonic = encrypt_data(mnemonic if mnemonic else 'Imported via private key', user_key)
+        encrypted_solana_private_key = encrypt_data(solana_private_key, user_key)
+        encrypted_eth_private_key = encrypt_data(eth_private_key, user_key) if eth_private_key else None
+        encrypted_bsc_private_key = encrypt_data(eth_private_key, user_key) if eth_private_key else None
+        
+        user_data = {
+            'user_id': user_id,
+            'mnemonic': encrypted_mnemonic,
+            'solana': {
+                'public_key': solana_public_key,
+                'private_key': encrypted_solana_private_key
+            },
+            'eth': {
+                'address': eth_address,
+                'private_key': encrypted_eth_private_key
+            } if eth_address else None,
+            'bsc': {
+                'address': eth_address,
+                'private_key': encrypted_bsc_private_key
+            } if eth_address else None,
+            'trading_mode': 'manual',
+            'auto_buy_amount': 0.0,
+            'sell_percentage': 0.0,
+            'loss_percentage': 0.0,
+            'portfolio': {},
+            'last_api_call': 0,
+            'posted_tokens': [],
+            'subscription_status': 'inactive',
+            'subscription_expiry': None,
+            'payment_address': None,
+            'expected_amount': None,
+            'payment_deadline': None
+        }
+        
+        logger.info(f"Wallet data prepared for user {user_id}", extra={'user_id': user_id})
+        return user_data
+    
+    except Exception as e:
+        logger.error(f"Failed to set wallet for user {user_id}: {str(e)}", extra={'user_id': user_id})
+        raise
 
 async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
     user_key = derive_user_key(user_id)
     decrypted_user = user.copy()
 
     def safe_decrypt(field):
-        if isinstance(field, dict) and 'iv' in field and 'ciphertext' in field:
+        if isinstance(field, dict) and 'ciphertext' in field:
             try:
                 return decrypt_data(field, user_key)
             except Exception as e:
                 logger.error(f"Decryption failed for user {user_id}: {str(e)}")
                 return "[Decryption Failed]"
-        else:
-            logger.warning(f"Invalid or unencrypted data for user {user_id}: {field}")
-            return field if isinstance(field, str) else "[Invalid Data]"
+        return field if isinstance(field, str) else "[Invalid Data]"
 
     decrypted_user.setdefault('mnemonic', '')
     decrypted_user.setdefault('solana', {'private_key': ''})
@@ -863,73 +859,33 @@ def mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
         raise ValueError(f"Failed to generate seed: {str(e)}")
 
 def validate_mnemonic(mnemonic: str) -> bool:
-    """
-    Thoroughly check if a mnemonic is a valid BIP-39 mnemonic phrase (12 or 24 words).
-    
-    Args:
-        mnemonic: The mnemonic phrase to validate
-        
-    Returns:
-        bool: True if valid, False otherwise
-    """
-    # First check basic requirements
     if not mnemonic or not isinstance(mnemonic, str):
         logger.debug("Mnemonic is empty or not a string")
         return False
-        
-    # Clean and split the mnemonic
-    cleaned_mnemonic = ' '.join(mnemonic.strip().split())  # Normalize whitespace
+    cleaned_mnemonic = ' '.join(mnemonic.strip().split())
     words = cleaned_mnemonic.split()
-    
-    # Check word count
     if len(words) not in [12, 24]:
-        logger.debug(f"Invalid word count: {len(words)} (expected 12 or 24)")
+        logger.debug(f"Invalid word count: {len(words)}")
         return False
-    
-    # Check each word is in the BIP-39 wordlist
     try:
         mnemo = Mnemonic("english")
-        if not mnemo.check(cleaned_mnemonic):
-            logger.debug("Mnemonic failed BIP-39 validation")
-            return False
-        return True
+        return mnemo.check(cleaned_mnemonic)
     except Exception as e:
         logger.error(f"Error validating mnemonic: {str(e)}")
         return False
 
-def mnemonic_to_eth_account(mnemonic: str) -> Tuple[str, str]:
-    """
-    Convert a BIP-39 mnemonic phrase to an Ethereum private key and address.
-    
-    Args:
-        mnemonic: The BIP-39 mnemonic phrase (12 or 24 words)
-        
-    Returns:
-        tuple: (private_key_hex, ethereum_address)
-        
-    Raises:
-        ValueError: If the mnemonic is invalid
-    """
-    # First validate the mnemonic thoroughly
+def mnemonic_to_eth_account(mnemonic: str) -> tuple[str, str]:
     if not validate_mnemonic(mnemonic):
         logger.error(f"Invalid mnemonic provided (first 10 chars): {mnemonic[:10]}...")
         raise ValueError("Invalid BIP-39 mnemonic. Must be 12 or 24 valid words from the BIP-39 wordlist.")
     
     try:
-        # Create deterministic seed from mnemonic
-        seed = Mnemonic.to_seed(mnemonic, passphrase="")
-        
-        # Derive private key (first 32 bytes of the seed)
-        private_key = seed[:32]
-        private_key_hex = private_key.hex()
-        
-        # Create Ethereum account from private key
-        account = Account.from_key(private_key_hex)
-        eth_address = account.address
-        
-        logger.debug(f"Successfully derived Ethereum account from mnemonic")
+        Account.enable_unaudited_hdwallet_features()
+        eth_account = Account.from_mnemonic(mnemonic, account_path=ETHEREUM_DEFAULT_PATH)
+        private_key_hex = eth_account.key.hex()
+        eth_address = eth_account.address
+        logger.debug(f"Successfully derived Ethereum account: {eth_address}")
         return private_key_hex, eth_address
-        
     except Exception as e:
         logger.error(f"Error deriving Ethereum account from mnemonic: {str(e)}")
         raise ValueError(f"Failed to derive Ethereum account: {str(e)}")
@@ -1115,16 +1071,6 @@ async def set_wallet_method(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return INPUT_PRIVATE_KEY
 
 async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handles the input of a mnemonic phrase during the wallet import process.
-    
-    Args:
-        update (Update): The incoming Telegram update.
-        context (ContextTypes.DEFAULT_TYPE): The context for the conversation.
-    
-    Returns:
-        int: The next state in the conversation handler or ConversationHandler.END.
-    """
     user_id = update.effective_user.id
     mnemonic = update.message.text.strip()
     log_user_action(user_id, "MNEMONIC_RECEIVED")
@@ -1141,30 +1087,8 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         # Validate mnemonic
-        mnemo = Mnemonic("english")
-        words = mnemonic.split()
-        word_count = len(words)
-        
-        logger.info(f"User {user_id} provided mnemonic with {word_count} words")
-        
-        # Check word count
-        if word_count not in [12, 24]:
-            log_user_action(user_id, "INVALID_MNEMONIC_WORD_COUNT")
-            error_msg = await update.message.reply_text(
-                f"❌ Invalid mnemonic length: {word_count} words. Please enter a 12-word or 24-word BIP-39 mnemonic phrase."
-            )
-            context.job_queue.run_once(
-                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
-                60,
-                user_id=user_id,
-                name=f"delete_error_{user_id}"
-            )
-            return INPUT_MNEMONIC
-        
-        # Validate mnemonic
-        if not mnemo.check(mnemonic):
+        if not validate_mnemonic(mnemonic):
             log_user_action(user_id, "INVALID_MNEMONIC")
-            logger.error(f"Invalid mnemonic provided by user {user_id}: {words[:3]}...")
             error_msg = await update.message.reply_text(
                 "❌ Invalid mnemonic phrase. Please check for:\n"
                 "1. Correct spelling of all words\n"
@@ -1177,12 +1101,13 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
                 60,
                 user_id=user_id,
-                name=f"delete_error_{user_id}"
+                name=f"delete_error_{user_id}_{int(time.time())}"
             )
             return INPUT_MNEMONIC
         
-        # Store mnemonic temporarily in user_data
+        # Store mnemonic temporarily
         context.user_data['wallet_input'] = mnemonic
+        context.user_data['wallet_method'] = 'mnemonic'
         log_user_action(user_id, "VALID_MNEMONIC_RECEIVED")
         
         # Check for existing wallet
@@ -1207,63 +1132,62 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=confirm_msg.message_id),
                 120,
                 user_id=user_id,
-                name=f"delete_confirm_{user_id}"
+                name=f"delete_confirm_{user_id}_{int(time.time())}"
             )
             return CONFIRM_SET_WALLET
-        else:
-            # No existing wallet - proceed with import
-            log_user_action(user_id, "WALLET_IMPORT_START")
-            user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
-            
-            # Save to MongoDB
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': user_data},
-                upsert=True
+        
+        # No existing wallet - proceed with import
+        log_user_action(user_id, "WALLET_IMPORT_START")
+        user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
+        
+        # Save to MongoDB
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': user_data},
+            upsert=True
+        )
+        log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
+        
+        # Verify the save
+        saved_user = users_collection.find_one({'user_id': user_id})
+        if not saved_user or not saved_user.get('solana') or not saved_user['solana'].get('public_key') or not saved_user.get('eth') or not saved_user['eth'].get('address'):
+            logger.error(f"Failed to save complete wallet for user {user_id}: {saved_user}")
+            error_msg = await update.message.reply_text(
+                "❌ Failed to save wallet to database. Please try again or contact support."
             )
-            log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
-            
-            # Verify the save
-            saved_user = users_collection.find_one({'user_id': user_id})
-            if not saved_user or not saved_user.get('solana') or not saved_user['solana'].get('public_key'):
-                logger.error(f"Failed to save wallet for user {user_id}: {saved_user}")
-                error_msg = await update.message.reply_text(
-                    "❌ Failed to save wallet to database. Please try again or contact support."
-                )
-                context.job_queue.run_once(
-                    lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
-                    60,
-                    user_id=user_id,
-                    name=f"delete_error_{user_id}"
-                )
-                return INPUT_MNEMONIC
-            
-            # Prepare success message (do not display mnemonic for security)
-            eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
-            success_msg = await update.message.reply_text(
-                f"✅ *Wallet Imported Successfully!*\n\n"
-                f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
-                f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
-                f"🚀 You're all set! The bot will now start sending you token alerts.\n"
-                f"Use /trade to manually trade tokens or /setmode to configure auto-trading.\n"
-                f"⚠️ *Important*: Store your mnemonic phrase securely and do not share it.",
-                parse_mode='Markdown'
-            )
-            
-            # Delete success message after 60 seconds for security
             context.job_queue.run_once(
-                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=success_msg.message_id),
+                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
                 60,
                 user_id=user_id,
-                name=f"delete_success_{user_id}"
+                name=f"delete_error_{user_id}_{int(time.time())}"
             )
-            
-            log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
-            
-            # Start token updates
-            await start_token_updates(context, user_id)
-            return ConversationHandler.END
-            
+            return INPUT_MNEMONIC
+        
+        # Prepare success message
+        eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
+        success_msg = await update.message.reply_text(
+            f"✅ *Wallet Imported Successfully!*\n\n"
+            f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
+            f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
+            f"🚀 You're all set! The bot will now start sending you token alerts.\n"
+            f"Use /trade to manually trade tokens or /setmode to configure auto-trading.\n"
+            f"⚠️ *Important*: Store your mnemonic phrase securely and do not share it.",
+            parse_mode='Markdown'
+        )
+        
+        context.job_queue.run_once(
+            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=success_msg.message_id),
+            60,
+            user_id=user_id,
+            name=f"delete_success_{user_id}_{int(time.time())}"
+        )
+        
+        log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
+        
+        # Start token updates
+        await start_token_updates(context, user_id)
+        return ConversationHandler.END
+    
     except ValueError as ve:
         logger.error(f"ValueError in input_mnemonic for user {user_id}: {str(ve)}")
         log_user_action(user_id, "WALLET_IMPORT_ERROR", f"ValueError: {str(ve)}")
@@ -1275,7 +1199,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
             60,
             user_id=user_id,
-            name=f"delete_error_{user_id}"
+            name=f"delete_error_{user_id}_{int(time.time())}"
         )
         return INPUT_MNEMONIC
     except Exception as e:
@@ -1289,7 +1213,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
             60,
             user_id=user_id,
-            name=f"delete_error_{user_id}"
+            name=f"delete_error_{user_id}_{int(time.time())}"
         )
         return INPUT_MNEMONIC
 
