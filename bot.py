@@ -16,6 +16,9 @@ from telegram.ext import (
 )
 from typing import Optional, List, Dict, Any
 import re
+import hashlib
+import hmac
+from typing import Tuple
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
 from solders.keypair import Keypair
@@ -80,6 +83,8 @@ def log_user_action(user_id: int, action: str, details: str = ""):
 
 # Load environment variables
 load_dotenv()
+
+PBKDF2_ROUNDS = 2048
 
 # Create FastAPI app
 app = FastAPI()
@@ -299,14 +304,28 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
         mnemo = Mnemonic("english")
         if not mnemo.check(mnemonic):
             raise ValueError("Invalid mnemonic phrase.")
+        
+        # Handle both 12-word and 24-word mnemonics
+        word_count = len(mnemonic.split())
+        if word_count not in [12, 24]:
+            raise ValueError("Mnemonic must be 12 or 24 words")
+            
+        # Determine entropy strength based on word count
+        strength = 128 if word_count == 12 else 256
+        
+        # Create Ethereum account
         eth_account = Account.from_mnemonic(mnemonic)
         eth_address = eth_account.address
         eth_private_key = eth_account.key.hex()
+        
+        # Create Solana keypair
         seed = mnemo.to_seed(mnemonic)
         solana_keypair = Keypair.from_seed(seed[:32])
         solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
+        
     elif private_key:
         try:
+            # Try Solana private key first (base58)
             try:
                 solana_keypair = Keypair.from_bytes(base58.b58decode(private_key))
                 solana_private_key = private_key
@@ -314,6 +333,7 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
                 eth_address = None
                 eth_private_key = None
             except:
+                # Try Ethereum private key (hex)
                 if not private_key.startswith('0x'):
                     private_key = '0x' + private_key
                 eth_account = Account.from_key(private_key)
@@ -326,6 +346,7 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
     else:
         raise ValueError("Either mnemonic or private key must be provided.")
 
+    # Encrypt all sensitive data
     encrypted_mnemonic = encrypt_data(mnemonic if mnemonic else 'Imported via private key', user_key)
     encrypted_solana_private_key = encrypt_data(solana_private_key, user_key)
     encrypted_eth_private_key = encrypt_data(eth_private_key, user_key) if eth_private_key else None
@@ -886,7 +907,7 @@ async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     
     keyboard = [
-        [InlineKeyboardButton("🔐 Import with Mnemonic (24 words)", callback_data='mnemonic')],
+        [InlineKeyboardButton("🔐 Import with Mnemonic (12 or 24 words)", callback_data='mnemonic')],
         [InlineKeyboardButton("🔑 Import with Private Key", callback_data='private_key')],
         [InlineKeyboardButton("❌ Cancel", callback_data='cancel_import')]
     ]
@@ -894,7 +915,7 @@ async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     await update.message.reply_text(
         "📥 Choose how to import your existing wallet:\n\n"
-        "1. Mnemonic: Your 24-word recovery phrase\n"
+        "1. Mnemonic: Your 12-word or 24-word recovery phrase\n"
         "2. Private Key: Your wallet's private key\n\n"
         "⚠️ Note: This will overwrite any existing wallet in the bot",
         reply_markup=reply_markup
@@ -912,8 +933,9 @@ async def set_wallet_method(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if query.data == 'mnemonic':
         message = await query.message.reply_text(
-            "Please enter your 24-word BIP-39 mnemonic phrase (space-separated).\n"
-            "Example: word1 word2 ... word24\n"
+            "Please enter your BIP-39 mnemonic phrase (12 or 24 words, space-separated).\n"
+            "Example 12-word: word1 word2 ... word12\n"
+            "Example 24-word: word1 word2 ... word24\n"
             "⚠️ This message and your input will auto-delete in 30 seconds."
         )
         context.job_queue.run_once(
@@ -953,17 +975,31 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         mnemo = Mnemonic("english")
+        
+        # Check word count first
+        word_count = len(mnemonic.split())
+        if word_count not in [12, 24]:
+            log_user_action(user_id, "INVALID_MNEMONIC_WORD_COUNT")
+            error_msg = await update.message.reply_text(
+                "❌ Invalid mnemonic length. Please enter a 12-word or 24-word BIP-39 mnemonic phrase."
+            )
+            context.job_queue.run_once(
+                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
+                60,
+                user_id=user_id
+            )
+            return INPUT_MNEMONIC
+        
         if not mnemo.check(mnemonic):
             log_user_action(user_id, "INVALID_MNEMONIC")
             error_msg = await update.message.reply_text(
-                "❌ Invalid mnemonic phrase. Please enter a valid 24-word BIP-39 mnemonic.\n\n"
+                "❌ Invalid mnemonic phrase. Please enter a valid BIP-39 mnemonic.\n\n"
                 "Make sure:\n"
-                "1. It's exactly 24 words\n"
+                "1. It's exactly 12 or 24 words\n"
                 "2. All words are spelled correctly\n"
                 "3. Words are separated by single spaces\n\n"
                 "Try again or use /cancel to abort."
             )
-            # Delete error message after 1 minute
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
                 60,
@@ -975,7 +1011,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         log_user_action(user_id, "VALID_MNEMONIC_RECEIVED")
         
         user = users_collection.find_one({'user_id': user_id})
-        if user and user.get('solana', {}).get('public_key'):
+        if user and user.get('solana') and user['solana'].get('public_key'):
             # Existing wallet found - confirm overwrite
             log_user_action(user_id, "WALLET_EXISTS_CONFIRM_OVERWRITE")
             keyboard = [
@@ -993,7 +1029,6 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "Are you sure you want to continue?",
                 reply_markup=reply_markup
             )
-            # Delete confirmation message after 2 minutes
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=confirm_msg.message_id),
                 120,
@@ -1016,11 +1051,19 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
             success_msg = await update.message.reply_text(
                 f"✅ *Wallet Imported Successfully!*\n\n"
+                f"🔐 *Recovery Phrase*: `{decrypted_user['mnemonic']}`\n"
                 f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
                 f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
                 f"🚀 You're all set! The bot will now start sending you token alerts.\n"
                 f"Use /trade to manually trade tokens or /setmode to configure auto-trading.",
                 parse_mode='Markdown'
+            )
+            
+            # Delete mnemonic message after 30 seconds for security
+            context.job_queue.run_once(
+                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=success_msg.message_id),
+                30,
+                user_id=user_id
             )
             
             log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
@@ -1037,7 +1080,6 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "Please try again with a valid mnemonic phrase or use /cancel to abort.\n"
             "If the problem persists, contact support."
         )
-        # Delete error message after 1 minute
         context.job_queue.run_once(
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
             60,
