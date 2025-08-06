@@ -288,14 +288,17 @@ def decrypt_data(encrypted_data: dict, key: bytes) -> str:
 async def check_subscription(user_id: int) -> bool:
     """Check if user has an active subscription or trial"""
     user = users_collection.find_one({'user_id': user_id})
+    
+    # New users should have been created by now, but double-check
     if not user:
-        # New user gets a 1-day trial
+        # Shouldn't happen because start creates user, but just in case
         expiry = datetime.now() + timedelta(days=1)
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
                 'subscription_status': 'trial',
-                'subscription_expiry': expiry.isoformat()
+                'subscription_expiry': expiry.isoformat(),
+                'created_at': datetime.now().isoformat()
             }},
             upsert=True
         )
@@ -308,9 +311,10 @@ async def check_subscription(user_id: int) -> bool:
         if isinstance(expiry, str):
             expiry = datetime.fromisoformat(expiry)
         
-        if expiry and datetime.now() < expiry:
+        if datetime.now() < expiry:
             return True
             
+        # Update status if expired
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
@@ -460,10 +464,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.user_data[f'conversation_state_{user_id}'] = None
     
+    # FIRST: Check and set up trial if new user
+    user_exists = users_collection.find_one({'user_id': user_id})
+    if not user_exists:
+        # New user - set up trial
+        expiry = datetime.now() + timedelta(days=1)
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {
+                'subscription_status': 'trial',
+                'subscription_expiry': expiry.isoformat(),
+                'created_at': datetime.now().isoformat()
+            }},
+            upsert=True
+        )
+        log_user_action(user_id, "NEW_USER_TRIAL_STARTED", f"Trial until {expiry}")
+    
+    # SECOND: Check subscription status
     if not await check_subscription(user_id):
-        await update.message.reply_text("🚫 There was an issue setting up your free trial. Please contact support.")
+        await update.message.reply_text("🚫 Your trial has expired. Use /subscribe to continue.")
         return
     
+    # THIRD: Check if wallet exists
     user = users_collection.find_one({'user_id': user_id})
     
     if not user or not user.get('solana') or not user['solana'].get('public_key'):
@@ -513,6 +535,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await check_subscription(user_id):
             logger.info(f"Starting token updates for user {user_id}")
             await start_token_updates(context, user_id)
+
+async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job to delete a message with logging"""
+    job = context.job
+    try:
+        await context.bot.delete_message(job.chat_id, job.data)
+        logger.info(f"✅ Deleted message {job.data} in chat {job.chat_id}")
+    except Exception as e:
+        logger.error(f"❌ Failed to delete message {job.data} in chat {job.chat_id}: {str(e)}")
 
 async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle user's choice of wallet setup method"""
@@ -671,7 +702,7 @@ async def start_input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYP
         # Save to database
         result = users_collection.replace_one(
             {'user_id': user_id},
-            user_data,
+            {**user_data, 'created_at': datetime.now().isoformat()},
             upsert=True
         )
         logger.info(f"Database update result - matched: {result.matched_count}, modified: {result.modified_count}")
@@ -696,15 +727,18 @@ async def start_input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYP
             f"2️⃣ Store it securely offline (write it down)\n"
             f"3️⃣ This message will self-destruct in 2 minutes\n\n"
             f"🚀 You're all set! The bot will now start sending you token alerts."
+            f"\n\n⏳ Your 1-day free trial has started!"
         )
         
         msg = await update.message.reply_text(success_msg, parse_mode='Markdown')
         
-        # Schedule message deletion
+        # Schedule message deletion with proper context
         context.job_queue.run_once(
-            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=msg.message_id),
-            120,  # 2 minutes
-            user_id=user_id
+            callback=delete_message_job,
+            when=120,  # 2 minutes
+            chat_id=user_id,
+            data=msg.message_id,
+            name=f"delete_msg_{msg.message_id}"
         )
         
         # Start token updates
@@ -719,7 +753,7 @@ async def start_input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYP
         
         await update.message.reply_text(error_msg)
         return START_INPUT_MNEMONIC
-
+    
 async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle private key input in start flow"""
     user_id = update.effective_user.id
