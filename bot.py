@@ -985,7 +985,6 @@ async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return SET_WALLET_METHOD
 
 async def set_wallet_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle wallet import method selection"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -998,7 +997,7 @@ async def set_wallet_method(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data['wallet_method'] = query.data
 
     if query.data == 'mnemonic':
-        message = await query.message.reply_text(
+        message = await query.edit_message_text(
             "📝 *Please enter your BIP-39 mnemonic phrase (12 or 24 words, space-separated):*\n\n"
             "🔹 Example 12-word: `word1 word2 ... word12`\n"
             "🔹 Example 24-word: `word1 word2 ... word24`\n\n"
@@ -1012,7 +1011,7 @@ async def set_wallet_method(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return INPUT_MNEMONIC
     else:
-        message = await query.message.reply_text(
+        message = await query.edit_message_text(
             "🔑 *Please enter your private key:*\n\n"
             "For Solana: 64-byte base58 encoded (starts with a number)\n"
             "For ETH/BSC: 32-byte hex encoded (with or without '0x' prefix)\n\n"
@@ -1027,7 +1026,6 @@ async def set_wallet_method(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return INPUT_PRIVATE_KEY
 
 async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle mnemonic phrase input"""
     user_id = update.effective_user.id
     mnemonic = update.message.text.strip()
     log_user_action(user_id, "MNEMONIC_RECEIVED")
@@ -2724,7 +2722,15 @@ def setup_handlers(application: Application):
                                  pattern='^(confirm_set_wallet|cancel_set_wallet)$')]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
+        per_message=False,
+        # Add map_to_parent to handle state transitions properly
+        map_to_parent={
+            ConversationHandler.END: ConversationHandler.END,
+            SET_WALLET_METHOD: SET_WALLET_METHOD,
+            INPUT_MNEMONIC: INPUT_MNEMONIC,
+            INPUT_PRIVATE_KEY: INPUT_PRIVATE_KEY,
+            CONFIRM_SET_WALLET: CONFIRM_SET_WALLET
+        }
     )
     application.add_handler(set_wallet_handler)
 
