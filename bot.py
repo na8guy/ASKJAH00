@@ -818,76 +818,116 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
     """
-    Convert BIP-39 mnemonic to seed (works for 12 or 24 words).
+    Convert BIP-39 mnemonic to seed using PBKDF2-HMAC-SHA512.
+    
+    Args:
+        mnemonic: The BIP-39 mnemonic phrase
+        passphrase: Optional passphrase for additional security
+        
+    Returns:
+        bytes: 64-byte seed
+        
+    Raises:
+        ValueError: If mnemonic is invalid
     """
-    mnemonic_bytes = mnemonic.encode('utf-8')
-    salt = ("mnemonic" + passphrase).encode('utf-8')
-    return hashlib.pbkdf2_hmac('sha512', mnemonic_bytes, salt, PBKDF2_ROUNDS)
+    if not validate_mnemonic(mnemonic):
+        raise ValueError("Cannot generate seed from invalid mnemonic")
+    
+    try:
+        # Normalize the mnemonic and passphrase
+        normalized_mnemonic = ' '.join(mnemonic.strip().split())
+        normalized_passphrase = passphrase.strip()
+        
+        # Convert to bytes
+        mnemonic_bytes = normalized_mnemonic.encode('utf-8')
+        salt = ("mnemonic" + normalized_passphrase).encode('utf-8')
+        
+        # Use PBKDF2 with 2048 rounds
+        seed = hashlib.pbkdf2_hmac(
+            'sha512',
+            mnemonic_bytes,
+            salt,
+            PBKDF2_ROUNDS
+        )
+        
+        logger.debug("Successfully generated seed from mnemonic")
+        return seed
+        
+    except Exception as e:
+        logger.error(f"Error generating seed from mnemonic: {str(e)}")
+        raise ValueError(f"Failed to generate seed: {str(e)}")
 
 def validate_mnemonic(mnemonic: str) -> bool:
     """
-    Check if a mnemonic is valid (supports 12 & 24 words).
+    Thoroughly check if a mnemonic is a valid BIP-39 mnemonic phrase (12 or 24 words).
+    
+    Args:
+        mnemonic: The mnemonic phrase to validate
+        
+    Returns:
+        bool: True if valid, False otherwise
     """
-    words = mnemonic.strip().split()
-    if len(words) not in [12, 24]:
+    # First check basic requirements
+    if not mnemonic or not isinstance(mnemonic, str):
+        logger.debug("Mnemonic is empty or not a string")
         return False
-
+        
+    # Clean and split the mnemonic
+    cleaned_mnemonic = ' '.join(mnemonic.strip().split())  # Normalize whitespace
+    words = cleaned_mnemonic.split()
+    
+    # Check word count
+    if len(words) not in [12, 24]:
+        logger.debug(f"Invalid word count: {len(words)} (expected 12 or 24)")
+        return False
+    
+    # Check each word is in the BIP-39 wordlist
     try:
-        # Load BIP-39 wordlist (ensure you have 'bip39_english.txt')
-        with open('bip39_english.txt', 'r') as f:
-            wordlist = [word.strip() for word in f.readlines()]
-
-        # Convert mnemonic back to entropy + checksum
-        bits = []
-        for word in words:
-            index = wordlist.index(word)
-            bits.append(bin(index)[2:].zfill(11))
-        bits = ''.join(bits)
-
-        # Split into entropy and checksum
-        total_length = len(bits)
-        entropy_length = 32 * total_length // 33  # 128 or 256 bits
-        entropy_bits = bits[:entropy_length]
-        checksum_bits = bits[entropy_length:]
-
-        # Verify checksum
-        entropy = int(entropy_bits, 2).to_bytes(entropy_length // 8, 'big')
-        hash_bytes = hashlib.sha256(entropy).digest()
-        hash_bits = bin(int.from_bytes(hash_bytes, 'big'))[2:].zfill(256)
-        expected_checksum = hash_bits[:total_length - entropy_length]
-
-        return checksum_bits == expected_checksum
-    except (ValueError, IndexError):
+        mnemo = Mnemonic("english")
+        if not mnemo.check(cleaned_mnemonic):
+            logger.debug("Mnemonic failed BIP-39 validation")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Error validating mnemonic: {str(e)}")
         return False
 
 def mnemonic_to_eth_account(mnemonic: str) -> Tuple[str, str]:
     """
-    Convert a BIP-39 mnemonic (12 or 24 words) to an Ethereum private key & address.
-    Returns: (private_key_hex, eth_address)
+    Convert a BIP-39 mnemonic phrase to an Ethereum private key and address.
+    
+    Args:
+        mnemonic: The BIP-39 mnemonic phrase (12 or 24 words)
+        
+    Returns:
+        tuple: (private_key_hex, ethereum_address)
+        
+    Raises:
+        ValueError: If the mnemonic is invalid
     """
+    # First validate the mnemonic thoroughly
     if not validate_mnemonic(mnemonic):
-        raise ValueError("Invalid BIP-39 mnemonic")
-
-    # Derive seed (BIP-39)
-    seed = mnemonic_to_seed(mnemonic)
-
-    # Derive private key (BIP-32, but simplified here)
-    # Note: For full BIP-32/44 support, use `bip44` or `hdwallets` library
-    private_key = seed[:32]  # First 32 bytes of seed (simplified approach)
-    private_key_hex = private_key.hex()
-
-    # Get Ethereum address
-    account = Account.from_key(private_key_hex)
-    eth_address = account.address
-
-    return private_key_hex, eth_address
-
-# Example: Import MetaMask 12-word wallet
-mnemonic = "your twelve word MetaMask mnemonic goes here"
-private_key, eth_address = mnemonic_to_eth_account(mnemonic)
-
-print("Private Key (Hex):", private_key)
-print("Ethereum Address:", eth_address)
+        logger.error(f"Invalid mnemonic provided (first 10 chars): {mnemonic[:10]}...")
+        raise ValueError("Invalid BIP-39 mnemonic. Must be 12 or 24 valid words from the BIP-39 wordlist.")
+    
+    try:
+        # Create deterministic seed from mnemonic
+        seed = Mnemonic.to_seed(mnemonic, passphrase="")
+        
+        # Derive private key (first 32 bytes of the seed)
+        private_key = seed[:32]
+        private_key_hex = private_key.hex()
+        
+        # Create Ethereum account from private key
+        account = Account.from_key(private_key_hex)
+        eth_address = account.address
+        
+        logger.debug(f"Successfully derived Ethereum account from mnemonic")
+        return private_key_hex, eth_address
+        
+    except Exception as e:
+        logger.error(f"Error deriving Ethereum account from mnemonic: {str(e)}")
+        raise ValueError(f"Failed to derive Ethereum account: {str(e)}")
 
 
 async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
