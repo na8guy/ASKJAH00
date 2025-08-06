@@ -342,6 +342,8 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             
             # Derive Ethereum account
             eth_private_key, eth_address = mnemonic_to_eth_account(mnemonic)
+            if not Web3.is_address(eth_address):
+                raise ValueError(f"Invalid Ethereum address derived: {eth_address}")
             logger.info(f"Derived Ethereum address: {eth_address}", extra={'user_id': user_id})
             
             # Derive Solana keypair
@@ -350,6 +352,8 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             solana_keypair = Keypair.from_seed(seed)
             solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
             solana_public_key = str(solana_keypair.pubkey())
+            if len(solana_public_key) < 32 or len(solana_public_key) > 44:
+                raise ValueError(f"Invalid Solana public key derived: {solana_public_key}")
             logger.info(f"Derived Solana public key: {solana_public_key}", extra={'user_id': user_id})
             
         elif private_key:
@@ -367,6 +371,8 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
                     private_key = '0x' + private_key
                 eth_account = Account.from_key(private_key)
                 eth_address = eth_account.address
+                if not Web3.is_address(eth_address):
+                    raise ValueError(f"Invalid Ethereum address derived: {eth_address}")
                 eth_private_key = eth_account.key.hex()
                 solana_keypair = Keypair.from_seed(bytes.fromhex(private_key[2:])[:32])
                 solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
@@ -409,6 +415,12 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             'expected_amount': None,
             'payment_deadline': None
         }
+        
+        # Verify wallet data before returning
+        if not user_data['solana']['public_key']:
+            raise ValueError("Solana public key is empty")
+        if mnemonic and not user_data['eth']['address']:
+            raise ValueError("Ethereum address is empty for mnemonic-derived wallet")
         
         logger.info(f"Wallet data prepared for user {user_id}", extra={'user_id': user_id})
         return user_data
@@ -692,9 +704,12 @@ async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     user = users_collection.find_one({'user_id': user_id})
     if not user:
+        logger.info(f"No user found for user_id {user_id}")
         return
         
-    if not user.get('solana') or not user['solana'].get('public_key'):
+    if not user.get('solana') or not user['solana'].get('public_key') or \
+       (user.get('mnemonic') and (not user.get('eth') or not user['eth'].get('address'))):
+        logger.info(f"User {user_id} has incomplete wallet data: {user}")
         await context.bot.send_message(
             chat_id=user_id,
             text="Please set up your wallet first using /start or /set_wallet to receive token updates."
@@ -702,16 +717,17 @@ async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
         return
         
     for job in context.job_queue.jobs():
-        if job.name.startswith(f"user_{user_id}_"):
+        if job.name == f"token_updates_{user_id}":
             job.schedule_removal()
     
     if await check_subscription(user_id):
+        logger.info(f"Scheduling token updates for user {user_id}")
         context.job_queue.run_repeating(
             update_token_info,
             interval=30,
             first=5,
             user_id=user_id,
-            name=f"user_{user_id}_token_updates",
+            name=f"token_updates_{user_id}",
             data={'last_activity': datetime.now()}
         )
         
@@ -723,7 +739,7 @@ async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
                 notify_trial_ending,
                 when=notify_time,
                 user_id=user_id,
-                name=f"user_{user_id}_trial_ending"
+                name=f"trial_ending_{user_id}"
             )
 
 async def check_conversation_timeout(context: ContextTypes.DEFAULT_TYPE):
@@ -1150,7 +1166,8 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         # Verify the save
         saved_user = users_collection.find_one({'user_id': user_id})
-        if not saved_user or not saved_user.get('solana') or not saved_user['solana'].get('public_key') or not saved_user.get('eth') or not saved_user['eth'].get('address'):
+        if not saved_user or not saved_user.get('solana') or not saved_user['solana'].get('public_key') or \
+           not saved_user.get('eth') or not saved_user['eth'].get('address'):
             logger.error(f"Failed to save complete wallet for user {user_id}: {saved_user}")
             error_msg = await update.message.reply_text(
                 "❌ Failed to save wallet to database. Please try again or contact support."
@@ -1370,38 +1387,38 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
             upsert=True
         )
         
-        decrypted_user = await decrypt_user_wallet(user_id, user_data)
-        eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
+        # Verify the save
+        saved_user = users_collection.find_one({'user_id': user_id})
+        if not saved_user or not saved_user.get('solana') or not saved_user['solana'].get('public_key') or \
+           (method == 'mnemonic' and (not saved_user.get('eth') or not saved_user['eth'].get('address'))):
+            logger.error(f"Failed to save complete wallet for user {user_id}: {saved_user}")
+            await query.edit_message_text(
+                "❌ Failed to save wallet to database. Please try again or contact support."
+            )
+            return ConversationHandler.END
         
-        if method == 'mnemonic':
-            success_msg = (
-                f"✅ *Wallet Imported Successfully!*\n\n"
-                f"🔐 *Recovery Phrase*: `{decrypted_user['mnemonic']}`\n"
-                f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
-                f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
-                f"⚠️ *Security Alert*: This message will self-destruct in 30 seconds.\n\n"
-                f"🚀 You're all set! The bot will now start sending you token alerts."
-            )
-        else:
-            success_msg = (
-                f"✅ *Wallet Imported Successfully!*\n\n"
-                f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
-                f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
-                f"🚀 You're all set! The bot will now start sending you token alerts."
-            )
+        eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
+        success_msg = (
+            f"✅ *Wallet Imported Successfully!*\n\n"
+            f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
+            f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
+            f"🚀 You're all set! The bot will now start sending you token alerts.\n"
+            f"Use /trade to manually trade tokens or /setmode to configure auto-trading.\n"
+            f"⚠️ *Important*: Store your mnemonic phrase securely and do not share it."
+        )
         
         await query.edit_message_text(
             success_msg,
             parse_mode='Markdown'
         )
         
-        if method == 'mnemonic':
-            # Delete sensitive mnemonic message after 30 seconds
-            context.job_queue.run_once(
-                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=query.message.message_id),
-                30,
-                user_id=user_id
-            )
+        # Delete success message after 60 seconds
+        context.job_queue.run_once(
+            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=query.message.message_id),
+            60,
+            user_id=user_id,
+            name=f"delete_success_{user_id}_{int(time.time())}"
+        )
         
         # Start token updates
         await start_token_updates(context, user_id)
@@ -1411,7 +1428,7 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"Error in confirm_set_wallet for user {user_id}: {str(e)}")
         await query.edit_message_text(
             f"❌ Failed to import wallet: {str(e)}\n\n"
-            "Please try again or contact support if the problem persists."
+            "Please try again or contact support."
         )
         return ConversationHandler.END
 
@@ -2686,11 +2703,12 @@ async def on_startup():
         
         for user in active_users:
             user_id = user['user_id']
-            if user.get('solana') and user['solana'].get('public_key'):
+            if user.get('solana') and user['solana'].get('public_key') and \
+               (user.get('mnemonic') and user.get('eth') and user['eth'].get('address')):
                 logger.info(f"  - Scheduling job for user {user_id}")
                 app.job_queue.run_repeating(
                     update_token_info,
-                    interval=30,
+                    interval=10,
                     first=5,
                     user_id=user_id,
                     name=f"token_updates_{user_id}"
