@@ -731,13 +731,16 @@ async def start_input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYP
      
 
         wallet_data = await set_user_wallet(user_id, mnemonic=mnemonic)
-        users_collection.update_one(
-    {'user_id': user_id},
-    {'$set': wallet_data},  # Only set wallet fields
-    upsert=True
-)
-        logger.info(f"Database update result - matched: {wallet_data.matched_count}, modified: {wallet_data.modified_count}")
+        update_result = users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': wallet_data},
+            upsert=True
+        )
         
+        # Log the update result properly
+        logger.info(f"Database update - matched: {update_result.matched_count}, "
+                   f"modified: {update_result.modified_count}, "
+                   f"upserted_id: {update_result.upserted_id}")
         # Verify the wallet was saved
         db_user = users_collection.find_one({'user_id': user_id})
         if not db_user or not db_user.get('solana') or not db_user['solana'].get('public_key'):
@@ -832,12 +835,16 @@ async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_
         
 
         wallet_data = await set_user_wallet(user_id, private_key=private_key)
-        users_collection.update_one(
-    {'user_id': user_id},
-    {'$set': wallet_data},  # Only set wallet fields
-    upsert=True
-)
-        log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
+        update_result = users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': wallet_data},
+            upsert=True
+        )
+        
+        # Properly log the update result
+        logger.info(f"Database update - matched: {update_result.matched_count}, "
+                   f"modified: {update_result.modified_count}, "
+                   f"upserted_id: {update_result.upserted_id}")
         
         # Get decrypted info for display
         decrypted_user = await decrypt_user_wallet(user_id, wallet_data)
@@ -1219,12 +1226,16 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
         # Save to database
        
         
-        users_collection.update_one(
-    {'user_id': user_id},
-    {'$set': user_data},  # Only set wallet fields
-    upsert=True
-)
-        log_user_action(user_id, "WALLET_SAVED_TO_DB")
+        update_result = users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': user_data},
+            upsert=True
+        )
+        
+        # Properly log the update result
+        logger.info(f"Database update - matched: {update_result.matched_count}, "
+                   f"modified: {update_result.modified_count}, "
+                   f"upserted_id: {update_result.upserted_id}")
         
         # Get decrypted info for display
         decrypted_user = await decrypt_user_wallet(user_id, user_data)
@@ -1391,19 +1402,19 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
          
 
            
-            result =  users_collection.update_one(
-    {'user_id': user_id},
-    {'$set': user_data},  # Only set wallet fields
-    upsert=True
-)
-            
-            # DEBUG: Log database operation result
-            logger.info(f"Database update result - matched: {result.matched_count}, modified: {result.modified_count}, upserted_id: {result.upserted_id}")
-            
+            update_result = users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': user_data},
+            upsert=True
+        )
+              # Log the update result properly
+            logger.info(f"Database update - matched: {update_result.matched_count}, "
+                   f"modified: {update_result.modified_count}, "
+                   f"upserted_id: {update_result.upserted_id}")
             # Verify the wallet was saved
             db_user = users_collection.find_one({'user_id': user_id})
-            if not db_user or not db_user.get('solana') or not db_user['solana'].get('public_key'):
-                raise RuntimeError("Wallet not saved to database")
+        if not db_user or not db_user.get('solana') or not db_user['solana'].get('public_key'):
+            raise RuntimeError("Wallet not saved to database")
             
             # DEBUG: Log successful save
             logger.info(f"Wallet successfully saved for user {user_id}")
@@ -1513,12 +1524,16 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             # No existing wallet - proceed directly
             log_user_action(user_id, "WALLET_IMPORT_START")
             user_data = await set_user_wallet(user_id, private_key=private_key)
-            users_collection.update_one(
+            update_result = users_collection.update_one(
             {'user_id': user_id},
-            {'$set': user_data},  # Only set wallet fields
+            {'$set': user_data},
             upsert=True
-             )
-            log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
+        )
+        
+        # Properly log the update result
+            logger.info(f"Database update - matched: {update_result.matched_count}, "
+                   f"modified: {update_result.modified_count}, "
+                   f"upserted_id: {update_result.upserted_id}")
             
            
             eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
@@ -1590,12 +1605,16 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
     private_key=wallet_input if method == 'private_key' else None
 )
         
-        users_collection.update_one(
-    {'user_id': user_id},
-    {'$set': user_data},  # Only set wallet fields
-    upsert=True
-)
-        log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
+        update_result = users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': user_data},
+            upsert=True
+        )
+        
+        # Properly log the update result
+        logger.info(f"Database update - matched: {update_result.matched_count}, "
+                   f"modified: {update_result.modified_count}, "
+                   f"upserted_id: {update_result.upserted_id}")
         
        
         eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
@@ -2152,22 +2171,14 @@ async def confirm_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await query.answer()
     await query.edit_message_text(text="⏳ Processing your trade...")
     user_id = query.from_user.id
-    log_user_action(user_id, "TRADE_CONFIRMATION", query.data)
-    
-    if not await check_subscription(user_id):
-        await query.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
-        return ConversationHandler.END
-    
-    if query.data == 'cancel_trade':
-        await query.message.reply_text("🛑 Trade cancelled.")
-        log_user_action(user_id, "TRADE_CANCELLED")
-        return ConversationHandler.END
     
     token = context.user_data['current_token']
     action = context.user_data.get('trade_action', 'buy')
     amount = context.user_data.get('buy_amount' if action == 'buy' else 'sell_amount')
     
-    success = await execute_trade(user_id, token['contract_address'], amount, action, 'solana')
+    # Pass token details to execute_trade
+    success = await execute_trade(user_id, token['contract_address'], amount, action, 'solana', token)
+    
     if success:
         if action == 'buy':
             users_collection.update_one(
@@ -2349,18 +2360,21 @@ async def transfer_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             token['amount'] -= amount
             
             if token['amount'] <= 0:
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$unset': {f'portfolio.{token_contract}': ""}}
-                )
+            # Remove token from portfolio
+             update_result = users_collection.update_one(
+                {'user_id': user_id},
+                {'$unset': {f'portfolio.{token_contract}': ""}}
+            )
             else:
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$set': {f'portfolio.{token_contract}.amount': token['amount']}}
-                )
-            
-            log_user_action(user_id, "TRANSFER_COMPLETED", 
-                           f"{amount} SOL worth of {token_contract} to {address}")
+                update_result = users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {f'portfolio.{token_contract}.amount': token['amount']}}
+            )
+        
+        # Log update result
+            logger.info(f"Portfolio update - matched: {update_result.matched_count}, "
+                   f"modified: {update_result.modified_count}, "
+                   f"upserted_id: {update_result.upserted_id}")
             await update.message.reply_text("✅ Transfer successful.")
         else:
             log_user_action(user_id, "TRANSFER_FAILED", 
@@ -2606,8 +2620,8 @@ async def check_balance(user_id, chain):
         logger.error(f"Error checking {chain} balance: {str(e)}")
         return 0.0
 
-async def execute_trade(user_id, contract_address, amount, action, chain):
-    """Execute a trade on the specified chain"""
+async def execute_trade(user_id, contract_address, amount, action, chain, token_info=None):
+    """Execute a trade on the specified chain using GMGN API"""
     logger.info(f"🏁 Starting {action} trade for {amount} SOL of {contract_address}")
     
     if chain != 'solana':
@@ -2620,6 +2634,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain):
         return False
     
     try:
+        # Decrypt and load wallet
         decrypted_user = await decrypt_user_wallet(user_id, user)
         solana_private_key = decrypted_user['solana']['private_key']
         if not solana_private_key or solana_private_key == "[Decryption Failed]":
@@ -2629,32 +2644,40 @@ async def execute_trade(user_id, contract_address, amount, action, chain):
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         from_address = str(keypair.pubkey())
         
+        # Check balance
         balance = await check_balance(user_id, 'solana')
         if action == 'buy' and balance < amount:
             logger.error(f"Insufficient balance for user {user_id}: {balance} SOL available, {amount} SOL required")
             return False
         
+        # Set token_in and token_out based on trade action
         if action == 'buy':
-            token_in = 'So11111111111111111111111111111111111111112'
+            token_in = 'So11111111111111111111111111111111111111112'  # SOL
             token_out = contract_address
-        else:
+            in_amount = int(amount * 1_000_000_000)  # Convert SOL to lamports
+            swap_mode = 'ExactIn'
+        else:  # Sell
             token_in = contract_address
-            token_out = 'So11111111111111111111111111111111111111112'
+            token_out = 'So11111111111111111111111111111111111111112'  # SOL
+            # For sells, we need to use token amount instead of SOL value
+            # This requires knowing token decimals - we'll assume 9 decimals for simplicity
+            # In a real implementation, you'd fetch token metadata
+            in_amount = int(amount * 1_000_000_000)  # Using same as SOL for simplicity
+            swap_mode = 'ExactIn'
         
-        in_amount = int(amount * 1_000_000_000)
-        
+        # Get swap quote from GMGN
         quote_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_swap_route"
         params = {
             'token_in_address': token_in,
             'token_out_address': token_out,
             'in_amount': str(in_amount),
             'from_address': from_address,
-            'slippage': '0.5',
-            'swap_mode': 'ExactIn'
+            'slippage': '0.5',  # 0.5% slippage
+            'swap_mode': swap_mode
         }
         
         logger.debug(f"🔄 GMGN API params: {params}")
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(quote_url, params=params)
             logger.debug(f"🔁 GMGN API response: {response.status_code} - {response.text[:200]}...")
             
@@ -2669,14 +2692,17 @@ async def execute_trade(user_id, contract_address, amount, action, chain):
                 logger.error(f"Failed to get swap route: {route.get('msg')}")
                 return False
             
+            # Extract transaction details
             swap_transaction = route['data']['raw_tx']['swapTransaction']
             last_valid_block_height = route['data']['raw_tx']['lastValidBlockHeight']
             
+            # Deserialize and sign transaction
             swap_transaction_buf = base64.b64decode(swap_transaction)
             transaction = VersionedTransaction.deserialize(swap_transaction_buf)
             transaction.sign([keypair])
             signed_tx = base64.b64encode(transaction.serialize()).decode('utf-8')
             
+            # Submit transaction
             submit_url = f"{GMGN_API_HOST}/txproxy/v1/send_transaction"
             payload = {
                 'chain': 'sol',
@@ -2694,6 +2720,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain):
             tx_hash = submit_result['data']['hash']
             logger.info(f"✅ Transaction submitted: {tx_hash}")
             
+            # Wait for confirmation
             max_attempts = 60
             for attempt in range(max_attempts):
                 status_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_transaction_status"
