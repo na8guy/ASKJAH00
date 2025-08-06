@@ -107,7 +107,9 @@ DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_add
 (WALLET_SETUP_CHOICE, SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
  SELECT_TOKEN, BUY_AMOUNT, CONFIRM_TRADE, TRANSFER_TOKEN, TRANSFER_AMOUNT, TRANSFER_ADDRESS,
  CONFIRM_NEW_WALLET, SET_WALLET_METHOD, INPUT_MNEMONIC, INPUT_PRIVATE_KEY, CONFIRM_SET_WALLET,
- SELECT_TOKEN_ACTION, SELL_AMOUNT, INPUT_CONTRACT) = range(19)
+ SELECT_TOKEN_ACTION, SELL_AMOUNT, INPUT_CONTRACT,
+ # New states for start flow
+ START_IMPORT_METHOD, START_INPUT_MNEMONIC, START_INPUT_PRIVATE_KEY) = range(22)
 
 # Create FastAPI app
 app = FastAPI()
@@ -542,13 +544,242 @@ async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYP
             return ConversationHandler.END
             
     elif query.data == 'import_wallet':
-        await query.message.reply_text(
-            "Choose how to import your wallet:\n"
-            "- 🔐 Mnemonic: Enter your 12-word or 24-word BIP-39 recovery phrase\n"
-            "- 🔑 Private Key: Enter your Solana or ETH/BSC private key\n\n"
-            "⚠️ Your input will auto-delete in 30 seconds for security."
+        # Start wallet import flow directly in start conversation
+        context.user_data['is_start_flow'] = True  # Flag to identify start flow
+        
+        keyboard = [
+            [InlineKeyboardButton("🔐 Mnemonic (12/24 words)", callback_data='mnemonic')],
+            [InlineKeyboardButton("🔑 Private Key", callback_data='private_key')],
+            [InlineKeyboardButton("❌ Cancel", callback_data='cancel_import')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message = await query.message.reply_text(
+            "📥 *Choose how to import your wallet:*\n\n"
+            "1. 🔐 *Mnemonic*: Enter your 12-word or 24-word BIP-39 recovery phrase\n"
+            "2. 🔑 *Private Key*: Enter your Solana or ETH/BSC private key\n\n"
+            "⚠️ This message will auto-delete in 30 seconds for security.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
         )
-        return await set_wallet_method(update, context)
+        
+        # Schedule message deletion
+        context.job_queue.run_once(
+            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=message.message_id),
+            30,
+            user_id=user_id
+        )
+        return START_IMPORT_METHOD  # New state for start flow
+    
+
+async def start_import_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle wallet method selection in start flow"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    log_user_action(user_id, "WALLET_IMPORT_METHOD_SELECTED", query.data)
+    
+    if query.data == 'cancel_import':
+        await query.edit_message_text("🛑 Wallet import cancelled.")
+        return ConversationHandler.END
+        
+    if query.data == 'mnemonic':
+        message = await query.edit_message_text(
+            "📝 *Please enter your BIP-39 mnemonic phrase (12 or 24 words, space-separated):*\n\n"
+            "🔹 Example 12-word: `word1 word2 ... word12`\n"
+            "🔹 Example 24-word: `word1 word2 ... word24`\n\n"
+            "⚠️ This message and your input will auto-delete in 30 seconds for security.",
+            parse_mode='Markdown'
+        )
+        # Schedule message deletion
+        context.job_queue.run_once(
+            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=message.message_id),
+            30,
+            user_id=user_id
+        )
+        return START_INPUT_MNEMONIC
+        
+    else:  # private_key
+        message = await query.edit_message_text(
+            "🔑 *Please enter your private key:*\n\n"
+            "For Solana: 64-byte base58 encoded (starts with a number)\n"
+            "For ETH/BSC: 32-byte hex encoded (with or without '0x' prefix)\n\n"
+            "⚠️ This message and your input will auto-delete in 30 seconds for security.",
+            parse_mode='Markdown'
+        )
+        context.job_queue.run_once(
+            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=message.message_id),
+            30,
+            user_id=user_id
+        )
+        return START_INPUT_PRIVATE_KEY
+    
+
+async def start_input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle mnemonic input in start flow"""
+    user_id = update.effective_user.id
+    mnemonic = update.message.text.strip()
+    logger.info(f"📝 [start_input_mnemonic] Received mnemonic from user {user_id}")
+    
+    # Delete the sensitive message immediately
+    try:
+        await context.bot.delete_message(chat_id=user_id, message_id=update.message.message_id)
+    except Exception as e:
+        logger.warning(f"Could not delete mnemonic message: {str(e)}")
+
+    try:
+        mnemo = Mnemonic("english")
+        word_count = len(mnemonic.split())
+        if word_count not in [12, 24]:
+            raise ValueError("Mnemonic must be 12 or 24 words")
+        
+        if not mnemo.check(mnemonic):
+            raise ValueError("Invalid mnemonic phrase")
+        
+        # Create and save wallet (no confirmation needed for new users)
+        logger.info("Creating new wallet from mnemonic in start flow")
+        user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
+        
+        # Save to database
+        result = users_collection.replace_one(
+            {'user_id': user_id},
+            user_data,
+            upsert=True
+        )
+        logger.info(f"Database update result - matched: {result.matched_count}, modified: {result.modified_count}")
+        
+        # Verify the wallet was saved
+        db_user = users_collection.find_one({'user_id': user_id})
+        if not db_user or not db_user.get('solana') or not db_user['solana'].get('public_key'):
+            raise RuntimeError("Wallet not saved to database")
+        
+        # Get decrypted info for display
+        decrypted_user = await decrypt_user_wallet(user_id, db_user)
+        eth_bsc_address = db_user['eth']['address'] if db_user.get('eth') else "Not set"
+        
+        # Prepare success message with self-destruct
+        success_msg = (
+            f"✅ *Wallet Imported Successfully!*\n\n"
+            f"🔐 *Recovery Phrase*: `{decrypted_user['mnemonic']}`\n"
+            f"🔑 *Solana Address*: `{db_user['solana']['public_key']}`\n"
+            f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
+            f"⚠️ *SECURITY WARNING*\n"
+            f"1️⃣ Never share your recovery phrase with anyone\n"
+            f"2️⃣ Store it securely offline (write it down)\n"
+            f"3️⃣ This message will self-destruct in 2 minutes\n\n"
+            f"🚀 You're all set! The bot will now start sending you token alerts."
+        )
+        
+        msg = await update.message.reply_text(success_msg, parse_mode='Markdown')
+        
+        # Schedule message deletion
+        context.job_queue.run_once(
+            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=msg.message_id),
+            120,  # 2 minutes
+            user_id=user_id
+        )
+        
+        # Start token updates
+        await start_token_updates(context, user_id)
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"🔥 [start_input_mnemonic] Error: {str(e)}", exc_info=True)
+        error_msg = f"❌ Failed to import wallet: {str(e)}"
+        if "Invalid mnemonic phrase" in str(e):
+            error_msg = "❌ Invalid mnemonic phrase. Please check your words and try again."
+        
+        await update.message.reply_text(error_msg)
+        return START_INPUT_MNEMONIC
+
+async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle private key input in start flow"""
+    user_id = update.effective_user.id
+    private_key = update.message.text.strip()
+    log_user_action(user_id, "PRIVATE_KEY_RECEIVED")
+    
+    # Delete the sensitive message immediately
+    try:
+        await context.bot.delete_message(
+            chat_id=user_id,
+            message_id=update.message.message_id
+        )
+    except Exception as e:
+        logger.warning(f"Could not delete private key message: {str(e)}")
+
+    try:
+        # Validate the private key format
+        key_type = None
+        if not private_key.startswith('0x'):
+            try:
+                # Try to decode as Solana private key (base58)
+                key_bytes = base58.b58decode(private_key)
+                if len(key_bytes) == 64:
+                    key_type = 'solana'
+                else:
+                    raise ValueError("Invalid Solana private key length")
+            except:
+                # Try to decode as ETH/BSC private key (hex)
+                private_key = '0x' + private_key
+                key_bytes = bytes.fromhex(private_key[2:])
+                if len(key_bytes) == 32:
+                    key_type = 'ethereum'
+                else:
+                    raise ValueError("Invalid Ethereum private key length")
+        else:
+            key_bytes = bytes.fromhex(private_key[2:])
+            if len(key_bytes) == 32:
+                key_type = 'ethereum'
+            else:
+                raise ValueError("Invalid Ethereum private key length")
+                
+        log_user_action(user_id, "VALID_PRIVATE_KEY_RECEIVED", f"Type: {key_type}")
+        
+        # Create and save wallet
+        user_data = await set_user_wallet(user_id, private_key=private_key)
+        users_collection.replace_one(
+            {'user_id': user_id},
+            user_data,
+            upsert=True
+        )
+        log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
+        
+        # Get decrypted info for display
+        decrypted_user = await decrypt_user_wallet(user_id, user_data)
+        eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
+        
+        # Prepare success message
+        success_msg = (
+            f"✅ *Wallet Imported Successfully!*\n\n"
+            f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
+            f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
+            f"🚀 You're all set! The bot will now start sending you token alerts."
+        )
+        
+        await update.message.reply_text(success_msg, parse_mode='Markdown')
+        log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
+        
+        # Start token updates
+        await start_token_updates(context, user_id)
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Error in start_input_private_key: {str(e)}")
+        log_user_action(user_id, "WALLET_IMPORT_ERROR", f"Error: {str(e)}", "error")
+        error_msg = await update.message.reply_text(
+            f"❌ Invalid private key: {str(e)}\n\n"
+            "Please enter a valid:\n"
+            "- Solana private key (base58 encoded, 64 bytes)\n"
+            "- ETH/BSC private key (hex encoded, 32 bytes with or without 0x prefix)\n\n"
+            "Try again or use /cancel to abort."
+        )
+        # Delete error message after 1 minute
+        context.job_queue.run_once(
+            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
+            60,
+            user_id=user_id
+        )
+        return START_INPUT_PRIVATE_KEY
 
 async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle manual token fetch command"""
@@ -725,13 +956,27 @@ async def check_conversation_timeout(context: ContextTypes.DEFAULT_TYPE):
     """Check if conversation has timed out and resume token updates"""
     user_id = context.job.user_id
     last_activity = context.job.data.get('last_activity', datetime.now())
-    if (datetime.now() - last_activity).total_seconds() > 60:
-        logger.debug(f"Resuming token updates for user {user_id} after 1 minute of inactivity")
+    
+    # 2 minutes timeout
+    if (datetime.now() - last_activity).total_seconds() > 120:
+        logger.info(f"⏰ Conversation timeout for user {user_id}")
+        
+        # Clear conversation state
         context.user_data[f'conversation_state_{user_id}'] = None
-        for job in context.job_queue.jobs():
-            if job.name == f"timeout_check_{user_id}":
-                job.schedule_removal()
-                logger.debug(f"Removed timeout_check_{user_id}")
+        
+        # Remove timeout job itself
+        context.job.schedule_removal()
+        
+        # Send notification
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="⏱️ Session timed out due to inactivity. Use /start to begin again."
+            )
+        except Exception as e:
+            logger.warning(f"Couldn't send timeout message: {str(e)}")
+        
+        # Restart token updates if subscribed
         if await check_subscription(user_id):
             await start_token_updates(context, user_id)
 
@@ -933,7 +1178,7 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
 async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle wallet import command"""
+    """Handle wallet import command (standalone)"""
     user_id = update.effective_user.id
     log_user_action(user_id, "WALLET_IMPORT_INITIATED")
     
@@ -942,9 +1187,12 @@ async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
         return ConversationHandler.END
     
+    # Set flag to identify standalone import flow
+    context.user_data['is_start_flow'] = False
+    
     keyboard = [
-        [InlineKeyboardButton("🔐 Import with Mnemonic (12 or 24 words)", callback_data='mnemonic')],
-        [InlineKeyboardButton("🔑 Import with Private Key", callback_data='private_key')],
+        [InlineKeyboardButton("🔐 Mnemonic (12/24 words)", callback_data='mnemonic')],
+        [InlineKeyboardButton("🔑 Private Key", callback_data='private_key')],
         [InlineKeyboardButton("❌ Cancel", callback_data='cancel_import')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -957,7 +1205,7 @@ async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
-    return SET_WALLET_METHOD
+    return SET_WALLET_METHOD  # Existing state for standalone import
 
 async def set_wallet_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -1073,9 +1321,12 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 parse_mode='Markdown'
             )
             
+        if context.user_data.get('is_start_flow', False):
+        # This should never happen but just in case
+         return await start_input_mnemonic(update, context)
             # Start token updates
-            await start_token_updates(context, user_id)
-            return ConversationHandler.END
+        await start_token_updates(context, user_id)
+        return ConversationHandler.END
             
     except Exception as e:
         logger.error(f"🔥 [input_mnemonic] Critical error: {str(e)}", exc_info=True)
@@ -1087,7 +1338,6 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return INPUT_MNEMONIC
     
 async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle private key input"""
     user_id = update.effective_user.id
     private_key = update.message.text.strip()
     log_user_action(user_id, "PRIVATE_KEY_RECEIVED")
@@ -1183,10 +1433,14 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             
             log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
+
+        if context.user_data.get('is_start_flow', False):
+        # This should never happen but just in case
+         return await start_input_private_key(update, context)
             
             # Start token updates
-            await start_token_updates(context, user_id)
-            return ConversationHandler.END
+        await start_token_updates(context, user_id)
+        return ConversationHandler.END
             
     except Exception as e:
         logger.error(f"Error in input_private_key for user {user_id}: {str(e)}")
@@ -2618,15 +2872,23 @@ def setup_handlers(application: Application):
 
     # Start command handler
     start_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", wrap_conversation_entry(start))],
-        states={
-            WALLET_SETUP_CHOICE: [CallbackQueryHandler(wrap_conversation_state(handle_wallet_choice), 
-                                 pattern='^(generate_wallet|import_wallet)$')],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
-    )
-    application.add_handler(start_handler)
+    entry_points=[CommandHandler("start", wrap_conversation_entry(start))],
+    states={
+        WALLET_SETUP_CHOICE: [CallbackQueryHandler(wrap_conversation_state(handle_wallet_choice), 
+                             pattern='^(generate_wallet|import_wallet)$')],
+        
+        # New states for import flow in start conversation
+        START_IMPORT_METHOD: [CallbackQueryHandler(wrap_conversation_state(start_import_method), 
+                             pattern='^(mnemonic|private_key|cancel_import)$')],
+        START_INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                            wrap_conversation_state(start_input_mnemonic))],
+        START_INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                              wrap_conversation_state(start_input_private_key))]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False
+)
+    application.add_handler(start_handler) 
 
     # Generate wallet handler
     generate_wallet_handler = ConversationHandler(
