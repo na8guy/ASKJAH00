@@ -58,6 +58,7 @@ from eth_account import Account
 from eth_account.hdaccount import ETHEREUM_DEFAULT_PATH
 from eth_account.hdaccount import generate_mnemonic
 from eth_account.hdaccount import key_from_seed
+from pymongo import UpdateOne, ReplaceOne
 
 # FastAPI setup
 from fastapi import FastAPI, Request, HTTPException
