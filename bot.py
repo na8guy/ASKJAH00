@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from eth_account import Account
+Account.enable_unaudited_hdwallet_features()
 import asyncio
 import logging
 import json
@@ -54,11 +56,11 @@ import time
 import os
 from dotenv import load_dotenv
 from web3 import Web3
-from eth_account import Account
 from eth_account.hdaccount import ETHEREUM_DEFAULT_PATH
 from eth_account.hdaccount import generate_mnemonic
 from eth_account.hdaccount import key_from_seed
 from pymongo import UpdateOne, ReplaceOne
+
 
 # FastAPI setup
 from fastapi import FastAPI, Request, HTTPException
@@ -353,7 +355,7 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             if not mnemo.check(mnemonic):
                 raise ValueError("Invalid mnemonic phrase.")
             
-            # Create Ethereum account
+            # Create Ethereum account with enabled HD features
             eth_account = Account.from_mnemonic(mnemonic)
             eth_address = eth_account.address
             eth_private_key = eth_account.key.hex()
@@ -364,8 +366,34 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
             
         elif private_key:
-            # Private key handling remains the same
-            pass
+            # Private key handling for Solana
+            if private_key.startswith('0x'):
+                # Ethereum/BSC private key
+                account = Account.from_key(private_key)
+                eth_address = account.address
+                eth_private_key = private_key
+                
+                # Create Solana keypair from the same seed?
+                # We can't directly convert, so generate new Solana key
+                logger.warning("ETH private key provided - generating new Solana wallet")
+                new_keypair = Keypair()
+                solana_private_key = base58.b58encode(new_keypair.to_bytes()).decode()
+                solana_keypair = new_keypair
+            else:
+                # Solana private key
+                key_bytes = base58.b58decode(private_key)
+                if len(key_bytes) != 64:
+                    raise ValueError("Invalid Solana private key length")
+                solana_keypair = Keypair.from_bytes(key_bytes)
+                solana_private_key = private_key
+                
+                # Create new ETH wallet since we can't derive from Solana key
+                logger.warning("SOL private key provided - generating new ETH wallet")
+                account = Account.create()
+                eth_address = account.address
+                eth_private_key = account.key.hex()
+        else:
+            raise ValueError("Must provide either mnemonic or private key")
 
         # Encrypt all sensitive data
         encrypted_mnemonic = encrypt_data(mnemonic if mnemonic else 'Imported via private key', user_key)
