@@ -2811,6 +2811,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
     except Exception as e:
         logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
         return False
+    
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show debug information"""
