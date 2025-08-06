@@ -173,6 +173,29 @@ for attempt in range(max_retries):
         db = mongo_client.get_database('trading_bot')
         users_collection = db.users
         users_collection.create_index('user_id', unique=True)
+        # Add schema validation to prevent accidental field deletion
+        users_collection.create_index([("user_id", 1)], unique=True)
+        users_collection.drop_indexes()  # Remove if already exists
+        users_collection.create_index("user_id", unique=True)
+
+# Add schema validation
+        users_collection.create_collection(
+    'users',
+    validator={
+        '$jsonSchema': {
+            'bsonType': 'object',
+            'required': ['user_id'],
+            'properties': {
+                'user_id': {'bsonType': 'int'},
+                'subscription_status': {'bsonType': 'string'},
+                'subscription_expiry': {'bsonType': ['string', 'date']},
+                'created_at': {'bsonType': 'string'},
+                # Add other required fields
+            }
+        }
+    },
+    validationLevel='moderate'
+)
         
         if 'global_posted_tokens' not in db.list_collection_names():
             db.create_collection('global_posted_tokens')
@@ -189,6 +212,8 @@ for attempt in range(max_retries):
     except Exception as e:
         logger.error(f"Unexpected error in MongoDB setup: {str(e)}")
         raise
+
+    
 
 # Master key for encryption
 MASTER_KEY = os.getenv("MASTER_KEY")
@@ -289,9 +314,8 @@ async def check_subscription(user_id: int) -> bool:
     """Check if user has an active subscription or trial"""
     user = users_collection.find_one({'user_id': user_id})
     
-    # New users should have been created by now, but double-check
+    # Create user with trial if doesn't exist
     if not user:
-        # Shouldn't happen because start creates user, but just in case
         expiry = datetime.now() + timedelta(days=1)
         users_collection.update_one(
             {'user_id': user_id},
@@ -306,24 +330,38 @@ async def check_subscription(user_id: int) -> bool:
         return True
         
     status = user.get('subscription_status')
-    if status in ['active', 'trial']:
-        expiry = user.get('subscription_expiry')
-        if isinstance(expiry, str):
-            expiry = datetime.fromisoformat(expiry)
-        
-        if datetime.now() < expiry:
-            return True
-            
-        # Update status if expired
+    expiry = user.get('subscription_expiry')
+    
+    # Handle different expiry formats
+    if isinstance(expiry, str):
+        expiry = datetime.fromisoformat(expiry)
+    elif isinstance(expiry, datetime):
+        pass  # Already correct format
+    else:
+        # If expiry is invalid, create new trial
+        expiry = datetime.now() + timedelta(days=1)
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
-                'subscription_status': 'inactive',
-                'subscription_expiry': None
+                'subscription_status': 'trial',
+                'subscription_expiry': expiry.isoformat()
             }}
         )
-        log_user_action(user_id, "SUBSCRIPTION_EXPIRED")
+        log_user_action(user_id, "TRIAL_RESET", "Invalid expiry format")
+        return True
     
+    if status in ['active', 'trial'] and datetime.now() < expiry:
+        return True
+            
+    # Update status if expired
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {
+            'subscription_status': 'inactive',
+            'subscription_expiry': None
+        }}
+    )
+    log_user_action(user_id, "SUBSCRIPTION_EXPIRED")
     return False
 
 async def get_subscription_status_message(user: dict) -> str:
@@ -405,21 +443,20 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
         encrypted_eth_private_key = encrypt_data(eth_private_key, user_key) if eth_private_key else None
 
         return {
-            'user_id': user_id,
-            'mnemonic': encrypted_mnemonic,
-            'solana': {
-                'public_key': str(solana_keypair.pubkey()),
-                'private_key': encrypted_solana_private_key
-            },
-            'eth': {
-                'address': eth_address,
-                'private_key': encrypted_eth_private_key
-            } if eth_address else None,
-            'bsc': {
-                'address': eth_address,
-                'private_key': encrypted_eth_private_key
-            } if eth_address else None
-        }
+        'mnemonic': encrypted_mnemonic,
+        'solana': {
+            'public_key': str(solana_keypair.pubkey()),
+            'private_key': encrypted_solana_private_key
+        },
+        'eth': {
+            'address': eth_address,
+            'private_key': encrypted_eth_private_key
+        } if eth_address else None,
+        'bsc': {
+            'address': eth_address,
+            'private_key': encrypted_eth_private_key
+        } if eth_address else None
+    }
         
     except Exception as e:
         logger.error(f"🔥 [set_user_wallet] Critical error: {str(e)}", exc_info=True)
@@ -459,15 +496,10 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /start command"""
     user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
     log_user_action(user_id, "START_COMMAND")
     
-    context.user_data[f'conversation_state_{user_id}'] = None
-    
-    # FIRST: Check and set up trial if new user
-    user_exists = users_collection.find_one({'user_id': user_id})
-    if not user_exists:
-        # New user - set up trial
+    # Ensure user exists with trial
+    if not users_collection.find_one({'user_id': user_id}):
         expiry = datetime.now() + timedelta(days=1)
         users_collection.update_one(
             {'user_id': user_id},
@@ -559,17 +591,11 @@ async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         
         try:
             user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
-            
             users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': {
-                    'solana': user_data['solana'],
-                    'eth': user_data['eth'],
-                    'bsc': user_data['bsc'],
-                    'mnemonic': user_data['mnemonic']
-                }},
-                upsert=True
-            )
+    {'user_id': user_id},
+    {'$set': user_data},  # Only set wallet fields
+    upsert=True
+)
             log_user_action(user_id, "WALLET_CREATED")
             
             decrypted_user = await decrypt_user_wallet(user_id, user_data)
@@ -697,15 +723,18 @@ async def start_input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYP
         
         # Create and save wallet (no confirmation needed for new users)
         logger.info("Creating new wallet from mnemonic in start flow")
-        user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
+        
         
         # Save to database
-        result = users_collection.replace_one(
-            {'user_id': user_id},
-            {**user_data, 'created_at': datetime.now().isoformat()},
-            upsert=True
-        )
-        logger.info(f"Database update result - matched: {result.matched_count}, modified: {result.modified_count}")
+     
+
+        wallet_data = await set_user_wallet(user_id, mnemonic=mnemonic)
+        users_collection.update_one(
+    {'user_id': user_id},
+    {'$set': wallet_data},  # Only set wallet fields
+    upsert=True
+)
+        logger.info(f"Database update result - matched: {wallet_data.matched_count}, modified: {wallet_data.modified_count}")
         
         # Verify the wallet was saved
         db_user = users_collection.find_one({'user_id': user_id})
@@ -798,22 +827,24 @@ async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_
         log_user_action(user_id, "VALID_PRIVATE_KEY_RECEIVED", f"Type: {key_type}")
         
         # Create and save wallet
-        user_data = await set_user_wallet(user_id, private_key=private_key)
-        users_collection.replace_one(
-            {'user_id': user_id},
-            user_data,
-            upsert=True
-        )
+        
+
+        wallet_data = await set_user_wallet(user_id, private_key=private_key)
+        users_collection.update_one(
+    {'user_id': user_id},
+    {'$set': wallet_data},  # Only set wallet fields
+    upsert=True
+)
         log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
         
         # Get decrypted info for display
-        decrypted_user = await decrypt_user_wallet(user_id, user_data)
-        eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
+        decrypted_user = await decrypt_user_wallet(user_id, wallet_data)
+        eth_bsc_address = wallet_data['eth']['address'] if wallet_data.get('eth') else "Not set"
         
         # Prepare success message
         success_msg = (
             f"✅ *Wallet Imported Successfully!*\n\n"
-            f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
+            f"🔑 *Solana Address*: `{wallet_data['solana']['public_key']}`\n"
             f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
             f"🚀 You're all set! The bot will now start sending you token alerts."
         )
@@ -1184,11 +1215,13 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
         log_user_action(user_id, "WALLET_CREATED_FROM_MNEMONIC")
         
         # Save to database
+       
+        
         users_collection.update_one(
-            {'user_id': user_id},
-            {'$set': user_data},
-            upsert=True
-        )
+    {'user_id': user_id},
+    {'$set': user_data},  # Only set wallet fields
+    upsert=True
+)
         log_user_action(user_id, "WALLET_SAVED_TO_DB")
         
         # Get decrypted info for display
@@ -1353,11 +1386,14 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.debug(f"Wallet data to save: {user_data.keys()}")
             
             # Use replace_one with upsert to ensure document is properly created
-            result = users_collection.replace_one(
-                {'user_id': user_id},
-                user_data,
-                upsert=True
-            )
+         
+
+           
+            result =  users_collection.update_one(
+    {'user_id': user_id},
+    {'$set': user_data},  # Only set wallet fields
+    upsert=True
+)
             
             # DEBUG: Log database operation result
             logger.info(f"Database update result - matched: {result.matched_count}, modified: {result.modified_count}, upserted_id: {result.upserted_id}")
@@ -1372,7 +1408,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.debug(f"SOL public key: {db_user['solana']['public_key']}")
             
             # Get decrypted info for display
-            decrypted_user = await decrypt_user_wallet(user_id, db_user)
+           
             eth_bsc_address = db_user['eth']['address'] if db_user.get('eth') else "Not set"
             
             success_msg = await update.message.reply_text(
@@ -1476,13 +1512,13 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             log_user_action(user_id, "WALLET_IMPORT_START")
             user_data = await set_user_wallet(user_id, private_key=private_key)
             users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': user_data},
-                upsert=True
-            )
+            {'user_id': user_id},
+            {'$set': user_data},  # Only set wallet fields
+            upsert=True
+             )
             log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
             
-            decrypted_user = await decrypt_user_wallet(user_id, user_data)
+           
             eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
             
             success_msg = await update.message.reply_text(
@@ -1545,23 +1581,25 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Show processing message
         await query.edit_message_text("⏳ Processing your wallet import...")
         
+        
         user_data = await set_user_wallet(
-            user_id, 
-            mnemonic=wallet_input if method == 'mnemonic' else None,
-            private_key=wallet_input if method == 'private_key' else None
-        )
+    user_id, 
+    mnemonic=wallet_input if method == 'mnemonic' else None,
+    private_key=wallet_input if method == 'private_key' else None
+)
         
         users_collection.update_one(
-            {'user_id': user_id},
-            {'$set': user_data},
-            upsert=True
-        )
+    {'user_id': user_id},
+    {'$set': user_data},  # Only set wallet fields
+    upsert=True
+)
         log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
         
-        decrypted_user = await decrypt_user_wallet(user_id, user_data)
+       
         eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
         
         if method == 'mnemonic':
+            decrypted_user = await decrypt_user_wallet(user_id, user_data)
             success_msg = (
                 f"✅ *Wallet Imported Successfully!*\n\n"
                 f"🔐 *Recovery Phrase*: `{decrypted_user['mnemonic']}`\n"
