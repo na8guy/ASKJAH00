@@ -55,18 +55,28 @@ from eth_account import Account
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-# Set up logging
+# Enhanced logging configuration
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - User:%(user_id)s - %(message)s',
+    level=logging.INFO,
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("bot_debug.log")
+        logging.FileHandler("bot_activity.log")
     ]
 )
 logger = logging.getLogger(__name__)
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('telegram').setLevel(logging.DEBUG)
+
+# Custom filter to add user_id to logs
+class UserFilter(logging.Filter):
+    def filter(self, record):
+        record.user_id = getattr(record, 'user_id', 'SYSTEM')
+        return True
+
+logger.addFilter(UserFilter())
+
+def log_user_action(user_id: int, action: str, details: str = ""):
+    extra = {'user_id': user_id}
+    logger.info(f"ACTION: {action} - {details}", extra=extra)
 
 # Load environment variables
 load_dotenv()
@@ -752,77 +762,90 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    logger.debug(f"Generate wallet command from user {user_id}")
+    log_user_action(user_id, "WALLET_GENERATE_INITIATED")
     
     if not await check_subscription(user_id):
+        log_user_action(user_id, "SUBSCRIPTION_CHECK_FAILED")
         await update.message.reply_text(
-            "Your free trial has expired. Please /subscribe to continue using the bot."
+            "🔒 You need an active subscription to use this feature. Use /subscribe."
         )
         return ConversationHandler.END
     
     user = users_collection.find_one({'user_id': user_id})
     if user and user.get('solana', {}).get('public_key'):
+        log_user_action(user_id, "WALLET_EXISTS_PROMPT_OVERWRITE")
         keyboard = [
-            [InlineKeyboardButton("Yes, generate new wallet", callback_data='confirm_new_wallet')],
-            [InlineKeyboardButton("No, keep existing wallet", callback_data='cancel_new_wallet')]
+            [InlineKeyboardButton("✅ Generate New Wallet", callback_data='confirm_new_wallet')],
+            [InlineKeyboardButton("❌ Cancel", callback_data='cancel_new_wallet')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
         await update.message.reply_text(
-            f"You already have a wallet:\n"
-            f"Solana wallet: {user['solana']['public_key']}\n"
-            f"ETH/BSC wallet: {eth_bsc_address}\n\n"
-            f"Generating a new wallet will overwrite the existing one. Are you sure?",
+            f"⚠️ You already have a wallet:\n"
+            f"🔑 Solana: {user['solana']['public_key']}\n"
+            f"🌐 ETH/BSC: {eth_bsc_address}\n\n"
+            "Generating a new wallet will overwrite the existing one.\n"
+            "Are you sure you want to continue?",
             reply_markup=reply_markup
         )
         return CONFIRM_NEW_WALLET
     else:
+        log_user_action(user_id, "WALLET_GENERATE_START")
         return await confirm_generate_wallet(update, context, new_user=True)
 
 async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE, new_user=False) -> int:
-    if not new_user:
-        query = update.callback_query
-        await query.answer()
-        user_id = query.from_user.id
-        if query.data == 'cancel_new_wallet':
-            await query.edit_message_text("🛑 Wallet generation cancelled. Your existing wallet remains unchanged.")
-            return ConversationHandler.END
-    else:
-        user_id = update.effective_user.id
-
+    user_id = update.effective_user.id if new_user else update.callback_query.from_user.id
+    log_user_action(user_id, "WALLET_GENERATION_STARTED")
+    
     try:
         # Show processing message
         if new_user:
             processing_msg = await update.message.reply_text("⏳ Generating your new wallet...")
         else:
+            query = update.callback_query
+            await query.answer()
+            if query.data == 'cancel_new_wallet':
+                log_user_action(user_id, "WALLET_GENERATION_CANCELLED")
+                await query.edit_message_text("🛑 Wallet generation cancelled. Your existing wallet remains unchanged.")
+                return ConversationHandler.END
             await query.edit_message_text("⏳ Generating your new wallet...")
         
+        # Generate new wallet
         mnemo = Mnemonic("english")
         mnemonic = mnemo.generate(strength=256)
-        user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
+        log_user_action(user_id, "MNEMONIC_GENERATED")
         
+        # Create wallet from mnemonic
+        user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
+        log_user_action(user_id, "WALLET_CREATED_FROM_MNEMONIC")
+        
+        # Save to database
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': user_data},
             upsert=True
         )
+        log_user_action(user_id, "WALLET_SAVED_TO_DB")
         
+        # Get decrypted info for display
         decrypted_user = await decrypt_user_wallet(user_id, user_data)
         eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
         
+        # Prepare success message
         success_msg = (
-            f"✨ *New Wallet Generated!*\n\n"
-            f"🔐 *Recovery Phrase*: `{decrypted_user['mnemonic']}`\n"
-            f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
-            f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
-            f"⚠️ *SECURITY WARNING*\n"
-            f"1️⃣ Never share your recovery phrase\n"
-            f"2️⃣ Store it securely offline\n"
-            f"3️⃣ This message will auto-delete in 30 seconds\n\n"
+            f"✨ *New Wallet Generated!* ✨\n\n"
+            f"🔐 *Recovery Phrase*:\n`{decrypted_user['mnemonic']}`\n\n"
+            f"🔑 *Solana Address*:\n`{user_data['solana']['public_key']}`\n\n"
+            f"🌐 *ETH/BSC Address*:\n`{eth_bsc_address}`\n\n"
+            f"⚠️ *SECURITY WARNING* ⚠️\n"
+            f"1️⃣ Never share your recovery phrase with anyone\n"
+            f"2️⃣ Store it securely offline (write it down)\n"
+            f"3️⃣ This message will self-destruct in 2 minutes\n\n"
             f"🚀 You're all set! The bot will now start sending you token alerts."
         )
         
+        # Send success message
         if new_user:
             await processing_msg.edit_text(success_msg, parse_mode='Markdown')
             msg_to_delete = processing_msg
@@ -830,12 +853,14 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text(success_msg, parse_mode='Markdown')
             msg_to_delete = query.message
         
-        # Delete sensitive message after 30 seconds
+        # Schedule message deletion
         context.job_queue.run_once(
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=msg_to_delete.message_id),
-            30,
+            120,  # 2 minutes
             user_id=user_id
         )
+        
+        log_user_action(user_id, "WALLET_GENERATION_SUCCESS")
         
         # Start token updates
         await start_token_updates(context, user_id)
@@ -843,32 +868,35 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
         
     except Exception as e:
         error_msg = f"❌ Error generating wallet: {str(e)}"
+        log_user_action(user_id, "WALLET_GENERATION_FAILED", f"Error: {str(e)}")
+        
         if new_user:
             await update.message.reply_text(error_msg)
         else:
             await query.edit_message_text(error_msg)
-        logger.error(f"Error in confirm_generate_wallet for user {user_id}: {str(e)}")
         return ConversationHandler.END
 
 async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    logger.debug(f"Set wallet command from user {user_id}")
+    log_user_action(user_id, "WALLET_IMPORT_INITIATED")
     
     if not await check_subscription(user_id):
-        await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
+        log_user_action(user_id, "SUBSCRIPTION_CHECK_FAILED")
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
         return ConversationHandler.END
     
     keyboard = [
-        [InlineKeyboardButton("Import with Mnemonic", callback_data='mnemonic')],
-        [InlineKeyboardButton("Import with Private Key", callback_data='private_key')]
+        [InlineKeyboardButton("🔐 Import with Mnemonic (24 words)", callback_data='mnemonic')],
+        [InlineKeyboardButton("🔑 Import with Private Key", callback_data='private_key')],
+        [InlineKeyboardButton("❌ Cancel", callback_data='cancel_import')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "Choose how to import your wallet:\n"
-        "- Mnemonic: Enter your 24-word BIP-39 mnemonic phrase\n"
-        "- Private Key: Enter your Solana (base58) or ETH/BSC (hex) private key\n\n"
-        "⚠️ Your input will auto-delete in 30 seconds for security.",
+        "📥 Choose how to import your existing wallet:\n\n"
+        "1. Mnemonic: Your 24-word recovery phrase\n"
+        "2. Private Key: Your wallet's private key\n\n"
+        "⚠️ Note: This will overwrite any existing wallet in the bot",
         reply_markup=reply_markup
     )
     return SET_WALLET_METHOD
@@ -910,43 +938,49 @@ async def set_wallet_method(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    if not await check_subscription(user_id):
-        await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
-        return ConversationHandler.END
-    
     mnemonic = update.message.text.strip()
-    context.user_data['wallet_input'] = mnemonic
-
-    # Delete the sensitive message after processing
+    log_user_action(user_id, "MNEMONIC_RECEIVED")
+    
+    # Delete the sensitive message immediately
     try:
         await context.bot.delete_message(
             chat_id=user_id,
             message_id=update.message.message_id
         )
     except Exception as e:
-        logger.warning(f"Could not delete message: {str(e)}")
+        logger.warning(f"Could not delete mnemonic message: {str(e)}")
+        log_user_action(user_id, "MESSAGE_DELETION_FAILED", "Mnemonic message")
 
     try:
         mnemo = Mnemonic("english")
         if not mnemo.check(mnemonic):
+            log_user_action(user_id, "INVALID_MNEMONIC")
             error_msg = await update.message.reply_text(
                 "❌ Invalid mnemonic phrase. Please enter a valid 24-word BIP-39 mnemonic.\n\n"
+                "Make sure:\n"
+                "1. It's exactly 24 words\n"
+                "2. All words are spelled correctly\n"
+                "3. Words are separated by single spaces\n\n"
                 "Try again or use /cancel to abort."
             )
-            # Delete error message after 30 seconds
+            # Delete error message after 1 minute
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
-                30,
+                60,
                 user_id=user_id
             )
             return INPUT_MNEMONIC
         
+        context.user_data['wallet_input'] = mnemonic
+        log_user_action(user_id, "VALID_MNEMONIC_RECEIVED")
+        
         user = users_collection.find_one({'user_id': user_id})
         if user and user.get('solana', {}).get('public_key'):
-            # Existing wallet found - ask for confirmation to overwrite
+            # Existing wallet found - confirm overwrite
+            log_user_action(user_id, "WALLET_EXISTS_CONFIRM_OVERWRITE")
             keyboard = [
-                [InlineKeyboardButton("✅ Yes, import new wallet", callback_data='confirm_set_wallet')],
-                [InlineKeyboardButton("❌ No, keep existing wallet", callback_data='cancel_set_wallet')]
+                [InlineKeyboardButton("✅ Confirm Import", callback_data='confirm_set_wallet')],
+                [InlineKeyboardButton("❌ Cancel", callback_data='cancel_set_wallet')]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -955,7 +989,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"⚠️ You already have a wallet:\n"
                 f"🔑 Solana: {user['solana']['public_key']}\n"
                 f"🌐 ETH/BSC: {eth_bsc_address}\n\n"
-                "Importing a new wallet will overwrite the existing one.\n"
+                "Importing this wallet will overwrite the existing one.\n"
                 "Are you sure you want to continue?",
                 reply_markup=reply_markup
             )
@@ -968,33 +1002,28 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return CONFIRM_SET_WALLET
         else:
             # No existing wallet - proceed directly
+            log_user_action(user_id, "WALLET_IMPORT_START")
             user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
             users_collection.update_one(
                 {'user_id': user_id},
                 {'$set': user_data},
                 upsert=True
             )
+            log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
             
             decrypted_user = await decrypt_user_wallet(user_id, user_data)
             eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
             
             success_msg = await update.message.reply_text(
                 f"✅ *Wallet Imported Successfully!*\n\n"
-                f"🔐 *Recovery Phrase*: `{decrypted_user['mnemonic']}`\n"
                 f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
                 f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
-                f"⚠️ *Security Alert*: This message will self-destruct in 30 seconds for your security.\n\n"
                 f"🚀 You're all set! The bot will now start sending you token alerts.\n"
                 f"Use /trade to manually trade tokens or /setmode to configure auto-trading.",
                 parse_mode='Markdown'
             )
             
-            # Delete sensitive info after 30 seconds
-            context.job_queue.run_once(
-                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=success_msg.message_id),
-                30,
-                user_id=user_id
-            )
+            log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
             
             # Start token updates
             await start_token_updates(context, user_id)
@@ -1002,6 +1031,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
     except Exception as e:
         logger.error(f"Error in input_mnemonic for user {user_id}: {str(e)}")
+        log_user_action(user_id, "WALLET_IMPORT_ERROR", f"Error: {str(e)}")
         error_msg = await update.message.reply_text(
             f"❌ Failed to import wallet: {str(e)}\n\n"
             "Please try again with a valid mnemonic phrase or use /cancel to abort.\n"
@@ -1015,15 +1045,12 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return INPUT_MNEMONIC
 
+
 async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    if not await check_subscription(user_id):
-        await update.message.reply_text("You need an active subscription to use this feature. Use /subscribe.")
-        return ConversationHandler.END
-    
     private_key = update.message.text.strip()
-    context.user_data['wallet_input'] = private_key
-
+    log_user_action(user_id, "PRIVATE_KEY_RECEIVED")
+    
     # Delete the sensitive message immediately
     try:
         await context.bot.delete_message(
@@ -1032,71 +1059,75 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
     except Exception as e:
         logger.warning(f"Could not delete private key message: {str(e)}")
+        log_user_action(user_id, "MESSAGE_DELETION_FAILED", "Private key message")
 
     try:
         # Validate the private key format
+        key_type = None
         if not private_key.startswith('0x'):
             try:
                 # Try to decode as Solana private key (base58)
-                base58.b58decode(private_key)
-                key_type = 'solana'
+                key_bytes = base58.b58decode(private_key)
+                if len(key_bytes) == 64:
+                    key_type = 'solana'
+                else:
+                    raise ValueError("Invalid Solana private key length")
             except:
                 # Try to decode as ETH/BSC private key (hex)
                 private_key = '0x' + private_key
-                bytes.fromhex(private_key[2:])
-                key_type = 'ethereum'
+                key_bytes = bytes.fromhex(private_key[2:])
+                if len(key_bytes) == 32:
+                    key_type = 'ethereum'
+                else:
+                    raise ValueError("Invalid Ethereum private key length")
         else:
-            bytes.fromhex(private_key[2:])
-            key_type = 'ethereum'
-    except Exception as e:
-        error_msg = await update.message.reply_text(
-            f"❌ Invalid private key: {str(e)}\n\n"
-            "Please enter a valid:\n"
-            "- Solana private key (base58 encoded, starts with letters/numbers)\n"
-            "- ETH/BSC private key (hex encoded, 64 chars with or without 0x prefix)\n\n"
-            "Try again or use /cancel to abort."
-        )
-        # Delete error message after 1 minute
-        context.job_queue.run_once(
-            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
-            60,
-            user_id=user_id
-        )
-        return INPUT_PRIVATE_KEY
-
-    user = users_collection.find_one({'user_id': user_id})
-    if user and user.get('solana', {}).get('public_key'):
-        # Existing wallet found - ask for confirmation to overwrite
-        keyboard = [
-            [InlineKeyboardButton("✅ Yes, import new wallet", callback_data='confirm_set_wallet')],
-            [InlineKeyboardButton("❌ No, keep existing wallet", callback_data='cancel_set_wallet')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+            key_bytes = bytes.fromhex(private_key[2:])
+            if len(key_bytes) == 32:
+                key_type = 'ethereum'
+            else:
+                raise ValueError("Invalid Ethereum private key length")
+                
+        log_user_action(user_id, "VALID_PRIVATE_KEY_RECEIVED", f"Type: {key_type}")
         
-        eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
-        confirm_msg = await update.message.reply_text(
-            f"⚠️ You already have a wallet:\n"
-            f"🔑 Solana: {user['solana']['public_key']}\n"
-            f"🌐 ETH/BSC: {eth_bsc_address}\n\n"
-            "Importing a new wallet will overwrite the existing one.\n"
-            "Are you sure you want to continue?",
-            reply_markup=reply_markup
-        )
-        # Delete confirmation message after 2 minutes
-        context.job_queue.run_once(
-            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=confirm_msg.message_id),
-            120,
-            user_id=user_id
-        )
-        return CONFIRM_SET_WALLET
-    else:
-        try:
+        context.user_data['wallet_input'] = private_key
+        context.user_data['key_type'] = key_type
+
+        user = users_collection.find_one({'user_id': user_id})
+        if user and user.get('solana', {}).get('public_key'):
+            # Existing wallet found - confirm overwrite
+            log_user_action(user_id, "WALLET_EXISTS_CONFIRM_OVERWRITE")
+            keyboard = [
+                [InlineKeyboardButton("✅ Confirm Import", callback_data='confirm_set_wallet')],
+                [InlineKeyboardButton("❌ Cancel", callback_data='cancel_set_wallet')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
+            confirm_msg = await update.message.reply_text(
+                f"⚠️ You already have a wallet:\n"
+                f"🔑 Solana: {user['solana']['public_key']}\n"
+                f"🌐 ETH/BSC: {eth_bsc_address}\n\n"
+                "Importing this wallet will overwrite the existing one.\n"
+                "Are you sure you want to continue?",
+                reply_markup=reply_markup
+            )
+            # Delete confirmation message after 2 minutes
+            context.job_queue.run_once(
+                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=confirm_msg.message_id),
+                120,
+                user_id=user_id
+            )
+            return CONFIRM_SET_WALLET
+        else:
+            # No existing wallet - proceed directly
+            log_user_action(user_id, "WALLET_IMPORT_START")
             user_data = await set_user_wallet(user_id, private_key=private_key)
             users_collection.update_one(
                 {'user_id': user_id},
                 {'$set': user_data},
                 upsert=True
             )
+            log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
             
             decrypted_user = await decrypt_user_wallet(user_id, user_data)
             eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
@@ -1110,23 +1141,31 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 parse_mode='Markdown'
             )
             
+            log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
+            
             # Start token updates
             await start_token_updates(context, user_id)
             return ConversationHandler.END
-        except Exception as e:
-            logger.error(f"Error importing private key for user {user_id}: {str(e)}")
-            error_msg = await update.message.reply_text(
-                f"❌ Failed to import wallet: {str(e)}\n\n"
-                "Please verify your private key and try again or use /cancel to abort.\n"
-                "If the problem persists, contact support."
-            )
-            # Delete error message after 1 minute
-            context.job_queue.run_once(
-                lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
-                60,
-                user_id=user_id
-            )
-            return INPUT_PRIVATE_KEY
+            
+    except Exception as e:
+        logger.error(f"Error in input_private_key for user {user_id}: {str(e)}")
+        log_user_action(user_id, "WALLET_IMPORT_ERROR", f"Error: {str(e)}")
+        error_msg = await update.message.reply_text(
+            f"❌ Invalid private key: {str(e)}\n\n"
+            "Please enter a valid:\n"
+            "- Solana private key (base58 encoded, 64 bytes)\n"
+            "- ETH/BSC private key (hex encoded, 32 bytes with or without 0x prefix)\n\n"
+            "Try again or use /cancel to abort."
+        )
+        # Delete error message after 1 minute
+        context.job_queue.run_once(
+            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
+            60,
+            user_id=user_id
+        )
+        return INPUT_PRIVATE_KEY
+
+
 
 async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
