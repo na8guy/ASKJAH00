@@ -20,6 +20,7 @@ import hashlib
 import hmac
 from typing import Optional
 from typing import Tuple
+from bip44 import Wallet
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
 from solders.keypair import Keypair
@@ -334,7 +335,7 @@ async def check_subscription(user_id: int) -> bool:
     return False
 
 async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None) -> dict:
-    Account.enable_unaudited_hdwallet_features()
+    Account.enable_unaudited_hdwallet_features()  # Enable mnemonic features
     user_key = derive_user_key(user_id)
     
     if mnemonic:
@@ -1114,6 +1115,16 @@ async def set_wallet_method(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return INPUT_PRIVATE_KEY
 
 async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Handles the input of a mnemonic phrase during the wallet import process.
+    
+    Args:
+        update (Update): The incoming Telegram update.
+        context (ContextTypes.DEFAULT_TYPE): The context for the conversation.
+    
+    Returns:
+        int: The next state in the conversation handler or ConversationHandler.END.
+    """
     user_id = update.effective_user.id
     mnemonic = update.message.text.strip()
     log_user_action(user_id, "MNEMONIC_RECEIVED")
@@ -1125,57 +1136,65 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             message_id=update.message.message_id
         )
     except Exception as e:
-        logger.warning(f"Could not delete mnemonic message: {str(e)}")
-        log_user_action(user_id, "MESSAGE_DELETION_FAILED", "Mnemonic message")
+        logger.warning(f"Could not delete mnemonic message for user {user_id}: {str(e)}")
+        log_user_action(user_id, "MESSAGE_DELETION_FAILED", f"Mnemonic message: {str(e)}")
 
     try:
+        # Validate mnemonic
         mnemo = Mnemonic("english")
+        words = mnemonic.split()
+        word_count = len(words)
         
-        # Check word count first
-        word_count = len(mnemonic.split())
+        logger.info(f"User {user_id} provided mnemonic with {word_count} words")
+        
+        # Check word count
         if word_count not in [12, 24]:
             log_user_action(user_id, "INVALID_MNEMONIC_WORD_COUNT")
             error_msg = await update.message.reply_text(
-                "❌ Invalid mnemonic length. Please enter a 12-word or 24-word BIP-39 mnemonic phrase."
+                f"❌ Invalid mnemonic length: {word_count} words. Please enter a 12-word or 24-word BIP-39 mnemonic phrase."
             )
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
                 60,
-                user_id=user_id
+                user_id=user_id,
+                name=f"delete_error_{user_id}"
             )
             return INPUT_MNEMONIC
         
+        # Validate mnemonic
         if not mnemo.check(mnemonic):
             log_user_action(user_id, "INVALID_MNEMONIC")
+            logger.error(f"Invalid mnemonic provided by user {user_id}: {words[:3]}...")
             error_msg = await update.message.reply_text(
-                "❌ Invalid mnemonic phrase. Please enter a valid BIP-39 mnemonic.\n\n"
-                "Make sure:\n"
-                "1. It's exactly 12 or 24 words\n"
-                "2. All words are spelled correctly\n"
-                "3. Words are separated by single spaces\n\n"
+                "❌ Invalid mnemonic phrase. Please check for:\n"
+                "1. Correct spelling of all words\n"
+                "2. Exactly 12 or 24 words\n"
+                "3. Single spaces between words\n"
+                "4. No extra characters or spaces\n\n"
                 "Try again or use /cancel to abort."
             )
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
                 60,
-                user_id=user_id
+                user_id=user_id,
+                name=f"delete_error_{user_id}"
             )
             return INPUT_MNEMONIC
         
+        # Store mnemonic temporarily in user_data
         context.user_data['wallet_input'] = mnemonic
         log_user_action(user_id, "VALID_MNEMONIC_RECEIVED")
         
+        # Check for existing wallet
         user = users_collection.find_one({'user_id': user_id})
         if user and user.get('solana') and user['solana'].get('public_key'):
-            # Existing wallet found - confirm overwrite
             log_user_action(user_id, "WALLET_EXISTS_CONFIRM_OVERWRITE")
+            eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
             keyboard = [
                 [InlineKeyboardButton("✅ Confirm Import", callback_data='confirm_set_wallet')],
                 [InlineKeyboardButton("❌ Cancel", callback_data='cancel_set_wallet')]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
             confirm_msg = await update.message.reply_text(
                 f"⚠️ You already have a wallet:\n"
                 f"🔑 Solana: {user['solana']['public_key']}\n"
@@ -1187,13 +1206,16 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=confirm_msg.message_id),
                 120,
-                user_id=user_id
+                user_id=user_id,
+                name=f"delete_confirm_{user_id}"
             )
             return CONFIRM_SET_WALLET
         else:
-            # No existing wallet - proceed directly
+            # No existing wallet - proceed with import
             log_user_action(user_id, "WALLET_IMPORT_START")
             user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
+            
+            # Save to MongoDB
             users_collection.update_one(
                 {'user_id': user_id},
                 {'$set': user_data},
@@ -1201,24 +1223,39 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             log_user_action(user_id, "WALLET_IMPORTED_TO_DB")
             
-            decrypted_user = await decrypt_user_wallet(user_id, user_data)
-            eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
+            # Verify the save
+            saved_user = users_collection.find_one({'user_id': user_id})
+            if not saved_user or not saved_user.get('solana') or not saved_user['solana'].get('public_key'):
+                logger.error(f"Failed to save wallet for user {user_id}: {saved_user}")
+                error_msg = await update.message.reply_text(
+                    "❌ Failed to save wallet to database. Please try again or contact support."
+                )
+                context.job_queue.run_once(
+                    lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
+                    60,
+                    user_id=user_id,
+                    name=f"delete_error_{user_id}"
+                )
+                return INPUT_MNEMONIC
             
+            # Prepare success message (do not display mnemonic for security)
+            eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
             success_msg = await update.message.reply_text(
                 f"✅ *Wallet Imported Successfully!*\n\n"
-                f"🔐 *Recovery Phrase*: `{decrypted_user['mnemonic']}`\n"
                 f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
                 f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
                 f"🚀 You're all set! The bot will now start sending you token alerts.\n"
-                f"Use /trade to manually trade tokens or /setmode to configure auto-trading.",
+                f"Use /trade to manually trade tokens or /setmode to configure auto-trading.\n"
+                f"⚠️ *Important*: Store your mnemonic phrase securely and do not share it.",
                 parse_mode='Markdown'
             )
             
-            # Delete mnemonic message after 30 seconds for security
+            # Delete success message after 60 seconds for security
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=success_msg.message_id),
-                30,
-                user_id=user_id
+                60,
+                user_id=user_id,
+                name=f"delete_success_{user_id}"
             )
             
             log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
@@ -1227,18 +1264,32 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await start_token_updates(context, user_id)
             return ConversationHandler.END
             
-    except Exception as e:
-        logger.error(f"Error in input_mnemonic for user {user_id}: {str(e)}")
-        log_user_action(user_id, "WALLET_IMPORT_ERROR", f"Error: {str(e)}")
+    except ValueError as ve:
+        logger.error(f"ValueError in input_mnemonic for user {user_id}: {str(ve)}")
+        log_user_action(user_id, "WALLET_IMPORT_ERROR", f"ValueError: {str(ve)}")
         error_msg = await update.message.reply_text(
-            f"❌ Failed to import wallet: {str(e)}\n\n"
-            "Please try again with a valid mnemonic phrase or use /cancel to abort.\n"
-            "If the problem persists, contact support."
+            f"❌ Failed to import wallet: {str(ve)}\n\n"
+            "Please try again with a valid mnemonic phrase or use /cancel to abort."
         )
         context.job_queue.run_once(
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
             60,
-            user_id=user_id
+            user_id=user_id,
+            name=f"delete_error_{user_id}"
+        )
+        return INPUT_MNEMONIC
+    except Exception as e:
+        logger.error(f"Unexpected error in input_mnemonic for user {user_id}: {str(e)}")
+        log_user_action(user_id, "WALLET_IMPORT_ERROR", f"Unexpected error: {str(e)}")
+        error_msg = await update.message.reply_text(
+            f"❌ An unexpected error occurred: {str(e)}\n\n"
+            "Please try again or contact support."
+        )
+        context.job_queue.run_once(
+            lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
+            60,
+            user_id=user_id,
+            name=f"delete_error_{user_id}"
         )
         return INPUT_MNEMONIC
 

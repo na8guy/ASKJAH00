@@ -13,3 +13,4 @@ solders
 web3
 python-dotenv
 structlog
+bip44
