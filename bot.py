@@ -171,37 +171,39 @@ for attempt in range(max_retries):
         mongo_client.admin.command('ping')
         logger.info("✅ MongoDB connection successful")
         db = mongo_client.get_database('trading_bot')
+        
+        # Create collections using the database object
+        if 'users' not in db.list_collection_names():
+            db.create_collection(
+                'users',
+                validator={
+                    '$jsonSchema': {
+                        'bsonType': 'object',
+                        'required': ['user_id'],
+                        'properties': {
+                            'user_id': {'bsonType': 'int'},
+                            'subscription_status': {'bsonType': 'string'},
+                            'subscription_expiry': {'bsonType': ['string', 'date']},
+                            'created_at': {'bsonType': 'string'},
+                        }
+                    }
+                },
+                validationLevel='moderate'
+            )
+            logger.info("Created users collection with validator")
+        
         users_collection = db.users
         users_collection.create_index('user_id', unique=True)
-        # Add schema validation to prevent accidental field deletion
-        users_collection.create_index([("user_id", 1)], unique=True)
-        users_collection.drop_indexes()  # Remove if already exists
-        users_collection.create_index("user_id", unique=True)
-
-# Add schema validation
-        users_collection.create_collection(
-    'users',
-    validator={
-        '$jsonSchema': {
-            'bsonType': 'object',
-            'required': ['user_id'],
-            'properties': {
-                'user_id': {'bsonType': 'int'},
-                'subscription_status': {'bsonType': 'string'},
-                'subscription_expiry': {'bsonType': ['string', 'date']},
-                'created_at': {'bsonType': 'string'},
-                # Add other required fields
-            }
-        }
-    },
-    validationLevel='moderate'
-)
         
         if 'global_posted_tokens' not in db.list_collection_names():
             db.create_collection('global_posted_tokens')
-            db.global_posted_tokens.create_index('contract_address', unique=True)
-            db.global_posted_tokens.create_index('timestamp', expireAfterSeconds=86400)
-            logger.info("Created global_posted_tokens collection with indexes")
+            logger.info("Created global_posted_tokens collection")
+            
+        global_posted_tokens = db.global_posted_tokens
+        global_posted_tokens.create_index('contract_address', unique=True)
+        global_posted_tokens.create_index('timestamp', expireAfterSeconds=86400)
+        logger.info("Created indexes for global_posted_tokens")
+        
         break
     except ConnectionFailure as e:
         logger.error(f"Attempt {attempt + 1} failed to connect to MongoDB Atlas: {str(e)}")
