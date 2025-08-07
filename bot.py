@@ -100,6 +100,7 @@ def log_user_action(user_id: int, action: str, details: str = "", level: str = "
 load_dotenv()
 
 # Constants
+SUBSCRIPTION_SOL_AMOUNT = 5.0
 PBKDF2_ROUNDS = 2048
 GMGN_API_HOST = 'https://gmgn.ai'
 DEXSCREENER_NEW_TOKENS_API = "https://api.dexscreener.com/token-profiles/latest/v1"
@@ -111,7 +112,7 @@ DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_add
  CONFIRM_NEW_WALLET, SET_WALLET_METHOD, INPUT_MNEMONIC, INPUT_PRIVATE_KEY, CONFIRM_SET_WALLET,
  SELECT_TOKEN_ACTION, SELL_AMOUNT, INPUT_CONTRACT,
  # New states for start flow
- START_IMPORT_METHOD, START_INPUT_MNEMONIC, START_INPUT_PRIVATE_KEY) = range(22)
+ START_IMPORT_METHOD, START_INPUT_MNEMONIC, START_INPUT_PRIVATE_KEY,SUBSCRIPTION_CONFIRMATION) = range(23)
 
 # Create FastAPI app
 app = FastAPI()
@@ -243,6 +244,8 @@ solana_client = AsyncClient(SOLANA_RPC)
 solana_sync_client = Client(SOLANA_RPC)
 w3_eth = Web3(Web3.HTTPProvider(ETH_RPC))
 w3_bsc = Web3(Web3.HTTPProvider(BSC_RPC))
+
+BOT_SOL_ADDRESS = os.getenv("BOT_SOL_ADDRESS")
 
 # USDT contract setup
 BOT_USDT_ADDRESS = os.getenv("BOT_USDT_ADDRESS")
@@ -1083,83 +1086,203 @@ async def check_conversation_timeout(context: ContextTypes.DEFAULT_TYPE):
             await start_token_updates(context, user_id)
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle subscription command"""
+    """Handle subscription with direct SOL payment"""
     user_id = update.effective_user.id
-    user = users_collection.find_one({'user_id': user_id})
     log_user_action(user_id, "SUBSCRIPTION_REQUEST")
     
+    user = users_collection.find_one({'user_id': user_id})
     if not user:
         await update.message.reply_text("🚫 Please use /start first to initialize your account.")
         return
     
-    status = user.get('subscription_status')
-    
-    if status == 'trial':
+    # Check current subscription status
+    if user.get('subscription_status') == 'active':
         expiry = datetime.fromisoformat(user['subscription_expiry'])
-        time_left = expiry - datetime.now()
-        hours = int(time_left.total_seconds() // 3600)
-        
-        await update.message.reply_text(
-            f"⏳ You're currently on a free trial ({hours} hours remaining).\n\n"
-            f"After your trial ends, you can subscribe for $5/week to continue using the bot.\n\n"
-            f"Would you like to subscribe now? (Your trial will still continue until it expires)",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Subscribe Now", callback_data='subscribe_now')],
-                [InlineKeyboardButton("⏳ Later", callback_data='subscribe_later')]
-            ])
-        )
-        return
-
-    if status == 'active':
-        expiry = user.get('subscription_expiry')
-        if isinstance(expiry, str):
-            expiry = datetime.fromisoformat(expiry)
         await update.message.reply_text(
             f"✅ You already have an active subscription until {expiry.strftime('%Y-%m-%d %H:%M:%S')}."
         )
-        await start_token_updates(context, user_id)
         return
-    elif status == 'trial':
-        expiry = datetime.fromisoformat(user['subscription_expiry'])
-        time_left = expiry - datetime.now()
+    
+    # Check if user has a Solana wallet connected
+    if not user.get('solana') or not user['solana'].get('public_key'):
         await update.message.reply_text(
-            f"⏳ You're currently on a free trial (expires in {time_left}).\n\n"
-            f"To continue after your trial ends, the subscription is $5/week."
+            "🔑 You need to have a Solana wallet connected to subscribe.\n\n"
+            "Please set up your wallet first using /start or /set_wallet."
         )
         return
+    
+    # Check SOL balance
+    sol_balance = await check_balance(user_id, 'solana')
+    if sol_balance < SUBSCRIPTION_SOL_AMOUNT:
+        await update.message.reply_text(
+            f"❌ Insufficient SOL balance. You need {SUBSCRIPTION_SOL_AMOUNT} SOL "
+            f"but only have {sol_balance:.4f} SOL.\n\n"
+            f"Your Solana address: `{user['solana']['public_key']}`"
+        )
+        return
+    
+    # Request confirmation
+    keyboard = [
+        [InlineKeyboardButton("✅ Confirm Payment", callback_data='confirm_subscription')],
+        [InlineKeyboardButton("❌ Cancel", callback_data='cancel_subscription')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"💳 Confirm subscription payment of {SUBSCRIPTION_SOL_AMOUNT} SOL?\n\n"
+        f"🔹 From: Your Solana wallet\n`{user['solana']['public_key']}`\n"
+        f"🔹 To: Bot address\n`{BOT_SOL_ADDRESS}`\n"
+        f"🔹 Current Balance: {sol_balance:.4f} SOL\n\n"
+        f"Transaction fee will apply.",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+    return SUBSCRIPTION_CONFIRMATION
 
+async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle subscription confirmation and execute SOL payment"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    if query.data == 'cancel_subscription':
+        await query.edit_message_text("🛑 Subscription cancelled.")
+        return ConversationHandler.END
+    
+    await query.edit_message_text("⏳ Processing your payment...")
+    log_user_action(user_id, "SUBSCRIPTION_CONFIRMED")
+    
+    user = users_collection.find_one({'user_id': user_id})
+    solana_pubkey = Pubkey.from_string(user['solana']['public_key'])
+    
     try:
-        usdt_amount = 5.0
-        usdt_amount_wei = int(usdt_amount * 10**6)
-
-        user_key = derive_user_key(user_id)
-        account = Account.create(user_key)
-        payment_address = account.address
-
-        payment_deadline = datetime.now() + timedelta(minutes=30)
+        # Decrypt private key
+        decrypted_user = await decrypt_user_wallet(user_id, user)
+        solana_private_key = decrypted_user['solana']['private_key']
+        
+        if not solana_private_key or solana_private_key == "[Decryption Failed]":
+            raise ValueError("Failed to decrypt Solana private key")
+        
+        keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
+        
+        # Create transfer transaction
+        to_pubkey = Pubkey.from_string(BOT_SOL_ADDRESS)
+        amount_lamports = int(SUBSCRIPTION_SOL_AMOUNT * 10**9)  # Convert SOL to lamports
+        
+        # Get recent blockhash
+        recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
+        
+        # Create transfer instruction
+        transfer_ix = transfer(
+            TransferParams(
+                from_pubkey=solana_pubkey,
+                to_pubkey=to_pubkey,
+                lamports=amount_lamports
+            )
+        )
+        
+        # Create and sign transaction
+        transaction = Transaction(
+            fee_payer=solana_pubkey,
+            recent_blockhash=recent_blockhash,
+            instructions=[transfer_ix]
+        ).sign([keypair])
+        
+        # Send transaction
+        tx_hash = await solana_client.send_transaction(transaction)
+        logger.info(f"Subscription payment sent: {tx_hash.value}")
+        
+        # Confirm transaction
+        await solana_client.confirm_transaction(tx_hash.value, commitment="confirmed")
+        log_user_action(user_id, "SUBSCRIPTION_PAYMENT_SENT", f"TX: {tx_hash.value}")
+        
+        # Update subscription status
+        expiry = datetime.now() + timedelta(days=7)
         users_collection.update_one(
             {'user_id': user_id},
-            {
-                '$set': {
-                    'payment_address': payment_address,
-                    'expected_amount': usdt_amount_wei,
-                    'payment_deadline': payment_deadline.isoformat()
-                }
-            }
+            {'$set': {
+                'subscription_status': 'active',
+                'subscription_expiry': expiry.isoformat()
+            }}
         )
-        log_user_action(user_id, "SUBSCRIPTION_INITIATED")
-
-        await update.message.reply_text(
-            f"💳 To subscribe ($5/week), send {usdt_amount:.6f} USDT to:\n"
-            f"🔹 Address: `{payment_address}`\n"
-            f"🔹 Network: Ethereum\n"
-            f"⏰ Deadline: {payment_deadline.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"Your subscription will activate automatically after payment is confirmed.",
-            parse_mode='Markdown'
+        log_user_action(user_id, "SUBSCRIPTION_ACTIVATED", f"Expiry: {expiry}")
+        
+        await query.edit_message_text(
+            f"✅ Subscription activated! You now have full access until {expiry.strftime('%Y-%m-%d')}.\n\n"
+            f"Transaction: https://solscan.io/tx/{tx_hash.value}"
         )
+        return ConversationHandler.END
+    
     except Exception as e:
-        logger.error(f"Error creating subscription for user {user_id}: {str(e)}")
-        await update.message.reply_text("❌ Error initiating subscription. Please try again later.")
+        logger.error(f"Subscription payment error: {str(e)}")
+        log_user_action(user_id, "SUBSCRIPTION_ERROR", str(e), "error")
+        await query.edit_message_text(
+            f"❌ Payment failed: {str(e)}\n\n"
+            "Please ensure you have enough SOL for the transaction fee."
+        )
+        return ConversationHandler.END
+
+
+async def verify_sol_payments(context: ContextTypes.DEFAULT_TYPE):
+    """Background job to verify SOL subscription payments"""
+    logger.info("🔍 Verifying SOL subscription payments...")
+    
+    # Get all pending payments (users who initiated payment but we haven't confirmed)
+    pending_payments = users_collection.find({
+        'subscription_payment_sent': True,
+        'subscription_status': {'$ne': 'active'}
+    })
+    
+    for user in pending_payments:
+        user_id = user['user_id']
+        tx_hash = user.get('last_payment_tx')
+        
+        if not tx_hash:
+            continue
+        
+        try:
+            # Check transaction status
+            tx_status = await solana_client.get_transaction(
+                tx_hash,
+                commitment="confirmed"
+            )
+            
+            if tx_status.value and not tx_status.value.transaction.meta.err:
+                # Payment confirmed!
+                expiry = datetime.now() + timedelta(days=7)
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {
+                        'subscription_status': 'active',
+                        'subscription_expiry': expiry.isoformat()
+                    }}
+                )
+                log_user_action(user_id, "SUBSCRIPTION_AUTO_ACTIVATED", f"TX: {tx_hash}")
+                
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"✅ Your subscription payment was confirmed! "
+                             f"You now have full access until {expiry.strftime('%Y-%m-%d')}."
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to notify user {user_id}: {str(e)}")
+            else:
+                # Transaction failed or not found
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$unset': {'subscription_payment_sent': "", 'last_payment_tx': ""}}
+                )
+                
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text="❌ Your subscription payment failed. Please try /subscribe again."
+                    )
+                except:
+                    pass
+        except Exception as e:
+            logger.error(f"Payment verification error for user {user_id}: {str(e)}")
 
 async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle wallet generation command"""
@@ -3049,7 +3172,7 @@ def setup_handlers(application: Application):
         return wrapped
 
     # Add basic command handlers
-    application.add_handler(CommandHandler("subscribe", subscribe))
+    
     application.add_handler(CommandHandler("job_status", job_status))
     application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
     application.add_handler(CommandHandler("force_fetch", force_token_fetch))
@@ -3078,7 +3201,19 @@ def setup_handlers(application: Application):
     fallbacks=[CommandHandler("cancel", cancel)],
     per_message=False
 )
-    application.add_handler(start_handler) 
+    application.add_handler(start_handler)
+
+    subscription_handler = ConversationHandler(
+    entry_points=[CommandHandler("subscribe", subscribe)],
+    states={
+        SUBSCRIPTION_CONFIRMATION: [
+            CallbackQueryHandler(confirm_subscription, pattern='^(confirm_subscription|cancel_subscription)$')
+        ]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False
+)
+    application.add_handler(subscription_handler) 
 
     # Generate wallet handler
     generate_wallet_handler = ConversationHandler(
@@ -3254,6 +3389,12 @@ async def on_startup():
                     user_id=user_id,
                     name=f"token_updates_{user_id}"
                 )
+                app.job_queue.run_repeating(
+    verify_sol_payments,
+    interval=300,  # every 5 minutes
+    first=10,
+    name="sol_payment_verification"
+)
         
         logger.info("✅ Bot startup complete")
     except Exception as e:
