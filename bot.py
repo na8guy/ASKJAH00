@@ -400,6 +400,7 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
     try:
         user_key = derive_user_key(user_id)
         
+        # Inside set_user_wallet function, in the mnemonic section:
         if mnemonic:
             mnemo = Mnemonic("english")
             word_count = len(mnemonic.split())
@@ -416,12 +417,14 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             
             # Create Solana account with proper derivation path
             seed = mnemo.to_seed(mnemonic, passphrase="")
-            derivation_path = "m/44'/501'/0'"
+            
+            # CORRECTED DERIVATION PATH
+            derivation_path = "m/44'/501'/0'/0'"
             
             # Derive Solana key using standard BIP44 path
             private_key_bytes = key_from_seed(seed, derivation_path)
             
-            # FIX: Use from_seed for 32-byte inputs
+            # FIXED: Use from_seed for 32-byte inputs
             solana_keypair = Keypair.from_seed(private_key_bytes[:32])
             solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
             
@@ -494,7 +497,7 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
 
 
 def key_from_seed(seed: bytes, path: str) -> bytes:
-    """Derive private key from seed using BIP32 derivation path"""
+    """Derive private key from seed using BIP32 derivation (SLIP-0010)"""
     # Split path into components
     path_components = path.split('/')
     
