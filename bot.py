@@ -436,6 +436,8 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             solana_keypair = derive_solana_keypair_from_mnemonic(mnemonic)
             solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
             
+            logger.info(f"🔐 Derived Solana address: {solana_keypair.pubkey()}")
+            
         
             
         elif private_key:
@@ -511,7 +513,7 @@ def derive_solana_keypair_from_mnemonic(mnemonic: str, passphrase: str = "", acc
     # Create BIP44 wallet
     wallet = Wallet(mnemonic, passphrase)
     
-    # Derive path: m/44'/501'/{account}'/0'
+    # Derive path: m/44'/501'/{account}'/0' (Phantom/Exodus standard)
     path = f"m/44'/501'/{account}'/0'"
     private_key = wallet.get_private_key(path)
     
