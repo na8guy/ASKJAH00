@@ -112,7 +112,7 @@ DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_add
  CONFIRM_NEW_WALLET, SET_WALLET_METHOD, INPUT_MNEMONIC, INPUT_PRIVATE_KEY, CONFIRM_SET_WALLET,
  SELECT_TOKEN_ACTION, SELL_AMOUNT, INPUT_CONTRACT,
  # New states for start flow
- START_IMPORT_METHOD, START_INPUT_MNEMONIC, START_INPUT_PRIVATE_KEY,SUBSCRIPTION_CONFIRMATION) = range(23)
+ START_IMPORT_METHOD, START_INPUT_MNEMONIC, START_INPUT_PRIVATE_KEY,SUBSCRIPTION_CONFIRMATION,INPUT_ANALYSIS_CONTRACT) = range(24)
 
 # Create FastAPI app
 app = FastAPI()
@@ -195,6 +195,15 @@ for attempt in range(max_retries):
         
         users_collection = db.users
         users_collection.create_index('user_id', unique=True)
+
+        # Create new collection if not exists
+        if 'token_performance' not in db.list_collection_names():
+            db.create_collection('token_performance')
+            logger.info("Created token_performance collection")
+
+        token_performance_collection = db.token_performance
+        token_performance_collection.create_index('contract_address')
+        token_performance_collection.create_index('first_posted_at')
         
         if 'global_posted_tokens' not in db.list_collection_names():
             db.create_collection('global_posted_tokens')
@@ -319,7 +328,7 @@ async def check_subscription(user_id: int) -> bool:
     """Check if user has an active subscription or trial"""
     user = users_collection.find_one({'user_id': user_id})
     
-    # Create user with trial if doesn't exist
+    # New user - create trial
     if not user:
         expiry = datetime.now() + timedelta(days=1)
         users_collection.update_one(
@@ -327,46 +336,43 @@ async def check_subscription(user_id: int) -> bool:
             {'$set': {
                 'subscription_status': 'trial',
                 'subscription_expiry': expiry.isoformat(),
+                'trial_used': True,  # Mark trial as used
                 'created_at': datetime.now().isoformat()
             }},
             upsert=True
         )
-        log_user_action(user_id, "NEW_USER_TRIAL_STARTED", f"Trial until {expiry}")
+        log_user_action(user_id, "NEW_USER_TRIAL_STARTED")
         return True
         
+    # Existing user check
     status = user.get('subscription_status')
     expiry = user.get('subscription_expiry')
     
-    # Handle different expiry formats
+    # Convert expiry to datetime if needed
     if isinstance(expiry, str):
         expiry = datetime.fromisoformat(expiry)
-    elif isinstance(expiry, datetime):
-        pass  # Already correct format
-    else:
-        # If expiry is invalid, create new trial
-        expiry = datetime.now() + timedelta(days=1)
+    
+    # Active subscription
+    if status == 'active' and datetime.now() < expiry:
+        return True
+        
+    # Trial status check
+    if status == 'trial' and datetime.now() < expiry:
+        return True
+        
+    # Expired trial - prevent reuse
+    if user.get('trial_used'):
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
-                'subscription_status': 'trial',
-                'subscription_expiry': expiry.isoformat()
+                'subscription_status': 'inactive',
+                'subscription_expiry': None
             }}
         )
-        log_user_action(user_id, "TRIAL_RESET", "Invalid expiry format")
-        return True
-    
-    if status in ['active', 'trial'] and datetime.now() < expiry:
-        return True
-            
-    # Update status if expired
-    users_collection.update_one(
-        {'user_id': user_id},
-        {'$set': {
-            'subscription_status': 'inactive',
-            'subscription_expiry': None
-        }}
-    )
-    log_user_action(user_id, "SUBSCRIPTION_EXPIRED")
+        log_user_action(user_id, "SUBSCRIPTION_EXPIRED")
+        return False
+        
+    # Should never reach here
     return False
 
 async def get_subscription_status_message(user: dict) -> str:
@@ -885,6 +891,174 @@ async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_
             user_id=user_id
         )
         return START_INPUT_PRIVATE_KEY
+    
+
+async def record_token_performance(token: dict):
+    """Record initial token metrics when first posted"""
+    contract_address = token['contract_address']
+    
+    # Check if already recorded
+    if token_performance_collection.find_one({'contract_address': contract_address}):
+        return
+    
+    # Record initial metrics
+    token_performance_collection.insert_one({
+        'contract_address': contract_address,
+        'name': token.get('name', ''),
+        'symbol': token.get('symbol', ''),
+        'first_posted_at': datetime.now(),
+        'initial_price': token['price_usd'],
+        'initial_liquidity': token['liquidity'],
+        'initial_market_cap': token.get('market_cap', 0),
+        'all_time_high': token['price_usd'],
+        'all_time_low': token['price_usd'],
+        'performance_updates': []
+    })
+    logger.info(f"Recorded initial performance for {contract_address}")
+
+
+async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
+    """Periodically update token performance metrics"""
+    logger.info("🔄 Updating token performance metrics...")
+    
+    # Get all tokens tracked
+    tokens = token_performance_collection.find()
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for token in tokens:
+            contract_address = token['contract_address']
+            try:
+                # Fetch current token data
+                current_data = await fetch_token_by_contract(contract_address)
+                if not current_data:
+                    continue
+                
+                # Calculate performance metrics
+                current_price = current_data['price_usd']
+                price_change = ((current_price - token['initial_price']) / token['initial_price']) * 100
+                
+                # Update all-time high/low
+                new_ath = max(token['all_time_high'], current_price)
+                new_atl = min(token['all_time_low'], current_price)
+                
+                # Add performance update
+                update_data = {
+                    'timestamp': datetime.now(),
+                    'price': current_price,
+                    'liquidity': current_data['liquidity'],
+                    'market_cap': current_data.get('market_cap', 0),
+                    'price_change_percent': price_change
+                }
+                
+                # Update database
+                token_performance_collection.update_one(
+                    {'_id': token['_id']},
+                    {
+                        '$set': {
+                            'all_time_high': new_ath,
+                            'all_time_low': new_atl
+                        },
+                        '$push': {
+                            'performance_updates': {
+                                '$each': [update_data],
+                                '$slice': -1000  # Keep last 1000 updates
+                            }
+                        }
+                    }
+                )
+                
+            except Exception as e:
+                logger.error(f"Error updating performance for {contract_address}: {str(e)}")
+
+
+async def token_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Initiate token performance analysis"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "TOKEN_ANALYSIS_REQUEST")
+    
+    await update.message.reply_text(
+        "🔍 Enter the token contract address for analysis:\n"
+        "(e.g., 4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R)"
+    )
+    return INPUT_ANALYSIS_CONTRACT
+
+async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle token contract input for analysis"""
+    user_id = update.effective_user.id
+    contract_address = update.message.text.strip()
+    log_user_action(user_id, "ANALYSIS_CONTRACT_INPUT", contract_address)
+    
+    # Fetch performance data
+    token_data = token_performance_collection.find_one(
+        {'contract_address': contract_address}
+    )
+    
+    if not token_data:
+        await update.message.reply_text(
+            "❌ This token hasn't been tracked by the bot. "
+            "Only tokens posted through the bot can be analyzed."
+        )
+        return ConversationHandler.END
+    
+    # Fetch current price
+    current_token = await fetch_token_by_contract(contract_address)
+    if not current_token:
+        await update.message.reply_text("❌ Failed to fetch current token data.")
+        return ConversationHandler.END
+    
+    # Calculate performance metrics
+    current_price = current_token['price_usd']
+    initial_price = token_data['initial_price']
+    price_change = ((current_price - initial_price) / initial_price) * 100
+    
+    # Determine performance tier
+    multiplier = current_price / initial_price
+    if multiplier >= 10:
+        performance = "10X+ 🚀🌕"
+    elif multiplier >= 5:
+        performance = "5X+ 🔥"
+    elif multiplier >= 2:
+        performance = "2X+ ⬆️"
+    elif multiplier >= 1:
+        performance = "1X ➡️"
+    else:
+        loss_percent = (1 - multiplier) * 100
+        performance = f"DOWN {loss_percent:.1f}% ⚠️"
+
+    # Calculate time since first post
+    time_posted = token_data['first_posted_at']
+    time_elapsed = datetime.now() - time_posted
+    days_elapsed = time_elapsed.days
+    hours_elapsed = time_elapsed.seconds // 3600
+    
+    # Format message
+    message = (
+        f"📊 *Token Performance Analysis*\n\n"
+        f"🔹 *Token:* {token_data['name']} ({token_data['symbol']})\n"
+        f"🔹 *Contract:* `{contract_address}`\n\n"
+        f"⏱️ *Tracked Since:* {time_posted.strftime('%Y-%m-%d %H:%M')} "
+        f"({days_elapsed}d {hours_elapsed}h ago)\n\n"
+        f"💰 *Price Performance*\n"
+        f"  - Initial: ${initial_price:.8f}\n"
+        f"  - Current: ${current_price:.8f}\n"
+        f"  - Change: {price_change:+.2f}% ({performance})\n"
+        f"  - All-Time High: ${token_data['all_time_high']:.8f}\n"
+        f"  - All-Time Low: ${token_data['all_time_low']:.8f}\n\n"
+        f"💧 *Liquidity*\n"
+        f"  - Initial: ${token_data['initial_liquidity']:,.2f}\n"
+        f"  - Current: ${current_token['liquidity']:,.2f}\n\n"
+        f"📈 *Market Cap*\n"
+        f"  - Initial: ${token_data.get('initial_market_cap', 0):,.2f}\n"
+        f"  - Current: ${current_token.get('market_cap', 0):,.2f}\n\n"
+        f"[View Chart]({current_token['dexscreener_url']})"
+    )
+    
+    await update.message.reply_text(
+        message, 
+        parse_mode='Markdown', 
+        disable_web_page_preview=True
+    )
+    return ConversationHandler.END
 
 async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle manual token fetch command"""
@@ -928,6 +1102,9 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
             if token['contract_address'] in user.get('posted_tokens', []):
                 logger.debug(f"User {user_id} already saw token {token['contract_address']}")
                 continue
+
+             # ⭐ NEW: Record token performance before sending notification
+            await record_token_performance(token)
 
             message = format_token_message(token)
             is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
@@ -2720,6 +2897,9 @@ async def update_token_info(context):
                 logger.debug(f"User {user_id} already saw token {token['contract_address']}")
                 continue
 
+             # ⭐ NEW: Record token performance before sending notification
+            await record_token_performance(token)
+
             message = format_token_message(token)
             is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
             warning = "⚠️ *LOW LIQUIDITY - Trade with caution!*\n" if is_suspicious else ""
@@ -3215,6 +3395,19 @@ def setup_handlers(application: Application):
 )
     application.add_handler(subscription_handler) 
 
+
+
+    analysis_handler = ConversationHandler(
+    entry_points=[CommandHandler("token_analysis", wrap_conversation_entry(token_analysis))],
+    states={
+        INPUT_ANALYSIS_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                              wrap_conversation_state(analysis_contract))]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False
+)
+    application.add_handler(analysis_handler)
+
     # Generate wallet handler
     generate_wallet_handler = ConversationHandler(
         entry_points=[CommandHandler("generatewallet", wrap_conversation_entry(generate_wallet))],
@@ -3394,6 +3587,12 @@ async def on_startup():
     interval=300,  # every 5 minutes
     first=10,
     name="sol_payment_verification"
+)
+                app.job_queue.run_repeating(
+    update_token_performance,
+    interval=3600,  # Update hourly
+    first=10,
+    name="token_performance_updates"
 )
         
         logger.info("✅ Bot startup complete")
