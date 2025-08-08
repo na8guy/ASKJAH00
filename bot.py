@@ -61,7 +61,7 @@ from eth_account.hdaccount import generate_mnemonic
 from eth_account.hdaccount import key_from_seed
 from pymongo import UpdateOne, ReplaceOne
 from bip44 import Wallet
-from bip44.utils import get_eth_addr
+
 
 
 # FastAPI setup
@@ -500,11 +500,24 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
 
 def derive_solana_keypair_from_mnemonic(mnemonic: str, passphrase: str = "", account: int = 0) -> Keypair:
     """Derive Solana keypair using BIP-44 standard with SLIP-0010 for ed25519"""
-    wallet = Wallet(mnemonic, passphrase)
+    # Explicitly specify English language
+    mnemo = Mnemonic("english")
+    
+    # Validate and get seed
+    if not mnemo.check(mnemonic):
+        raise ValueError("Invalid mnemonic phrase")
+    
+    seed = mnemo.to_seed(mnemonic, passphrase)
+    
+    # Create BIP44 wallet with explicit language
+    wallet = Wallet(mnemonic, passphrase, language="english")
+    
+    # Derive path: m/44'/501'/{account}'/0' (Phantom/Exodus standard)
     path = f"m/44'/501'/{account}'/0'"
     private_key = wallet.get_private_key(path)
-    return Keypair.from_seed(private_key[:32])
     
+    # Convert to Solana keypair
+    return Keypair.from_seed(private_key[:32])
 
 async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
     """Decrypt sensitive wallet information for a user"""
