@@ -206,9 +206,9 @@ for attempt in range(max_retries):
         token_performance_collection.create_index('first_posted_at')
         
         if 'global_posted_tokens' not in db.list_collection_names():
-            db.create_collection('global_posted_tokens')
-            logger.info("Created global_posted_tokens collection")
-            
+         db.create_collection('global_posted_tokens')
+         logger.info("Created global_posted_tokens collection")
+    
         global_posted_tokens = db.global_posted_tokens
         global_posted_tokens.create_index('contract_address', unique=True)
         global_posted_tokens.create_index('timestamp', expireAfterSeconds=86400)
@@ -1060,11 +1060,10 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+# Modified fetch_tokens_manual function
 async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle manual token fetch command"""
     user_id = update.effective_user.id
     log_user_action(user_id, "MANUAL_TOKEN_FETCH")
-    context.user_data[f'conversation_state_{user_id}'] = None
     
     try:
         if not await check_subscription(user_id):
@@ -1087,23 +1086,21 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
         tokens = await fetch_latest_token()
         
         if not tokens:
-            logger.warning("No new tokens fetched")
-            await update.message.reply_text("🔍 No new tokens found. Please try again later.")
+            logger.warning("No tokens fetched")
+            await update.message.reply_text("🔍 No tokens found. Please try again later.")
+            return
+            
+        posted_tokens = user.get('posted_tokens', [])
+        new_tokens = [t for t in tokens if t['contract_address'] not in posted_tokens]
+        
+        if not new_tokens:
+            await update.message.reply_text("🔍 No new tokens available that you haven't seen.")
             return
             
         sent_any = False
-        for token in tokens:
-            logger.info(f"Processing token: {token.get('name')} ({token.get('contract_address')})")
-
-            if db.global_posted_tokens.find_one({'contract_address': token['contract_address']}):
-                logger.debug(f"Token {token['contract_address']} already posted globally")
-                continue
-
-            if token['contract_address'] in user.get('posted_tokens', []):
-                logger.debug(f"User {user_id} already saw token {token['contract_address']}")
-                continue
-
-             # ⭐ NEW: Record token performance before sending notification
+        # Limit to 20 tokens for manual fetch
+        for token in new_tokens[:20]:
+            # Record token performance
             await record_token_performance(token)
 
             message = format_token_message(token)
@@ -1140,24 +1137,15 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
                 sent_any = True
             
-            try:
-                db.global_posted_tokens.insert_one({
-                    'contract_address': token['contract_address'],
-                    'timestamp': datetime.now(),
-                    'name': token.get('name', ''),
-                    'symbol': token.get('symbol', '')
-                })
-                
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {
-                        '$set': {'last_api_call': current_time},
-                        '$addToSet': {'posted_tokens': token['contract_address']}
-                    }
-                )
-                logger.info(f"Token records updated for {token['contract_address']}")
-            except Exception as e:
-                logger.error(f"Error updating token records for {token['contract_address']}: {str(e)}")
+            # Add to user's posted tokens
+            users_collection.update_one(
+                {'user_id': user_id},
+                {
+                    '$set': {'last_api_call': current_time},
+                    '$addToSet': {'posted_tokens': token['contract_address']}
+                }
+            )
+            logger.info(f"Added token {token['contract_address']} to user {user_id}'s posted tokens")
         
         if not sent_any:
             await update.message.reply_text("🔍 No new tokens available that you haven't seen.")
@@ -1165,8 +1153,6 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"Error in manual token fetch: {str(e)}", exc_info=True)
         await update.message.reply_text("❌ An error occurred while fetching tokens. Please try again.")
-        if await check_subscription(user_id):
-            await start_token_updates(context, user_id)
 
 async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show trade system status"""
@@ -2749,8 +2735,9 @@ async def transfer_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"❌ Invalid address: {str(e)}")
         return TRANSFER_ADDRESS
 
+# Modified fetch_latest_token function
 async def fetch_latest_token() -> List[Dict[str, Any]]:
-    """Fetch latest tokens from DexScreener"""
+    """Fetch all Solana tokens without time filtering"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept': 'application/json'
@@ -2771,32 +2758,12 @@ async def fetch_latest_token() -> List[Dict[str, Any]]:
                 logger.warning("No tokens found in API response")
                 return []
             
-            time_threshold = datetime.now() - timedelta(seconds=30)
-            time_threshold_ms = int(time_threshold.timestamp() * 1000)
             solana_tokens = []
             
             for token_data in data:
                 if token_data.get('chainId') != 'solana':
                     continue
                 
-                open_graph_url = token_data.get('openGraph', '')
-                timestamp_match = re.search(r'timestamp=(\d+)', open_graph_url)
-                if not timestamp_match:
-                    logger.warning(f"No timestamp found in openGraph URL for token {token_data.get('tokenAddress', 'unknown')}")
-                    continue
-                
-                token_timestamp_ms = int(timestamp_match.group(1))
-                if token_timestamp_ms < time_threshold_ms:
-                    continue
-                
-                solana_tokens.append(token_data)
-            
-            if not solana_tokens:
-                logger.warning("No recent Solana tokens found in API response")
-                return []
-            
-            result_tokens = []
-            for token_data in solana_tokens:
                 contract_address = token_data.get('tokenAddress', '')
                 if not contract_address:
                     continue
@@ -2815,10 +2782,10 @@ async def fetch_latest_token() -> List[Dict[str, Any]]:
                     'description': token_data.get('description', ''),
                     'openGraph': token_data.get('openGraph', '')
                 })
-                result_tokens.append(token)
+                solana_tokens.append(token)
             
-            logger.info(f"Fetched {len(result_tokens)} recent Solana tokens")
-            return result_tokens
+            logger.info(f"Fetched {len(solana_tokens)} Solana tokens")
+            return solana_tokens
         
         except Exception as e:
             logger.error(f"Error fetching latest tokens: {str(e)}")
@@ -2852,31 +2819,23 @@ def format_token_message(token: Dict[str, Any]) -> str:
         f"[📊 View Chart]({token.get('dexscreener_url', '')})"
     )
 
+# Modified update_token_info function
 async def update_token_info(context):
-    """Periodic job to update token information for a user"""
     user_id = context.job.user_id
     logger.info(f"⏰ Token update job started for user {user_id} at {datetime.now()}")
     
     try:
-        user = db.users.find_one({'user_id': user_id})
+        user = users_collection.find_one({'user_id': user_id})
         if not user:
             logger.info(f"User {user_id} not found in database")
-            context.job.schedule_removal()
             return
             
-        logger.debug(f"Subscription status for user {user_id}: {user.get('subscription_status')}")
         if not await check_subscription(user_id):
             logger.info(f"User {user_id} subscription inactive")
-            context.job.schedule_removal()
             return
         
         if not user.get('solana') or not user['solana'].get('public_key'):
             logger.info(f"User {user_id} has no wallet set up")
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="🚫 Please set up your wallet first using /start or /set_wallet to receive token updates."
-            )
-            context.job.schedule_removal()
             return
 
         current_time = time.time()
@@ -2887,17 +2846,21 @@ async def update_token_info(context):
         logger.info(f"🔍 Fetching tokens for user {user_id}")
         tokens = await fetch_latest_token()
         if not tokens:
-            logger.warning("No new tokens fetched")
+            logger.warning("No tokens fetched")
             return
             
-        for token in tokens:
+        posted_tokens = user.get('posted_tokens', [])
+        new_tokens = [t for t in tokens if t['contract_address'] not in posted_tokens]
+        
+        if not new_tokens:
+            logger.info(f"No new tokens for user {user_id}")
+            return
+            
+        # Limit to 5 tokens per run to avoid flooding
+        for token in new_tokens[:5]:
             logger.info(f"Processing token: {token['name']} ({token['contract_address']})")
             
-            if token['contract_address'] in user.get('posted_tokens', []):
-                logger.debug(f"User {user_id} already saw token {token['contract_address']}")
-                continue
-
-             # ⭐ NEW: Record token performance before sending notification
+            # Record token performance
             await record_token_performance(token)
 
             message = format_token_message(token)
@@ -2935,24 +2898,12 @@ async def update_token_info(context):
                     reply_markup=reply_markup
                 )
             
-            try:
-                db.global_posted_tokens.insert_one({
-                    'contract_address': token['contract_address'],
-                    'timestamp': datetime.now(),
-                    'name': token.get('name', ''),
-                    'symbol': token.get('symbol', '')
-                })
-                
-                db.users.update_one(
-                    {'user_id': user_id},
-                    {
-                        '$set': {'last_api_call': current_time},
-                        '$addToSet': {'posted_tokens': token['contract_address']}
-                    }
-                )
-                logger.info(f"Token records updated for {token['contract_address']}")
-            except Exception as e:
-                logger.error(f"Error updating token records for {token['contract_address']}: {str(e)}")
+            # Add to user's posted tokens
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'posted_tokens': token['contract_address']}}
+            )
+            logger.info(f"Added token {token['contract_address']} to user {user_id}'s posted tokens")
             
             if user.get('trading_mode') == 'automatic':
                 await auto_trade(context, user_id, token)
