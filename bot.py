@@ -425,34 +425,35 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
             
         elif private_key:
-            # Private key handling for Solana
             if private_key.startswith('0x'):
                 # Ethereum/BSC private key
                 account = Account.from_key(private_key)
                 eth_address = account.address
                 eth_private_key = private_key
                 
-                # Create Solana keypair from the same seed using proper derivation
-                # This isn't directly possible, so we'll generate new but warn user
-                logger.warning("ETH private key provided - generating new Solana wallet")
-                seed = os.urandom(32)
-                derivation_path = "m/44'/501'/0'"
-                private_key_bytes = key_from_seed(seed, derivation_path)
-                solana_keypair = Keypair.from_bytes(private_key_bytes)
+                # FIXED: Generate Solana keypair PROPERLY from seed
+                new_seed = os.urandom(32)
+                solana_keypair = Keypair.from_seed(new_seed)  # Use from_seed for 32-byte seeds
                 solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
-            else:
-                # Solana private key
-                key_bytes = base58.b58decode(private_key)
-                if len(key_bytes) != 64:
-                    raise ValueError("Invalid Solana private key length")
-                solana_keypair = Keypair.from_bytes(key_bytes)
-                solana_private_key = private_key
                 
-                # Create new ETH wallet since we can't derive from Solana key
-                logger.warning("SOL private key provided - generating new ETH wallet")
-                account = Account.create()
-                eth_address = account.address
-                eth_private_key = account.key.hex()
+            else:
+                # Handle Solana private key
+                key_bytes = base58.b58decode(private_key)
+                if len(key_bytes) == 64:
+                    # Valid 64-byte keypair
+                    solana_keypair = Keypair.from_bytes(key_bytes)
+                    solana_private_key = private_key
+                elif len(key_bytes) == 32:
+                    # Handle 32-byte seeds CORRECTLY
+                    solana_keypair = Keypair.from_seed(key_bytes)  # Use from_seed
+                    solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
+                else:
+                    raise ValueError("Invalid Solana private key length")
+
+                # Create new ETH wallet
+                eth_account = Account.create()
+                eth_address = eth_account.address
+                eth_private_key = eth_account.key.hex()
         else:
             raise ValueError("Must provide either mnemonic or private key")
 
@@ -1766,6 +1767,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return INPUT_MNEMONIC
     
 async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle private key input for wallet import"""
     user_id = update.effective_user.id
     private_key = update.message.text.strip()
     log_user_action(user_id, "PRIVATE_KEY_RECEIVED")
@@ -1783,28 +1785,34 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         # Validate the private key format
         key_type = None
-        if not private_key.startswith('0x'):
-            try:
-                # Try to decode as Solana private key (base58)
-                key_bytes = base58.b58decode(private_key)
-                if len(key_bytes) == 64:
-                    key_type = 'solana'
-                else:
-                    raise ValueError("Invalid Solana private key length")
-            except:
-                # Try to decode as ETH/BSC private key (hex)
-                private_key = '0x' + private_key
-                key_bytes = bytes.fromhex(private_key[2:])
-                if len(key_bytes) == 32:
-                    key_type = 'ethereum'
-                else:
-                    raise ValueError("Invalid Ethereum private key length")
-        else:
+        if private_key.startswith('0x'):
+            # Ethereum/BSC private key (hex format)
             key_bytes = bytes.fromhex(private_key[2:])
             if len(key_bytes) == 32:
                 key_type = 'ethereum'
             else:
                 raise ValueError("Invalid Ethereum private key length")
+        else:
+            try:
+                # Try to decode as Solana private key (base58)
+                key_bytes = base58.b58decode(private_key)
+                if len(key_bytes) == 64:
+                    key_type = 'solana'  # Full 64-byte keypair
+                elif len(key_bytes) == 32:
+                    key_type = 'solana_seed'  # 32-byte seed
+                else:
+                    raise ValueError("Invalid Solana key length (must be 32 or 64 bytes)")
+            except:
+                # Try to decode as ETH/BSC private key without 0x prefix
+                try:
+                    key_bytes = bytes.fromhex(private_key)
+                    if len(key_bytes) == 32:
+                        key_type = 'ethereum'
+                        private_key = '0x' + private_key  # Add 0x prefix
+                    else:
+                        raise ValueError("Invalid Ethereum key length")
+                except:
+                    raise ValueError("Could not decode as Solana (base58) or ETH/BSC (hex)")
                 
         log_user_action(user_id, "VALID_PRIVATE_KEY_RECEIVED", f"Type: {key_type}")
         
@@ -1812,7 +1820,7 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data['key_type'] = key_type
 
         user = users_collection.find_one({'user_id': user_id})
-        if user and user.get('solana', {}).get('public_key'):
+        if user and user.get('solana') and user['solana'].get('public_key'):
             # Existing wallet found - confirm overwrite
             log_user_action(user_id, "WALLET_EXISTS_CONFIRM_OVERWRITE")
             keyboard = [
@@ -1824,11 +1832,12 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             eth_bsc_address = user['eth']['address'] if user.get('eth') else "Not set"
             confirm_msg = await update.message.reply_text(
                 f"⚠️ You already have a wallet:\n"
-                f"🔑 Solana: {user['solana']['public_key']}\n"
-                f"🌐 ETH/BSC: {eth_bsc_address}\n\n"
+                f"🔑 Solana: `{user['solana']['public_key']}`\n"
+                f"🌐 ETH/BSC: `{eth_bsc_address}`\n\n"
                 "Importing this wallet will overwrite the existing one.\n"
                 "Are you sure you want to continue?",
-                reply_markup=reply_markup
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
             )
             # Delete confirmation message after 2 minutes
             context.job_queue.run_once(
@@ -1841,47 +1850,60 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             # No existing wallet - proceed directly
             log_user_action(user_id, "WALLET_IMPORT_START")
             user_data = await set_user_wallet(user_id, private_key=private_key)
-            update_result = users_collection.update_one(
-            {'user_id': user_id},
-            {'$set': user_data},
-            upsert=True
-        )
-        
-        # Properly log the update result
-            logger.info(f"Database update - matched: {update_result.matched_count}, "
-                   f"modified: {update_result.modified_count}, "
-                   f"upserted_id: {update_result.upserted_id}")
             
-           
-            eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
+            # Save to database
+            update_result = users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': user_data},
+                upsert=True
+            )
+            
+            # Verify save was successful
+            db_user = users_collection.find_one({'user_id': user_id})
+            if not db_user or not db_user.get('solana') or not db_user['solana'].get('public_key'):
+                raise RuntimeError("Wallet not saved to database")
+            
+            eth_bsc_address = db_user['eth']['address'] if db_user.get('eth') else "Not set"
             
             success_msg = await update.message.reply_text(
                 f"✅ *Wallet Imported Successfully!*\n\n"
-                f"🔑 *Solana Address*: `{user_data['solana']['public_key']}`\n"
-                f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
-                f"🚀 You're all set! The bot will now start sending you token alerts.\n"
-                f"Use /trade to manually trade tokens or /setmode to configure auto-trading.",
+                f"🔑 Solana Address: `{db_user['solana']['public_key']}`\n"
+                f"🌐 ETH/BSC Address: `{eth_bsc_address}`\n\n"
+                f"🚀 You're all set! The bot will now start sending you token alerts.",
                 parse_mode='Markdown'
             )
             
             log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
 
-        if context.user_data.get('is_start_flow', False):
-        # This should never happen but just in case
-         return await start_input_private_key(update, context)
-            
             # Start token updates
-        await start_token_updates(context, user_id)
-        return ConversationHandler.END
+            await start_token_updates(context, user_id)
+            return ConversationHandler.END
             
     except Exception as e:
         logger.error(f"Error in input_private_key for user {user_id}: {str(e)}")
         log_user_action(user_id, "WALLET_IMPORT_ERROR", f"Error: {str(e)}", "error")
+        
+        # Create user-friendly error message
+        if "32 bytes" in str(e):
+            error_details = (
+                "For ETH/BSC: Must be 32-byte hex key (64 hex characters)\n"
+                "Example: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+            )
+        elif "64 bytes" in str(e):
+            error_details = (
+                "For Solana: Must be 64-byte keypair (base58) OR 32-byte seed\n"
+                "Example keypair: 5H1eQz1R1g4HqQVQZz4fQeTzLd7pN7J8W7J8Z7Y7c7a7b7c7d7e7f7g7h7i7j7k7l7m7n7o7p7q7r\n"
+                "Example seed: 5H1eQz1R1g4HqQVQZz4fQeTzLd7pN7J8W7J8Z7Y7c7a7b7c7d7e7f7g7h"
+            )
+        else:
+            error_details = "Please check the format and try again"
+            
         error_msg = await update.message.reply_text(
             f"❌ Invalid private key: {str(e)}\n\n"
-            "Please enter a valid:\n"
-            "- Solana private key (base58 encoded, 64 bytes)\n"
-            "- ETH/BSC private key (hex encoded, 32 bytes with or without 0x prefix)\n\n"
+            "Valid formats:\n"
+            "1. Solana (64-byte keypair or 32-byte seed): Base58 encoded\n"
+            "2. ETH/BSC (32-byte key): Hex with or without 0x prefix\n\n"
+            f"{error_details}\n\n"
             "Try again or use /cancel to abort."
         )
         # Delete error message after 1 minute
@@ -1891,7 +1913,6 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             user_id=user_id
         )
         return INPUT_PRIVATE_KEY
-
 async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Confirm wallet import"""
     query = update.callback_query
