@@ -160,6 +160,11 @@ async def telegram_webhook(request: Request):
             status_code=500
         )
 
+@app.get("/debug/address")
+async def debug_address(mnemonic: str):
+    keypair = derive_solana_keypair_from_mnemonic(mnemonic)
+    return {"address": str(keypair.pubkey())}
+
 # MongoDB setup with retry logic
 MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
@@ -396,20 +401,7 @@ async def get_subscription_status_message(user: dict) -> str:
         return "❌ No active subscription. Use /subscribe to start."
 
 
-def test_address_generation():
-    """Test Solana address generation matches standard wallets"""
-    test_mnemonic = "your test mnemonic here"  # Use your actual mnemonic
-    expected_address = "Axn4Z584Q8JHH1ABKrS76rtPX395copEKwYiQnGhTGy7"
-    
-    keypair = derive_solana_keypair_from_mnemonic(test_mnemonic)
-    actual_address = str(keypair.pubkey())
-    
-    print(f"Expected: {expected_address}")
-    print(f"Actual:   {actual_address}")
-    print(f"Match:    {expected_address == actual_address}")
 
-# Run test
-test_address_generation()
 
 # Update the set_user_wallet function with proper derivation paths
 async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None) -> dict:
@@ -437,8 +429,6 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
             
             logger.info(f"🔐 Derived Solana address: {solana_keypair.pubkey()}")
-            
-        
             
         elif private_key:
             # Private key handling for Solana
@@ -510,14 +500,9 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
 
 def derive_solana_keypair_from_mnemonic(mnemonic: str, passphrase: str = "", account: int = 0) -> Keypair:
     """Derive Solana keypair using BIP-44 standard with SLIP-0010 for ed25519"""
-    # Create BIP44 wallet
     wallet = Wallet(mnemonic, passphrase)
-    
-    # Derive path: m/44'/501'/{account}'/0' (Phantom/Exodus standard)
     path = f"m/44'/501'/{account}'/0'"
     private_key = wallet.get_private_key(path)
-    
-    # Convert to Solana keypair
     return Keypair.from_seed(private_key[:32])
     
 
