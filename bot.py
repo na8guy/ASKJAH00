@@ -2821,9 +2821,14 @@ async def fetch_latest_token() -> List[Dict[str, Any]]:
         except Exception as e:
             logger.error(f"Error fetching latest tokens: {str(e)}")
             return []
+        
+def escape_markdown(text: str) -> str:
+    """Escape Markdown special characters for Telegram messages"""
+    escape_chars = r'\_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
 def format_token_message(token: Dict[str, Any]) -> str:
-    """Format token information into a message"""
+    """Format token information into a message with escaped Markdown"""
     platform_icons = {
         'telegram': '📢',
         'twitter': '🐦',
@@ -2832,22 +2837,37 @@ def format_token_message(token: Dict[str, Any]) -> str:
         'medium': '✍️'
     }
     
+    # Escape all dynamic content
+    name = escape_markdown(token.get('name', 'New Token'))
+    symbol = escape_markdown(token.get('symbol', 'TOKEN'))
+    contract_address = escape_markdown(token.get('contract_address', ''))
+    description = escape_markdown(token.get('description', 'No description available'))
+    
+    # Format numbers safely
+    price = f"{token.get('price_usd', 0):.6f}"
+    market_cap = f"{token.get('market_cap', 0):,.2f}"
+    liquidity = f"{token.get('liquidity', 0):,.2f}"
+    volume = f"{token.get('volume', 0):,.2f}"
+    
     social_links = ""
     if token.get('socials'):
         for platform, url in token['socials'].items():
             icon = platform_icons.get(platform.lower(), '🔗')
-            social_links += f"{icon} [{platform.capitalize()}]({url})\n"
+            platform_text = escape_markdown(platform.capitalize())
+            social_links += f"{icon} [{platform_text}]({url})\n"
+    
+    dexscreener_url = token.get('dexscreener_url', '')
     
     return (
-        f"🚀 *{token.get('name', 'New Token')} ({token.get('symbol', 'TOKEN')})*\n\n"
-        f"💵 *Price:* ${token.get('price_usd', 0):.6f}\n"
-        f"📊 *Market Cap:* ${token.get('market_cap', 0):,.2f}\n"
-        f"💧 *Liquidity:* ${token.get('liquidity', 0):,.2f}\n"
-        f"📈 *24h Volume:* ${token.get('volume', 0):,.2f}\n\n"
-        f"🔗 *Contract:* `{token.get('contract_address', '')}`\n"
-        f"📝 *Description:* {token.get('description', 'No description available')}\n\n"
+        f"🚀 *{name} ({symbol})*\n\n"
+        f"💵 *Price:* ${price}\n"
+        f"📊 *Market Cap:* ${market_cap}\n"
+        f"💧 *Liquidity:* ${liquidity}\n"
+        f"📈 *24h Volume:* ${volume}\n\n"
+        f"🔗 *Contract:* `{contract_address}`\n"
+        f"📝 *Description:* {description}\n\n"
         f"🔗 *Links:*\n{social_links or 'No links available'}\n"
-        f"[📊 View Chart]({token.get('dexscreener_url', '')})"
+        f"[📊 View Chart]({dexscreener_url})"
     )
 
 # Modified update_token_info function
