@@ -498,7 +498,7 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
     
 
 
-def derive_solana_keypair_from_mnemonic(mnemonic: str, passphrase: str = "", account: int = 0) -> Keypair:
+def derive_solana_keypair_from_mnemonic(mnemonic: str, passphrase: str = "") -> Keypair:
     """Derive Solana keypair using BIP-44 standard with SLIP-0010 for ed25519"""
     mnemo = Mnemonic("english")
     
@@ -515,15 +515,14 @@ def derive_solana_keypair_from_mnemonic(mnemonic: str, passphrase: str = "", acc
         language="english"
     )
     
-    # Derive path: m/44'/501'/{account}'/0' (Phantom/Exodus standard)
-    path = f"m/44'/501'/{account}'/0'"
+    # Derive path: m/44'/501'/0'/0' (Phantom/Exodus standard)
+    path = "m/44'/501'/0'/0'"
     
-    # Use derive_path method which returns (private_key_hex, public_key_hex)
-    private_key_hex, _ = wallet.derive_path(path)
+    # Use the correct method to derive the private key
+    private_key = wallet.get_private_key(path)
     
-    # Convert hex to bytes and get first 32 bytes for seed
-    private_key_bytes = bytes.fromhex(private_key_hex)
-    return Keypair.from_seed(private_key_bytes[:32])
+    # Convert to Solana keypair
+    return Keypair.from_seed(private_key[:32])
 
 async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
     """Decrypt sensitive wallet information for a user"""
