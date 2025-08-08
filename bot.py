@@ -509,8 +509,12 @@ def derive_solana_keypair_from_mnemonic(mnemonic: str, passphrase: str = "", acc
     
     seed = mnemo.to_seed(mnemonic, passphrase)
     
-    # Create BIP44 wallet with explicit language
-    wallet = Wallet(mnemonic, passphrase, language="english")
+    # FIX: Use keyword arguments to avoid parameter conflict
+    wallet = Wallet(
+        mnemonic=mnemonic,
+        passphrase=passphrase,
+        language="english"
+    )
     
     # Derive path: m/44'/501'/{account}'/0' (Phantom/Exodus standard)
     path = f"m/44'/501'/{account}'/0'"
