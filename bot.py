@@ -3537,6 +3537,7 @@ async def setup_bot():
         commands = [
             BotCommand("start", "Start the bot and create or view wallet"),
             BotCommand("subscribe", "Subscribe to use trading features"),
+            BotCommand("token_analysis", "Analyze performance of a specific token"),
             BotCommand("generate_wallet", "Generate a new wallet"),
             BotCommand("set_wallet", "Import an existing wallet"),
             BotCommand("fetch_tokens", "Manually fetch new tokens (requires wallet)"),
