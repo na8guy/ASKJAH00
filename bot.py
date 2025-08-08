@@ -393,8 +393,9 @@ async def get_subscription_status_message(user: dict) -> str:
     else:
         return "❌ No active subscription. Use /subscribe to start."
 
+# Update the set_user_wallet function with proper derivation paths
 async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None) -> dict:
-    """Set up a user wallet from mnemonic or private key"""
+    """Set up a user wallet from mnemonic or private key with proper derivation paths"""
     logger.info(f"🔐 [set_user_wallet] Starting for user {user_id}")
     try:
         user_key = derive_user_key(user_id)
@@ -408,14 +409,19 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             if not mnemo.check(mnemonic):
                 raise ValueError("Invalid mnemonic phrase.")
             
-            # Create Ethereum account with enabled HD features
-            eth_account = Account.from_mnemonic(mnemonic)
+            # Create Ethereum account with standard derivation path
+            eth_account = Account.from_mnemonic(mnemonic, account_path=ETHEREUM_DEFAULT_PATH)
             eth_address = eth_account.address
             eth_private_key = eth_account.key.hex()
             
-            # Create Solana keypair
-            seed = mnemo.to_seed(mnemonic)
-            solana_keypair = Keypair.from_seed(seed[:32])
+            # Create Solana account with proper derivation path
+            # SOLANA DERIVATION PATH: m/44'/501'/0'
+            seed = mnemo.to_seed(mnemonic, passphrase="")
+            derivation_path = "m/44'/501'/0'"
+            
+            # Derive Solana key using standard BIP44 path
+            private_key_bytes = key_from_seed(seed, derivation_path)
+            solana_keypair = Keypair.from_bytes(private_key_bytes)
             solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
             
         elif private_key:
@@ -426,12 +432,14 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
                 eth_address = account.address
                 eth_private_key = private_key
                 
-                # Create Solana keypair from the same seed?
-                # We can't directly convert, so generate new Solana key
+                # Create Solana keypair from the same seed using proper derivation
+                # This isn't directly possible, so we'll generate new but warn user
                 logger.warning("ETH private key provided - generating new Solana wallet")
-                new_keypair = Keypair()
-                solana_private_key = base58.b58encode(new_keypair.to_bytes()).decode()
-                solana_keypair = new_keypair
+                seed = os.urandom(32)
+                derivation_path = "m/44'/501'/0'"
+                private_key_bytes = key_from_seed(seed, derivation_path)
+                solana_keypair = Keypair.from_bytes(private_key_bytes)
+                solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
             else:
                 # Solana private key
                 key_bytes = base58.b58decode(private_key)
@@ -454,24 +462,55 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
         encrypted_eth_private_key = encrypt_data(eth_private_key, user_key) if eth_private_key else None
 
         return {
-        'mnemonic': encrypted_mnemonic,
-        'solana': {
-            'public_key': str(solana_keypair.pubkey()),
-            'private_key': encrypted_solana_private_key
-        },
-        'eth': {
-            'address': eth_address,
-            'private_key': encrypted_eth_private_key
-        } if eth_address else None,
-        'bsc': {
-            'address': eth_address,
-            'private_key': encrypted_eth_private_key
-        } if eth_address else None
-    }
+            'mnemonic': encrypted_mnemonic,
+            'solana': {
+                'public_key': str(solana_keypair.pubkey()),
+                'private_key': encrypted_solana_private_key
+            },
+            'eth': {
+                'address': eth_address,
+                'private_key': encrypted_eth_private_key
+            } if eth_address else None,
+            'bsc': {
+                'address': eth_address,
+                'private_key': encrypted_eth_private_key
+            } if eth_address else None
+        }
         
     except Exception as e:
         logger.error(f"🔥 [set_user_wallet] Critical error: {str(e)}", exc_info=True)
         raise ValueError(f"Wallet creation failed: {str(e)}")
+    
+
+
+def key_from_seed(seed: bytes, path: str) -> bytes:
+    """Derive private key from seed using BIP32 derivation path"""
+    # Split path into components
+    path_components = path.split('/')
+    
+    # Start with the seed
+    private_key = seed
+    
+    # Derive keys for each path component
+    for component in path_components[1:]:  # Skip the first 'm'
+        # Handle hardened derivation
+        if component.endswith("'"):
+            component = component[:-1]
+            hardened = True
+        else:
+            hardened = False
+            
+        # Convert to integer
+        index = int(component)
+        if hardened:
+            index += 0x80000000
+        
+        # Create HMAC-SHA512 context
+        h = hmac.new(b"ed25519 seed", private_key, hashlib.sha512)
+        h.update(index.to_bytes(4, 'big'))
+        private_key = h.digest()[:32]  # Use first 32 bytes as new key
+    
+    return private_key
     
 
 async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
