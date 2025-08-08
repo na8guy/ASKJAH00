@@ -100,7 +100,7 @@ def log_user_action(user_id: int, action: str, details: str = "", level: str = "
 load_dotenv()
 
 # Constants
-SUBSCRIPTION_SOL_AMOUNT = 5.0
+SUBSCRIPTION_SOL_AMOUNT = 0.1
 PBKDF2_ROUNDS = 2048
 GMGN_API_HOST = 'https://gmgn.ai'
 DEXSCREENER_NEW_TOKENS_API = "https://api.dexscreener.com/token-profiles/latest/v1"
@@ -3400,10 +3400,10 @@ def setup_handlers(application: Application):
 
     # Set wallet handler (import)
     set_wallet_handler = ConversationHandler(
-        entry_points=[CommandHandler("setwallet", wrap_conversation_entry(set_wallet))],
+        entry_points=[CommandHandler("set_wallet", wrap_conversation_entry(set_wallet))],
         states={
             SET_WALLET_METHOD: [CallbackQueryHandler(wrap_conversation_state(set_wallet_method), 
-                               pattern='^(mnemonic|private_key)$')],
+                               pattern='^(mnemonic|private_key|cancel_import)$')],
             INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
                                          wrap_conversation_state(input_mnemonic))],
             INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
@@ -3412,15 +3412,7 @@ def setup_handlers(application: Application):
                                  pattern='^(confirm_set_wallet|cancel_set_wallet)$')]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,
-        # Add map_to_parent to handle state transitions properly
-        map_to_parent={
-            ConversationHandler.END: ConversationHandler.END,
-            SET_WALLET_METHOD: SET_WALLET_METHOD,
-            INPUT_MNEMONIC: INPUT_MNEMONIC,
-            INPUT_PRIVATE_KEY: INPUT_PRIVATE_KEY,
-            CONFIRM_SET_WALLET: CONFIRM_SET_WALLET
-        }
+        per_message=False
     )
     application.add_handler(set_wallet_handler)
 
