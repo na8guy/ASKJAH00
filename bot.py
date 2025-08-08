@@ -60,6 +60,8 @@ from eth_account.hdaccount import ETHEREUM_DEFAULT_PATH
 from eth_account.hdaccount import generate_mnemonic
 from eth_account.hdaccount import key_from_seed
 from pymongo import UpdateOne, ReplaceOne
+from bip44 import Wallet
+from bip44.utils import get_eth_addr
 
 
 # FastAPI setup
@@ -393,6 +395,22 @@ async def get_subscription_status_message(user: dict) -> str:
     else:
         return "❌ No active subscription. Use /subscribe to start."
 
+
+def test_address_generation():
+    """Test Solana address generation matches standard wallets"""
+    test_mnemonic = "your test mnemonic here"  # Use your actual mnemonic
+    expected_address = "Axn4Z584Q8JHH1ABKrS76rtPX395copEKwYiQnGhTGy7"
+    
+    keypair = derive_solana_keypair_from_mnemonic(test_mnemonic)
+    actual_address = str(keypair.pubkey())
+    
+    print(f"Expected: {expected_address}")
+    print(f"Actual:   {actual_address}")
+    print(f"Match:    {expected_address == actual_address}")
+
+# Run test
+test_address_generation()
+
 # Update the set_user_wallet function with proper derivation paths
 async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None) -> dict:
     """Set up a user wallet from mnemonic or private key with proper derivation paths"""
@@ -400,7 +418,6 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
     try:
         user_key = derive_user_key(user_id)
         
-        # Inside set_user_wallet function, in the mnemonic section:
         if mnemonic:
             mnemo = Mnemonic("english")
             word_count = len(mnemonic.split())
@@ -410,23 +427,16 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             if not mnemo.check(mnemonic):
                 raise ValueError("Invalid mnemonic phrase.")
             
-            # Create Ethereum account with standard derivation path
+            # Create Ethereum account
             eth_account = Account.from_mnemonic(mnemonic, account_path=ETHEREUM_DEFAULT_PATH)
             eth_address = eth_account.address
             eth_private_key = eth_account.key.hex()
             
-            # Create Solana account with proper derivation path
-            seed = mnemo.to_seed(mnemonic, passphrase="")
-            
-            # CORRECTED DERIVATION PATH
-            derivation_path = "m/44'/501'/0'/0'"
-            
-            # Derive Solana key using standard BIP44 path
-            private_key_bytes = key_from_seed(seed, derivation_path)
-            
-            # FIXED: Use from_seed for 32-byte inputs
-            solana_keypair = Keypair.from_seed(private_key_bytes[:32])
+            # Create Solana account using standard derivation
+            solana_keypair = derive_solana_keypair_from_mnemonic(mnemonic)
             solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
+            
+        
             
         elif private_key:
             # Private key handling for Solana
@@ -496,34 +506,17 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
     
 
 
-def key_from_seed(seed: bytes, path: str) -> bytes:
-    """Derive private key from seed using BIP32 derivation (SLIP-0010)"""
-    # Split path into components
-    path_components = path.split('/')
+def derive_solana_keypair_from_mnemonic(mnemonic: str, passphrase: str = "", account: int = 0) -> Keypair:
+    """Derive Solana keypair using BIP-44 standard with SLIP-0010 for ed25519"""
+    # Create BIP44 wallet
+    wallet = Wallet(mnemonic, passphrase)
     
-    # Start with the seed
-    private_key = seed
+    # Derive path: m/44'/501'/{account}'/0'
+    path = f"m/44'/501'/{account}'/0'"
+    private_key = wallet.get_private_key(path)
     
-    # Derive keys for each path component
-    for component in path_components[1:]:  # Skip the first 'm'
-        # Handle hardened derivation
-        if component.endswith("'"):
-            component = component[:-1]
-            hardened = True
-        else:
-            hardened = False
-            
-        # Convert to integer
-        index = int(component)
-        if hardened:
-            index += 0x80000000
-        
-        # Create HMAC-SHA512 context
-        h = hmac.new(b"ed25519 seed", private_key, hashlib.sha512)
-        h.update(index.to_bytes(4, 'big'))
-        private_key = h.digest()[:32]  # Use first 32 bytes as new key
-    
-    return private_key
+    # Convert to Solana keypair
+    return Keypair.from_seed(private_key[:32])
     
 
 async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
