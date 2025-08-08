@@ -1093,13 +1093,8 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
         posted_tokens = user.get('posted_tokens', [])
         new_tokens = [t for t in tokens if t['contract_address'] not in posted_tokens]
         
-        if not new_tokens:
-            await update.message.reply_text("🔍 No new tokens available that you haven't seen.")
-            return
-            
-        sent_any = False
-        # Limit to 20 tokens for manual fetch
-        for token in new_tokens[:20]:
+        if new_tokens:
+            token = new_tokens[0]  # Take the most recent unseen token
             # Record token performance
             await record_token_performance(token)
 
@@ -1127,7 +1122,6 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
                         parse_mode='Markdown',
                         reply_markup=reply_markup
                     )
-                sent_any = True
             except Exception as e:
                 logger.error(f"Error sending token {token['contract_address']}: {str(e)}")
                 await update.message.reply_text(
@@ -1135,7 +1129,6 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
                     parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
-                sent_any = True
             
             # Add to user's posted tokens
             users_collection.update_one(
@@ -1146,8 +1139,7 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
                 }
             )
             logger.info(f"Added token {token['contract_address']} to user {user_id}'s posted tokens")
-        
-        if not sent_any:
+        else:
             await update.message.reply_text("🔍 No new tokens available that you haven't seen.")
             
     except Exception as e:
@@ -2852,15 +2844,11 @@ async def update_token_info(context):
         posted_tokens = user.get('posted_tokens', [])
         new_tokens = [t for t in tokens if t['contract_address'] not in posted_tokens]
         
-        if not new_tokens:
-            logger.info(f"No new tokens for user {user_id}")
-            return
-            
-        # Limit to 5 tokens per run to avoid flooding
-        for token in new_tokens[:5]:
+        if new_tokens:
+            token = new_tokens[0]  # Take the most recent unseen token
             logger.info(f"Processing token: {token['name']} ({token['contract_address']})")
             
-            # Record token performance
+            # Record token performance globally
             await record_token_performance(token)
 
             message = format_token_message(token)
