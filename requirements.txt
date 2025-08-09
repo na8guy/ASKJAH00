@@ -8,11 +8,10 @@ cryptography
 fastapi==0.110.0
 uvicorn==0.29.0
 gunicorn==21.2.0
-solana
+solana==0.34.3
 solders
 web3
 python-dotenv
 structlog
 bip44
-bip32utils
-bip-utils
+bip-utils==2.9.3
