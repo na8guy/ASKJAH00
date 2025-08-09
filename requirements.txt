@@ -14,3 +14,4 @@ web3
 python-dotenv
 structlog
 bip44
+bip32utils

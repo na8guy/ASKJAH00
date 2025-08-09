@@ -61,6 +61,7 @@ from eth_account.hdaccount import generate_mnemonic
 from eth_account.hdaccount import key_from_seed
 from pymongo import UpdateOne, ReplaceOne
 from bip44 import Wallet
+from bip32utils import BIP32Key, BIP32_HARDEN
 
 
 
@@ -424,27 +425,29 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             eth_address = eth_account.address
             eth_private_key = eth_account.key.hex()
             
-            # Create Solana account with Phantom-compatible derivation path
-            wallet = Wallet(mnemonic)
-            solana_private_key_bytes, _ = wallet.derive_account('sol', 0)  # Index 0 for first account
+            # Create Solana account with direct BIP-32 derivation
+            seed = mnemo.to_seed(mnemonic)
+            root = BIP32Key.fromEntropy(seed)
+            # Derive Solana path: m/44'/501'/0'
+            solana_key = (root
+                         .ChildKey(44 + BIP32_HARDEN)
+                         .ChildKey(501 + BIP32_HARDEN)
+                         .ChildKey(0 + BIP32_HARDEN))
+            solana_private_key_bytes = solana_key.PrivateKey()
             solana_keypair = Keypair.from_seed(solana_private_key_bytes[:32])
             solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
             
         elif private_key:
-            # Private key handling
+            # Private key handling (unchanged)
             if private_key.startswith('0x'):
-                # Ethereum/BSC private key
                 account = Account.from_key(private_key)
                 eth_address = account.address
                 eth_private_key = private_key
-                
-                # Generate new Solana wallet (as ETH key can't derive Solana directly)
                 new_seed = os.urandom(32)
                 solana_keypair = Keypair.from_seed(new_seed)
                 solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
                 logger.warning("ETH private key provided - generated new Solana wallet")
             else:
-                # Solana private key
                 key_bytes = base58.b58decode(private_key)
                 if len(key_bytes) == 64:
                     solana_keypair = Keypair.from_bytes(key_bytes)
@@ -454,8 +457,6 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
                     solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
                 else:
                     raise ValueError("Invalid Solana private key length")
-                
-                # Generate new ETH wallet (as Solana key can't derive ETH directly)
                 account = Account.create()
                 eth_address = account.address
                 eth_private_key = account.key.hex()
