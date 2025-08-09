@@ -16,4 +16,3 @@ structlog
 bip44
 bip32utils
 bip-utils
-solana-py
