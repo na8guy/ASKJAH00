@@ -62,8 +62,9 @@ from eth_account.hdaccount import key_from_seed
 from pymongo import UpdateOne, ReplaceOne
 from bip44 import Wallet
 from bip32utils import BIP32Key, BIP32_HARDEN
-from bip_utils import Bip39SeedGenerator, Bip32Slip10Ed25519
+from bip_utils import Bip32Slip10Ed25519
 from solders.keypair import Keypair
+from bip_utils import Bip39MnemonicValidator, Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 
 
 
@@ -408,115 +409,69 @@ async def get_subscription_status_message(user: dict) -> str:
 
 # Update the set_user_wallet function with proper derivation paths
 async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None) -> dict:
-    """
-    Set up a user wallet from mnemonic or private key with proper derivation paths.
-    Returns a dict like:
-    {
-      'mnemonic': encrypted_mnemonic,
-      'solana': {'public_key': <base58>, 'private_key': <encrypted base58 64-bytes secret>},
-      'eth': {'address': <0x...>, 'private_key': <encrypted 0x...>} or None,
-      'bsc': same as eth (kept for compatibility)
-    }
-    """
+    """Set up a user wallet from mnemonic or private key with proper derivation paths"""
     logger.info(f"🔐 [set_user_wallet] Starting for user {user_id}")
     try:
         user_key = derive_user_key(user_id)
-
-        eth_address = None
-        eth_private_key = None
-        solana_keypair = None
-
-        # ---------- If mnemonic provided ----------
+        
         if mnemonic:
-            mnemo = Mnemonic("english")
-            word_count = len(mnemonic.split())
-            if word_count not in (12, 24):
-                raise ValueError(f"Invalid mnemonic length: {word_count} words (must be 12 or 24)")
-
-            if not mnemo.check(mnemonic):
+            # Validate mnemonic
+            if not Bip39MnemonicValidator().IsValid(mnemonic):
                 raise ValueError("Invalid mnemonic phrase.")
-
-            # ETH account from mnemonic (uses ETHEREUM_DEFAULT_PATH from your imports)
-            try:
-                eth_account = Account.from_mnemonic(mnemonic, account_path=ETHEREUM_DEFAULT_PATH)
-                eth_address = eth_account.address
-                # Account.from_mnemonic sets .key (bytes) on some versions; fallback to derive via from_key if needed
-                eth_private_key = getattr(eth_account, "key", None)
-                if eth_private_key is None:
-                    # try using key_from_seed if available in your codebase; else fallback to create from mnemonic then export key
-                    eth_private_key = eth_account.key.hex() if hasattr(eth_account, "key") else None
-                if isinstance(eth_private_key, bytes):
-                    eth_private_key = "0x" + eth_private_key.hex()
-            except Exception as e:
-                # Non-fatal: continue, but log
-                logger.warning(f"[set_user_wallet] ETH derivation from mnemonic failed: {e}")
-
-            # SOLANA keypair via correct derivation function (SLIP-0010 ed25519)
-            solana_keypair = derive_solana_keypair_from_mnemonic(mnemonic)
-            if solana_keypair is None:
-                raise ValueError("Failed to derive Solana keypair from mnemonic.")
-
-        # ---------- If private_key provided (either ETH hex or Solana base58) ----------
+            
+            word_count = len(mnemonic.split())
+            if word_count not in [12, 24]:
+                raise ValueError(f"Invalid mnemonic length: {word_count} words (must be 12 or 24)")
+            
+            # Create Ethereum account with standard derivation path
+            eth_account = Account.from_mnemonic(mnemonic, account_path=ETHEREUM_DEFAULT_PATH)
+            eth_address = eth_account.address
+            eth_private_key = eth_account.key.hex()
+            
+            # Create Solana account with Phantom-compatible derivation path using bip-utils
+            seed = Bip39SeedGenerator(mnemonic).Generate()
+            bip44_mst = Bip44.FromSeed(seed, Bip44Coins.SOLANA)
+            bip44_acc = bip44_mst.Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT)
+            solana_private_key_bytes = bip44_acc.PrivateKey().Raw().ToBytes()
+            solana_keypair = Keypair.from_seed(solana_private_key_bytes[:32])
+            solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
+        
         elif private_key:
-            # ETH-style private key (hex with 0x prefix)
-            if isinstance(private_key, str) and private_key.startswith("0x"):
-                try:
-                    acct = Account.from_key(private_key)
-                    eth_address = acct.address
-                    eth_private_key = private_key
-                    # Generate a fresh Solana keypair since we don't have a Solana key in this case.
-                    # NOTE: We intentionally don't derive a Solana key from an ETH private key (different curves).
-                    new_seed = os.urandom(32)
-                    solana_keypair = Keypair.from_seed(new_seed)
-                    logger.warning("ETH private key provided — generated a new random Solana wallet (different curve).")
-                except Exception as e:
-                    raise ValueError(f"Invalid ETH private key: {e}")
-
+            # Private key handling
+            if private_key.startswith('0x'):
+                account = Account.from_key(private_key)
+                eth_address = account.address
+                eth_private_key = private_key
+                new_seed = os.urandom(32)
+                solana_keypair = Keypair.from_seed(new_seed)
+                solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
+                logger.warning("ETH private key provided - generated new Solana wallet")
             else:
-                # Try interpreting as base58-encoded Solana secret (either 64-byte secret_key or 32-byte seed)
-                try:
-                    key_bytes = base58.b58decode(private_key)
-                except Exception as e:
-                    raise ValueError("Provided private_key is neither hex ETH key nor valid base58 Solana key.")
-
+                key_bytes = base58.b58decode(private_key)
                 if len(key_bytes) == 64:
-                    # 64-byte secret (secret + pubkey). Use from_secret_key
-                    try:
-                        solana_keypair = Keypair.from_secret_key(key_bytes)
-                    except Exception as e:
-                        raise ValueError(f"Failed to import Solana key from 64-byte secret: {e}")
+                    solana_keypair = Keypair.from_bytes(key_bytes)
+                    solana_private_key = private_key
                 elif len(key_bytes) == 32:
-                    # 32-byte seed -> Keypair.from_seed
-                    try:
-                        solana_keypair = Keypair.from_seed(key_bytes)
-                    except Exception as e:
-                        raise ValueError(f"Failed to import Solana key from 32-byte seed: {e}")
+                    solana_keypair = Keypair.from_seed(key_bytes)
+                    solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
                 else:
-                    raise ValueError(f"Invalid Solana private key length: {len(key_bytes)} bytes")
-
+                    raise ValueError("Invalid Solana private key length")
+                account = Account.create()
+                eth_address = account.address
+                eth_private_key = account.key.hex()
+                logger.warning("Solana private key provided - generated new ETH/BSC wallet")
         else:
-            # Neither mnemonic nor private_key provided
-            raise ValueError("Must provide either mnemonic or private_key")
+            raise ValueError("Must provide either mnemonic or private key")
 
-        # At this point we must have a solana_keypair
-        if solana_keypair is None:
-            raise ValueError("Solana keypair was not created or imported successfully.")
-
-        # Build storeable values
-        sol_public = str(solana_keypair.public_key)
-        # solana_keypair.to_bytes() returns 64 bytes (secret+pub)
-        sol_priv_b58 = base58.b58encode(solana_keypair.to_bytes()).decode()
-
-        # Encrypt sensitive fields
-        encrypted_mnemonic = encrypt_data(mnemonic if mnemonic else "imported_via_private_key", user_key)
-        encrypted_solana_private_key = encrypt_data(sol_priv_b58, user_key)
+        # Encrypt all sensitive data
+        encrypted_mnemonic = encrypt_data(mnemonic if mnemonic else 'Imported via private key', user_key)
+        encrypted_solana_private_key = encrypt_data(solana_private_key, user_key)
         encrypted_eth_private_key = encrypt_data(eth_private_key, user_key) if eth_private_key else None
 
-        # Return same shape as your previous function expected
         return {
             'mnemonic': encrypted_mnemonic,
             'solana': {
-                'public_key': sol_public,
+                'public_key': str(solana_keypair.pubkey()),  # Updated to pubkey()
                 'private_key': encrypted_solana_private_key
             },
             'eth': {
@@ -528,12 +483,10 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
                 'private_key': encrypted_eth_private_key
             } if eth_address else None
         }
-
+        
     except Exception as e:
         logger.error(f"🔥 [set_user_wallet] Critical error: {str(e)}", exc_info=True)
-        # Re-raise so callers can react (your bot seemed to expect exceptions to bubble)
-        raise
-
+        raise ValueError(f"Wallet creation failed: {str(e)}")
     
 
 
