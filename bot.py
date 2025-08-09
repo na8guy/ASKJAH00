@@ -419,55 +419,47 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             if not mnemo.check(mnemonic):
                 raise ValueError("Invalid mnemonic phrase.")
             
-            # Create Ethereum account
+            # Create Ethereum account with standard derivation path
             eth_account = Account.from_mnemonic(mnemonic, account_path=ETHEREUM_DEFAULT_PATH)
             eth_address = eth_account.address
             eth_private_key = eth_account.key.hex()
             
-            # Create Solana account using standard derivation
-            solana_keypair = derive_solana_keypair_from_mnemonic(mnemonic)
+            # Create Solana account with Phantom-compatible derivation path
+            wallet = Wallet(mnemonic)
+            solana_private_key_bytes, _ = wallet.derive_account('sol', 0)  # Index 0 for first account
+            solana_keypair = Keypair.from_seed(solana_private_key_bytes[:32])
             solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
             
-            logger.info(f"🔐 Derived Solana address: {solana_keypair.pubkey()}")
-            
         elif private_key:
-            # Private key handling for Solana
+            # Private key handling
             if private_key.startswith('0x'):
                 # Ethereum/BSC private key
                 account = Account.from_key(private_key)
                 eth_address = account.address
                 eth_private_key = private_key
                 
-                # Generate new Solana wallet from 32-byte seed
+                # Generate new Solana wallet (as ETH key can't derive Solana directly)
                 new_seed = os.urandom(32)
                 solana_keypair = Keypair.from_seed(new_seed)
                 solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
-                logger.info("Generated new Solana wallet from Ethereum key")
-                
+                logger.warning("ETH private key provided - generated new Solana wallet")
             else:
-                # Solana private key (either seed or full keypair)
+                # Solana private key
                 key_bytes = base58.b58decode(private_key)
-                
                 if len(key_bytes) == 64:
-                    # Full 64-byte keypair
                     solana_keypair = Keypair.from_bytes(key_bytes)
                     solana_private_key = private_key
-                    logger.info("Imported 64-byte Solana keypair")
-                    
                 elif len(key_bytes) == 32:
-                    # 32-byte seed - convert to keypair
                     solana_keypair = Keypair.from_seed(key_bytes)
                     solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
-                    logger.info("Converted 32-byte seed to Solana keypair")
-                    
                 else:
-                    raise ValueError(f"Invalid Solana key length: {len(key_bytes)} bytes (must be 32 or 64)")
+                    raise ValueError("Invalid Solana private key length")
                 
-                # Create new ETH wallet since we can't derive from Solana key
-                eth_account = Account.create()
-                eth_address = eth_account.address
-                eth_private_key = eth_account.key.hex()
-                logger.info("Generated new ETH/BSC wallet from Solana key")
+                # Generate new ETH wallet (as Solana key can't derive ETH directly)
+                account = Account.create()
+                eth_address = account.address
+                eth_private_key = account.key.hex()
+                logger.warning("Solana private key provided - generated new ETH/BSC wallet")
         else:
             raise ValueError("Must provide either mnemonic or private key")
 
