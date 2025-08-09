@@ -63,7 +63,7 @@ from pymongo import UpdateOne, ReplaceOne
 from bip44 import Wallet
 from bip32utils import BIP32Key, BIP32_HARDEN
 from bip_utils import Bip39SeedGenerator, Bip32Slip10Ed25519
-from solana.keypair import Keypair
+from solders.keypair import Keypair
 
 
 
