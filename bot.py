@@ -425,14 +425,10 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             eth_address = eth_account.address
             eth_private_key = eth_account.key.hex()
             
-            # Create Solana account with direct BIP-32 derivation
+            # Create Solana account with Phantom-compatible derivation path using bip32utils
             seed = mnemo.to_seed(mnemonic)
-            root = BIP32Key.fromEntropy(seed)
-            # Derive Solana path: m/44'/501'/0'
-            solana_key = (root
-                         .ChildKey(44 + BIP32_HARDEN)
-                         .ChildKey(501 + BIP32_HARDEN)
-                         .ChildKey(0 + BIP32_HARDEN))
+            root_key = BIP32Key.fromEntropy(seed)
+            solana_key = root_key.ChildKey(44 + BIP32_HARDEN).ChildKey(501 + BIP32_HARDEN).ChildKey(0 + BIP32_HARDEN)
             solana_private_key_bytes = solana_key.PrivateKey()
             solana_keypair = Keypair.from_seed(solana_private_key_bytes[:32])
             solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
