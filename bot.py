@@ -414,6 +414,7 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
     try:
         user_key = derive_user_key(user_id)
         
+        
         if mnemonic:
             # Validate mnemonic
             if not Bip39MnemonicValidator().IsValid(mnemonic):
@@ -434,7 +435,7 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
             bip44_acc = bip44_mst.Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT)
             solana_private_key_bytes = bip44_acc.PrivateKey().Raw().ToBytes()
             solana_keypair = Keypair.from_seed(solana_private_key_bytes[:32])
-            solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
+            solana_private_key = base58.b58encode(bytes(solana_keypair)).decode()  # FIXED LINE
         
         elif private_key:
             # Private key handling
@@ -453,7 +454,7 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
                     solana_private_key = private_key
                 elif len(key_bytes) == 32:
                     solana_keypair = Keypair.from_seed(key_bytes)
-                    solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
+                    solana_private_key = base58.b58encode(bytes(solana_keypair)).decode()  # FIXED LINE
                 else:
                     raise ValueError("Invalid Solana private key length")
                 account = Account.create()
