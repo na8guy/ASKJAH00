@@ -106,7 +106,7 @@ def log_user_action(user_id: int, action: str, details: str = "", level: str = "
 load_dotenv()
 
 # Constants
-SUBSCRIPTION_SOL_AMOUNT = 0.1
+SUBSCRIPTION_SOL_AMOUNT = 0.01
 PBKDF2_ROUNDS = 2048
 GMGN_API_HOST = 'https://gmgn.ai'
 DEXSCREENER_NEW_TOKENS_API = "https://api.dexscreener.com/token-profiles/latest/v1"
