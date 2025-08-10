@@ -1407,10 +1407,11 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Create transfer instruction
         transfer_ix = transfer(
             TransferParams(
-                from_pubkey=keypair.pubkey(),  # Use keypair's pubkey directly
+                from_pubkey=keypair.pubkey(),
                 to_pubkey=to_pubkey,
                 lamports=amount_lamports
-            )
+            ),
+            None  # Add None for the context parameter
         )
         
         # Create and sign transaction
