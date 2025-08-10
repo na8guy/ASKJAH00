@@ -27,7 +27,7 @@ from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.system_program import TransferParams, transfer, Context
+from solders.system_program import TransferParams, transfer
 from solders.transaction import Transaction, VersionedTransaction
 try:
     import base58
@@ -1405,19 +1405,18 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
-        # Create transfer instruction
+        # Create transfer instruction (updated method)
         transfer_ix = transfer(
             TransferParams(
-                from_pubkey=solana_pubkey,
+                from_pubkey=keypair.pubkey(),  # Use keypair's pubkey directly
                 to_pubkey=to_pubkey,
                 lamports=amount_lamports
-            ),
-            Context()  # Add this required context parameter
+            )
         )
         
         # Create and sign transaction
         transaction = Transaction(
-            fee_payer=solana_pubkey,
+            fee_payer=keypair.pubkey(),
             recent_blockhash=recent_blockhash,
             instructions=[transfer_ix]
         ).sign([keypair])
@@ -1448,17 +1447,13 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     
     except Exception as e:
-     logger.error(f"Subscription payment error: {str(e)}", exc_info=True)
-    log_user_action(user_id, "SUBSCRIPTION_ERROR", str(e), "error")
-    
-    # More specific error message for users
-    if "missing 1 required positional argument" in str(e):
-        error_msg = "Payment system error. Our team has been notified."
-    else:
-        error_msg = f"❌ Payment failed: {str(e)}"
-    
-    await query.edit_message_text(error_msg)
-
+        logger.error(f"Subscription payment error: {str(e)}", exc_info=True)
+        log_user_action(user_id, "SUBSCRIPTION_ERROR", str(e), "error")
+        await query.edit_message_text(
+            f"❌ Payment failed: {str(e)}\n\n"
+            "Please ensure you have enough SOL for the transaction fee."
+        )
+        return ConversationHandler.END
 
 async def verify_sol_payments(context: ContextTypes.DEFAULT_TYPE):
     """Background job to verify SOL subscription payments"""
