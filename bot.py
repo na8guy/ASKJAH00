@@ -1413,12 +1413,13 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             ),
             None  # Add None for the context parameter
         )
+
         
         # Create and sign transaction
         transaction = Transaction(
-            fee_payer=keypair.pubkey(),
-            recent_blockhash=recent_blockhash,
-            instructions=[transfer_ix]
+            [transfer_ix],  # Instructions list
+            keypair.pubkey(),  # Fee payer
+            recent_blockhash  # Recent blockhash
         ).sign([keypair])
         
         # Send transaction
