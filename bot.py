@@ -27,7 +27,7 @@ from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.system_program import TransferParams, transfer
+from solders.system_program import TransferParams, transfer, Context
 from solders.transaction import Transaction, VersionedTransaction
 try:
     import base58
@@ -65,6 +65,7 @@ from bip32utils import BIP32Key, BIP32_HARDEN
 from bip_utils import Bip32Slip10Ed25519
 from solders.keypair import Keypair
 from bip_utils import Bip39MnemonicValidator, Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
+
 
 
 
@@ -1410,7 +1411,8 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
                 from_pubkey=solana_pubkey,
                 to_pubkey=to_pubkey,
                 lamports=amount_lamports
-            )
+            ),
+            Context()  # Add this required context parameter
         )
         
         # Create and sign transaction
@@ -1446,13 +1448,16 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     
     except Exception as e:
-        logger.error(f"Subscription payment error: {str(e)}")
-        log_user_action(user_id, "SUBSCRIPTION_ERROR", str(e), "error")
-        await query.edit_message_text(
-            f"❌ Payment failed: {str(e)}\n\n"
-            "Please ensure you have enough SOL for the transaction fee."
-        )
-        return ConversationHandler.END
+     logger.error(f"Subscription payment error: {str(e)}", exc_info=True)
+    log_user_action(user_id, "SUBSCRIPTION_ERROR", str(e), "error")
+    
+    # More specific error message for users
+    if "missing 1 required positional argument" in str(e):
+        error_msg = "Payment system error. Our team has been notified."
+    else:
+        error_msg = f"❌ Payment failed: {str(e)}"
+    
+    await query.edit_message_text(error_msg)
 
 
 async def verify_sol_payments(context: ContextTypes.DEFAULT_TYPE):
