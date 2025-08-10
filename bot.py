@@ -1386,7 +1386,6 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
     log_user_action(user_id, "SUBSCRIPTION_CONFIRMED")
     
     user = users_collection.find_one({'user_id': user_id})
-    solana_pubkey = Pubkey.from_string(user['solana']['public_key'])
     
     try:
         # Decrypt private key
@@ -1405,7 +1404,7 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
-        # Create transfer instruction (updated method)
+        # Create transfer instruction
         transfer_ix = transfer(
             TransferParams(
                 from_pubkey=keypair.pubkey(),  # Use keypair's pubkey directly
