@@ -8,7 +8,7 @@ cryptography
 fastapi==0.110.0
 uvicorn==0.29.0
 gunicorn==21.2.0
-solana==0.34.3
+solana>=0.36.0
 solders
 web3
 python-dotenv
