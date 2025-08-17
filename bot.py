@@ -1398,42 +1398,32 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         
-        # Check balance
-        balance = (await solana_client.get_balance(keypair.pubkey())).value
-        amount_lamports = int(SUBSCRIPTION_SOL_AMOUNT * 10**9)  # Convert SOL to lamports
-        if balance < amount_lamports + 5000:  # 5000 lamports for typical fee
-            raise ValueError("Insufficient SOL for transaction and fee")
-        
         # Create transfer instruction
         to_pubkey = Pubkey.from_string(BOT_SOL_ADDRESS)
+        amount_lamports = int(SUBSCRIPTION_SOL_AMOUNT * 10**9)  # Convert SOL to lamports
         
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
-        # Create transfer instruction
-        transfer_ix = transfer(
-            TransferParams(
-                from_pubkey=keypair.pubkey(),
-                to_pubkey=to_pubkey,
-                lamports=amount_lamports
+        # Create transaction
+        txn = Transaction()
+        txn.add(
+            transfer(
+                TransferParams(
+                    from_pubkey=keypair.pubkey(),
+                    to_pubkey=to_pubkey,
+                    lamports=amount_lamports
+                )
             )
         )
-
-        # Create message with blockhash
-        message = Message.new_with_blockhash(
-            [transfer_ix],
-            keypair.pubkey(),  # payer
-            recent_blockhash
-        )
         
-        # Create unsigned transaction
-        txn = Transaction.new_unsigned(message)
-
-        # Sign the transaction
-        txn.sign([keypair], recent_blockhash)
-
-        # Send transaction
-        tx_hash = await solana_client.send_transaction(txn)
+        # Set required fields
+        txn.recent_blockhash = recent_blockhash
+        txn.fee_payer = keypair.pubkey()
+        
+        # Sign and send
+        txn.sign(keypair)
+        tx_hash = await solana_client.send_transaction(txn, keypair)
         logger.info(f"Subscription payment sent: {tx_hash.value}")
         
         # Confirm transaction
@@ -1465,6 +1455,7 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             "Please ensure you have enough SOL for the transaction fee."
         )
         return ConversationHandler.END
+
 
 async def verify_sol_payments(context: ContextTypes.DEFAULT_TYPE):
     """Background job to verify SOL subscription payments"""
