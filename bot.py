@@ -1398,9 +1398,14 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         
+        # Check balance
+        balance = (await solana_client.get_balance(keypair.pubkey())).value
+        amount_lamports = int(SUBSCRIPTION_SOL_AMOUNT * 10**9)  # Convert SOL to lamports
+        if balance < amount_lamports + 5000:  # 5000 lamports for typical fee
+            raise ValueError("Insufficient SOL for transaction and fee")
+        
         # Create transfer instruction
         to_pubkey = Pubkey.from_string(BOT_SOL_ADDRESS)
-        amount_lamports = int(SUBSCRIPTION_SOL_AMOUNT * 10**9)  # Convert SOL to lamports
         
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
@@ -1414,17 +1419,18 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         )
 
-        # Create transaction with recent blockhash
-        txn = Transaction(
-            fee_payer=keypair.pubkey(),
-            recent_blockhash=recent_blockhash
-        ).add(transfer_ix)
+        # Create message with blockhash
+        message = Message.new_with_blockhash(
+            [transfer_ix],
+            keypair.pubkey(),  # payer
+            recent_blockhash
+        )
         
-        # Sign the transaction
-        txn.sign([keypair])
-        
-        # Send transaction
-        tx_hash = await solana_client.send_transaction(txn)
+        # Create unsigned transaction
+        txn = Transaction.new_unsigned(message)
+
+        # Send transaction with signers
+        tx_hash = await solana_client.send_transaction(txn, signers=[keypair])
         logger.info(f"Subscription payment sent: {tx_hash.value}")
         
         # Confirm transaction
