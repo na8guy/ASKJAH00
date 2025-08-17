@@ -66,6 +66,7 @@ from bip_utils import Bip32Slip10Ed25519
 from solders.keypair import Keypair
 from bip_utils import Bip39MnemonicValidator, Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 from solders.message import Message
+from solana.rpc.types import TxOpts
 
 
 
@@ -1373,6 +1374,8 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return SUBSCRIPTION_CONFIRMATION
 
+
+
 async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle subscription confirmation and execute SOL payment"""
     query = update.callback_query
@@ -1405,25 +1408,31 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
-        # Create transaction with required parameters
-        txn = Transaction(
-            from_keypairs=[keypair],
-            message=Message.new_with_blockhash(
-                [transfer(
-                    TransferParams(
-                        from_pubkey=keypair.pubkey(),
-                        to_pubkey=to_pubkey,
-                        lamports=amount_lamports
-                    )
-                )],
-                keypair.pubkey(),
-                recent_blockhash
-            ),
-            recent_blockhash=recent_blockhash
+        # Create transaction
+        txn = Transaction()
+        txn.add(
+            transfer(
+                TransferParams(
+                    from_pubkey=keypair.pubkey(),
+                    to_pubkey=to_pubkey,
+                    lamports=amount_lamports
+                )
+            )
         )
         
-        # Sign and send
-        tx_hash = await solana_client.send_transaction(txn, keypair)
+        # Set required fields
+        txn.recent_blockhash = recent_blockhash
+        txn.fee_payer = keypair.pubkey()
+        
+        # Sign transaction
+        txn.sign(keypair)
+        
+        # Send transaction with proper options
+        tx_hash = await solana_client.send_raw_transaction(
+            txn.serialize(),
+            opts=TxOpts(skip_confirmation=False, preflight_commitment="confirmed")
+        )
+        
         logger.info(f"Subscription payment sent: {tx_hash.value}")
         
         # Confirm transaction
