@@ -1405,15 +1405,14 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
-        # Create transfer instruction
+        # Create transfer instruction - CORRECT USAGE
         transfer_ix = transfer(
             TransferParams(
                 from_pubkey=keypair.pubkey(),
                 to_pubkey=to_pubkey,
                 lamports=amount_lamports
             ),
-             None 
-            
+            None
         )
 
         # Create message with instruction
@@ -1425,7 +1424,6 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         
         # Create and sign transaction
         txn = Transaction([keypair], message, recent_blockhash)
-        txn.sign([keypair])  # Sign with keypair
 
         # Send transaction
         tx_hash = await solana_client.send_transaction(txn)
