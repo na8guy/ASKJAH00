@@ -1428,8 +1428,8 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Create transaction
         txn = Transaction([keypair], message, recent_blockhash)
         
-        # Sign transaction
-        txn.sign([keypair])
+        # Sign transaction with all required parameters
+        txn.sign([keypair], recent_blockhash)
         
         # Send transaction
         tx_hash = await solana_client.send_transaction(txn)
