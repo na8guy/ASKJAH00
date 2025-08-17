@@ -69,6 +69,8 @@ from solders.message import Message
 from solana.rpc.types import TxOpts
 from solders.message import Message
 from solders.transaction import Transaction
+from solders.transaction import VersionedTransaction, Transaction
+from solders.message import MessageV0
 
 
 
@@ -1410,29 +1412,24 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
-        # Create transfer instruction
-        transfer_ix = transfer(
-            TransferParams(
-                from_pubkey=keypair.pubkey(),
-                to_pubkey=to_pubkey,
-                lamports=amount_lamports
-            )
-        )
-        
         # Create message
         message = Message.new_with_blockhash(
-            [transfer_ix],
+            [transfer(
+                TransferParams(
+                    from_pubkey=keypair.pubkey(),
+                    to_pubkey=to_pubkey,
+                    lamports=amount_lamports
+                )
+            )],
             keypair.pubkey(),
             recent_blockhash
         )
         
-        # Create and sign transaction
-        txn = Transaction.new_signed_with_payer(
-            [transfer_ix],
-            Some(keypair.pubkey()),
-            [keypair],
-            recent_blockhash
-        )
+        # Create transaction
+        txn = Transaction([keypair], message, recent_blockhash)
+        
+        # Sign transaction
+        txn.sign([keypair])
         
         # Send transaction
         tx_hash = await solana_client.send_transaction(txn)
