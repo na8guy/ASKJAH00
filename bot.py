@@ -1398,14 +1398,14 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         
-        # Create transfer transaction
+        # Create transfer instruction
         to_pubkey = Pubkey.from_string(BOT_SOL_ADDRESS)
         amount_lamports = int(SUBSCRIPTION_SOL_AMOUNT * 10**9)  # Convert SOL to lamports
         
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
-        # Create transfer instruction - FIXED: Remove the extra None argument
+        # Create transfer instruction
         transfer_ix = transfer(
             TransferParams(
                 from_pubkey=keypair.pubkey(),
@@ -1414,15 +1414,18 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         )
 
-        # Create message with instruction
+        # Create message with blockhash
         message = Message.new_with_blockhash(
             [transfer_ix],
             keypair.pubkey(),  # payer
             recent_blockhash
         )
         
-        # Create and sign transaction
-        txn = Transaction([keypair], message, recent_blockhash)
+        # Create transaction with signers and message
+        txn = Transaction.new_signed(
+            message=message,
+            signers=[keypair]
+        )
 
         # Send transaction
         tx_hash = await solana_client.send_transaction(txn)
