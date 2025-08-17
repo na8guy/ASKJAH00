@@ -1411,19 +1411,21 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
                 to_pubkey=to_pubkey,
                 lamports=amount_lamports
             ),
-            None  # Add None for the context parameter
+            None  # Context parameter
         )
 
         
         # Create and sign transaction
-        transaction = Transaction(
-            [transfer_ix],  # Instructions list
-            keypair.pubkey(),  # Fee payer
-            recent_blockhash  # Recent blockhash
-        ).sign([keypair])
+        txn = Transaction()
+        txn.add(transfer_ix)
+        txn.recent_blockhash = recent_blockhash
+        txn.fee_payer = keypair.pubkey()
         
+        # Sign the transaction properly
+        txn.sign(keypair)
+
         # Send transaction
-        tx_hash = await solana_client.send_transaction(transaction)
+        tx_hash = await solana_client.send_transaction(txn)
         logger.info(f"Subscription payment sent: {tx_hash.value}")
         
         # Confirm transaction
