@@ -1405,24 +1405,24 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
-        # Create transaction
-        txn = Transaction()
-        txn.add(
-            transfer(
-                TransferParams(
-                    from_pubkey=keypair.pubkey(),
-                    to_pubkey=to_pubkey,
-                    lamports=amount_lamports
-                )
-            )
+        # Create transaction with required parameters
+        txn = Transaction(
+            from_keypairs=[keypair],
+            message=Message.new_with_blockhash(
+                [transfer(
+                    TransferParams(
+                        from_pubkey=keypair.pubkey(),
+                        to_pubkey=to_pubkey,
+                        lamports=amount_lamports
+                    )
+                )],
+                keypair.pubkey(),
+                recent_blockhash
+            ),
+            recent_blockhash=recent_blockhash
         )
         
-        # Set required fields
-        txn.recent_blockhash = recent_blockhash
-        txn.fee_payer = keypair.pubkey()
-        
         # Sign and send
-        txn.sign(keypair)
         tx_hash = await solana_client.send_transaction(txn, keypair)
         logger.info(f"Subscription payment sent: {tx_hash.value}")
         
