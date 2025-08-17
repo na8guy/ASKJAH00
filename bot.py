@@ -65,6 +65,7 @@ from bip32utils import BIP32Key, BIP32_HARDEN
 from bip_utils import Bip32Slip10Ed25519
 from solders.keypair import Keypair
 from bip_utils import Bip39MnemonicValidator, Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
+from solders.message import Message
 
 
 
@@ -1410,7 +1411,9 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
                 from_pubkey=keypair.pubkey(),
                 to_pubkey=to_pubkey,
                 lamports=amount_lamports
-            )
+            ),
+             None 
+            
         )
 
         # Create message with instruction
