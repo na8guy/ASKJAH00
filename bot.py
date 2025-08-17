@@ -1408,31 +1408,25 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
-        # Create transaction
-        txn = Transaction()
-        txn.add(
-            transfer(
+        # Create message with transfer instruction
+        message = Message.new_with_blockhash(
+            [transfer(
                 TransferParams(
                     from_pubkey=keypair.pubkey(),
                     to_pubkey=to_pubkey,
                     lamports=amount_lamports
                 )
-            )
+            )],
+            keypair.pubkey(),
+            recent_blockhash
         )
         
-        # Set required fields
-        txn.recent_blockhash = recent_blockhash
-        txn.fee_payer = keypair.pubkey()
+        # Create and sign transaction
+        txn = Transaction([keypair], message, recent_blockhash)
+        txn.sign([keypair])
         
-        # Sign transaction
-        txn.sign(keypair)
-        
-        # Send transaction with proper options
-        tx_hash = await solana_client.send_raw_transaction(
-            txn.serialize(),
-            opts=TxOpts(skip_confirmation=False, preflight_commitment="confirmed")
-        )
-        
+        # Send transaction
+        tx_hash = await solana_client.send_transaction(txn)
         logger.info(f"Subscription payment sent: {tx_hash.value}")
         
         # Confirm transaction
@@ -1464,7 +1458,6 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             "Please ensure you have enough SOL for the transaction fee."
         )
         return ConversationHandler.END
-
 
 async def verify_sol_payments(context: ContextTypes.DEFAULT_TYPE):
     """Background job to verify SOL subscription payments"""
