@@ -1421,11 +1421,11 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             recent_blockhash
         )
         
-        # Create transaction with signers and message
-        txn = Transaction.new_signed(
-            message=message,
-            signers=[keypair]
-        )
+        # Create unsigned transaction
+        txn = Transaction.new_unsigned(message)
+
+        # Sign the transaction
+        txn.sign([keypair])
 
         # Send transaction
         tx_hash = await solana_client.send_transaction(txn)
