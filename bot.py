@@ -1414,19 +1414,15 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         )
 
-        # Create message with blockhash
-        message = Message.new_with_blockhash(
-            [transfer_ix],
-            keypair.pubkey(),  # payer
-            recent_blockhash
-        )
+        # Create transaction with recent blockhash
+        txn = Transaction(
+            fee_payer=keypair.pubkey(),
+            recent_blockhash=recent_blockhash
+        ).add(transfer_ix)
         
-        # Create unsigned transaction
-        txn = Transaction.new_unsigned(message)
-
         # Sign the transaction
         txn.sign([keypair])
-
+        
         # Send transaction
         tx_hash = await solana_client.send_transaction(txn)
         logger.info(f"Subscription payment sent: {tx_hash.value}")
