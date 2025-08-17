@@ -1429,8 +1429,11 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Create unsigned transaction
         txn = Transaction.new_unsigned(message)
 
-        # Send transaction with signers
-        tx_hash = await solana_client.send_transaction(txn, signers=[keypair])
+        # Sign the transaction
+        txn.sign([keypair], recent_blockhash)
+
+        # Send transaction
+        tx_hash = await solana_client.send_transaction(txn)
         logger.info(f"Subscription payment sent: {tx_hash.value}")
         
         # Confirm transaction
