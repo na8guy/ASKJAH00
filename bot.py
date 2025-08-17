@@ -1405,14 +1405,13 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
-        # Create transfer instruction - CORRECT USAGE
+        # Create transfer instruction - FIXED: Remove the extra None argument
         transfer_ix = transfer(
             TransferParams(
                 from_pubkey=keypair.pubkey(),
                 to_pubkey=to_pubkey,
                 lamports=amount_lamports
-            ),
-            None
+            )
         )
 
         # Create message with instruction
@@ -2698,7 +2697,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(message, parse_mode='Markdown')
 
-async def transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Initiate token transfer"""
     user_id = update.effective_user.id
     log_user_action(user_id, "TRANSFER_INITIATED")
@@ -3538,7 +3537,7 @@ def setup_handlers(application: Application):
 
     # Transfer handler
     transfer_handler = ConversationHandler(
-        entry_points=[CommandHandler("transfer", wrap_conversation_entry(transfer))],
+        entry_points=[CommandHandler("transfer", wrap_conversation_entry(start_transfer))],
         states={
             TRANSFER_TOKEN: [CallbackQueryHandler(wrap_conversation_state(transfer_token))],
             TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
