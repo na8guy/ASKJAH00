@@ -67,6 +67,8 @@ from solders.keypair import Keypair
 from bip_utils import Bip39MnemonicValidator, Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 from solders.message import Message
 from solana.rpc.types import TxOpts
+from solders.message import Message
+from solders.transaction import Transaction
 
 
 
@@ -1408,24 +1410,29 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
-        # Create transaction
-        txn = Transaction()
-        txn.add(
-            transfer(
-                TransferParams(
-                    from_pubkey=keypair.pubkey(),
-                    to_pubkey=to_pubkey,
-                    lamports=amount_lamports
-                )
+        # Create transfer instruction
+        transfer_ix = transfer(
+            TransferParams(
+                from_pubkey=keypair.pubkey(),
+                to_pubkey=to_pubkey,
+                lamports=amount_lamports
             )
         )
         
-        # Set required fields
-        txn.recent_blockhash = recent_blockhash
-        txn.fee_payer = keypair.pubkey()
+        # Create message
+        message = Message.new_with_blockhash(
+            [transfer_ix],
+            keypair.pubkey(),
+            recent_blockhash
+        )
         
-        # Sign transaction - use the keypair to sign the transaction
-        txn.sign([keypair])
+        # Create and sign transaction
+        txn = Transaction.new_signed_with_payer(
+            [transfer_ix],
+            Some(keypair.pubkey()),
+            [keypair],
+            recent_blockhash
+        )
         
         # Send transaction
         tx_hash = await solana_client.send_transaction(txn)
