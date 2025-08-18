@@ -118,6 +118,8 @@ PBKDF2_ROUNDS = 2048
 GMGN_API_HOST = 'https://gmgn.ai'
 DEXSCREENER_NEW_TOKENS_API = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
+MIN_LIQUIDITY = 1000  # Minimum liquidity threshold in USD
+AUTO_TRADE_COOLDOWN = 60  # 60 seconds cooldown between auto-trades
 
 # Bot states for conversation
 (WALLET_SETUP_CHOICE, SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
@@ -711,7 +713,7 @@ async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYP
             msg = await query.message.reply_text(message, parse_mode='Markdown')
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=msg.message_id),
-                30,
+                60,
                 user_id=user_id
             )
             
@@ -746,7 +748,7 @@ async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         # Schedule message deletion
         context.job_queue.run_once(
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=message.message_id),
-            30,
+            60,
             user_id=user_id
         )
         return START_IMPORT_METHOD  # New state for start flow
@@ -774,7 +776,7 @@ async def start_import_method(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Schedule message deletion
         context.job_queue.run_once(
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=message.message_id),
-            30,
+            60,
             user_id=user_id
         )
         return START_INPUT_MNEMONIC
@@ -2205,27 +2207,101 @@ async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE
         log_user_action(user_id, "LOSS_PERCENTAGE_SET", f"{percentage}%")
         
         user = users_collection.find_one({'user_id': user_id})
-        await update.message.reply_text(
-            f"✅ *Automatic trading settings saved:*\n\n"
-            f"🔹 Auto-buy amount: {user['auto_buy_amount']} SOL\n"
-            f"🔹 Sell at: {user['sell_percentage']}% profit\n"
-            f"🔹 Stop-loss at: {user['loss_percentage']}% loss\n\n"
-            f"The bot will now automatically trade based on these settings.",
-            parse_mode='Markdown'
+        
+        # Schedule auto-trade job
+        for job in context.job_queue.jobs():
+            if job.name == f"auto_trade_{user_id}":
+                job.schedule_removal()
+        
+        context.job_queue.run_repeating(
+            auto_trade, 
+            interval=30,  # Check every 30 seconds
+            first=5, 
+            user_id=user_id,
+            name=f"auto_trade_{user_id}"
         )
         
-        if user['trading_mode'] == 'automatic':
-            context.job_queue.run_repeating(
-                auto_trade, 
-                interval=5, 
-                first=0, 
-                user_id=user_id,
-                name=f"auto_trade_{user_id}"
-            )
+        await update.message.reply_text(
+            f"✅ *Automatic trading activated!*\n\n"
+            f"🤖 Settings:\n"
+            f"• Auto-buy amount: {user['auto_buy_amount']} SOL\n"
+            f"• Sell at: {user['sell_percentage']}% profit\n"
+            f"• Stop-loss at: {user['loss_percentage']}% loss\n"
+            f"• Token liquidity filter: >${MIN_LIQUIDITY}\n\n"
+            f"🔔 You'll receive notifications for all auto-trades.",
+            parse_mode='Markdown'
+        )
         return ConversationHandler.END
     except ValueError:
         await update.message.reply_text("❌ Invalid percentage. Please enter a number.")
         return SET_LOSS_PERCENTAGE
+    
+
+async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
+    """Send daily trading report to users"""
+    logger.info("📊 Generating daily reports...")
+    active_users = users_collection.find({
+        "subscription_status": "active",
+        "subscription_expiry": {"$gt": datetime.now().isoformat()}
+    })
+    
+    for user in active_users:
+        user_id = user['user_id']
+        portfolio = user.get('portfolio', {})
+        trade_history = user.get('trade_history', [])
+        
+        if not portfolio and not trade_history:
+            continue
+            
+        # Calculate portfolio value
+        total_value = 0
+        portfolio_details = ""
+        for contract, token_data in portfolio.items():
+            total_value += token_data['amount']
+            portfolio_details += (
+                f"• {token_data['name']} ({token_data['symbol']}): "
+                f"{token_data['amount']:.4f} SOL\n"
+            )
+        
+        # Summarize today's trades
+        today = datetime.now().date()
+        today_trades = [
+            t for t in trade_history 
+            if datetime.fromisoformat(t['timestamp']).date() == today
+        ]
+        
+        trade_summary = ""
+        if today_trades:
+            profit_loss = 0
+            for trade in today_trades:
+                trade_profit = (trade['sell_price'] - trade['buy_price']) * trade['amount']
+                profit_loss += trade_profit
+                trade_summary += (
+                    f"• {trade['token']}: Sold at {trade['reason']}, "
+                    f"P&L: {trade_profit:.4f} SOL\n"
+                )
+        else:
+            trade_summary = "No trades today"
+        
+        message = (
+            f"📈 *Daily Trading Report*\n\n"
+            f"🏦 *Portfolio Value*: {total_value:.4f} SOL\n"
+            f"📊 *Holdings*:\n{portfolio_details}\n"
+            f"🔄 *Today's Trades*:\n{trade_summary}\n"
+            f"💰 *Total Daily P&L*: {profit_loss:.4f} SOL"
+        )
+        
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode='Markdown'
+            )
+            log_user_action(user_id, "DAILY_REPORT_SENT")
+        except Exception as e:
+            logger.error(f"Failed to send daily report to {user_id}: {str(e)}")
+
+        
 
 async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Initiate manual trading"""
@@ -2667,7 +2743,7 @@ async def confirm_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show wallet balances"""
+    """Show wallet balances with token amounts"""
     user_id = update.effective_user.id
     log_user_action(user_id, "BALANCE_REQUEST")
     
@@ -2697,9 +2773,13 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += "No tokens held."
     else:
         for contract, details in portfolio.items():
+            # Calculate token amount based on buy price
+            token_amount = details['amount'] / details['buy_price']
             message += (
                 f"🔸 {details['name']} ({details['symbol']}): "
-                f"{details['amount']:.4f} SOL worth (bought at ${details['buy_price']:.6f})\n"
+                f"{token_amount:.2f} tokens "
+                f"(Value: {details['amount']:.4f} SOL)\n"
+                f"   - Bought at: ${details['buy_price']:.8f}\n"
             )
     
     await update.message.reply_text(message, parse_mode='Markdown')
@@ -3020,6 +3100,8 @@ async def update_token_info(context):
             )
             logger.info(f"Added token {token['contract_address']} to user {user_id}'s posted tokens")
             
+            
+            
             if user.get('trading_mode') == 'automatic':
                 await auto_trade(context, user_id, token)
         
@@ -3241,91 +3323,198 @@ async def notify_trial_ending(context: ContextTypes.DEFAULT_TYPE):
             )
             log_user_action(user_id, "TRIAL_ENDING_NOTIFICATION")
 
-async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int, token: dict):
-    """Handle automatic trading based on user settings"""
-    logger.info(f"🤖 Auto-trading for user {user_id} - {token['name']}")
-    user = users_collection.find_one({'user_id': user_id})
-    if not await check_subscription(user_id):
-        return
+async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
+    """Handle automatic trading using GMGN API"""
+    job = context.job
+    user_id = job.user_id
+    logger.info(f"🤖 Auto-trading for user {user_id}")
     
-    # Check if we already hold this token
-    if token['contract_address'] in user['portfolio']:
-        buy_price = user['portfolio'][token['contract_address']]['buy_price']
-        current_price = token['price_usd']
-        price_change = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0
+    try:
+        user = users_collection.find_one({'user_id': user_id})
+        if not user or not await check_subscription(user_id):
+            return
+            
+        # Check cooldown
+        last_trade_time = user.get('last_trade_time', 0)
+        if time.time() - last_trade_time < AUTO_TRADE_COOLDOWN:
+            logger.debug(f"Auto-trade cooldown active for user {user_id}")
+            return
+            
+        # Get portfolio and trading settings
+        portfolio = user.get('portfolio', {})
+        trading_mode = user.get('trading_mode', 'manual')
+        buy_amount = user.get('auto_buy_amount', 0.01)
+        sell_percent = user.get('sell_percentage', 10)
+        loss_percent = user.get('loss_percentage', 5)
         
-        # Check if we should sell for profit
-        if price_change >= user['sell_percentage']:
-            success = await execute_trade(
-                user_id, 
-                token['contract_address'], 
-                user['portfolio'][token['contract_address']]['amount'], 
-                'sell', 
-                'solana'
-            )
-            if success:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"🤖 Sold {token['name']} at {price_change:.2f}% profit!"
+        # 1. First handle sell conditions for existing tokens
+        for contract, token_data in list(portfolio.items()):
+            token = await fetch_token_by_contract(contract)
+            if not token:
+                continue
+                
+            buy_price = token_data['buy_price']
+            current_price = token['price_usd']
+            price_change = ((current_price - buy_price) / buy_price) * 100
+            
+            # Check profit target
+            if price_change >= sell_percent:
+                await execute_auto_sell(
+                    context, user_id, token, token_data, 
+                    f"{price_change:.2f}% profit"
                 )
-                log_user_action(user_id, "AUTO_SELL_PROFIT", 
-                              f"{token['name']} at {price_change:.2f}% profit")
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
+                
+            # Check stop loss
+            elif price_change <= -loss_percent:
+                await execute_auto_sell(
+                    context, user_id, token, token_data, 
+                    f"{abs(price_change):.2f}% loss"
                 )
         
-        # Check if we should sell to stop loss
-        elif price_change <= -user['loss_percentage']:
-            success = await execute_trade(
-                user_id, 
-                token['contract_address'], 
-                user['portfolio'][token['contract_address']]['amount'], 
-                'sell', 
-                'solana'
-            )
-            if success:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"🤖 Stopped loss for {token['name']} at {price_change:.2f}% loss."
-                )
-                log_user_action(user_id, "AUTO_SELL_LOSS", 
-                              f"{token['name']} at {price_change:.2f}% loss")
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
-                )
-        return
+        # 2. Handle buy conditions for new tokens
+        tokens = await fetch_latest_token()
+        if not tokens:
+            return
+            
+        # Filter tokens that meet criteria
+        valid_tokens = [
+            t for t in tokens 
+            if t['liquidity'] >= MIN_LIQUIDITY 
+            and t['contract_address'] not in portfolio
+        ]
+        
+        if not valid_tokens:
+            return
+            
+        token = valid_tokens[0]  # Take the best candidate
+        await execute_auto_buy(context, user_id, token, buy_amount)
+        
+    except Exception as e:
+        logger.error(f"Auto-trade error for user {user_id}: {str(e)}")
+        await notify_user(
+            context, user_id,
+            f"❌ AUTOTRADE ERROR: {str(e)}",
+            "Auto-Trade System Failure"
+        )
 
-    # Check if we should buy this token
+
+async def execute_auto_buy(context, user_id, token, buy_amount):
+    """Execute automatic buy using GMGN API"""
+    # Check balance
     balance = await check_balance(user_id, 'solana')
-    if balance < user['auto_buy_amount']:
-        logger.debug(f"Insufficient balance for auto-buy for user {user_id}: {balance} SOL available")
-        return
-
+    if balance < buy_amount:
+        await notify_user(
+            context, user_id,
+            f"⏳ Insufficient balance for auto-buy. Needed: {buy_amount} SOL, Available: {balance:.4f} SOL",
+            "Auto-Buy Failed"
+        )
+        return False
+        
+    # Execute trade
     success = await execute_trade(
         user_id, 
         token['contract_address'], 
-        user['auto_buy_amount'], 
+        buy_amount, 
         'buy', 
-        'solana'
+        'solana',
+        token
     )
+    
     if success:
+        # Update portfolio
         users_collection.update_one(
             {'user_id': user_id},
-            {'$set': {f'portfolio.{token["contract_address"]}': {
-                'name': token['name'],
-                'symbol': token['symbol'],
-                'amount': user['auto_buy_amount'],
-                'buy_price': token['price_usd']
-            }}}
+            {'$set': {
+                f'portfolio.{token["contract_address"]}': {
+                    'name': token['name'],
+                    'symbol': token['symbol'],
+                    'amount': buy_amount,
+                    'buy_price': token['price_usd'],
+                    'buy_time': datetime.now().isoformat()
+                },
+                'last_trade_time': time.time()
+            }}
         )
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"🤖 Automatically bought {user['auto_buy_amount']} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
+        await notify_user(
+            context, user_id,
+            f"🤖 AUTOBUY: Purchased {buy_amount} SOL worth of {token['name']} at ${token['price_usd']:.6f}",
+            "Auto-Buy Executed"
         )
-        log_user_action(user_id, "AUTO_BUY", 
-                       f"{user['auto_buy_amount']} SOL of {token['name']}")
+        return True
+    else:
+        await notify_user(
+            context, user_id,
+            f"❌ AUTOBUY FAILED: Could not buy {token['name']}",
+            "Auto-Buy Failed"
+        )
+        return False
+    
+
+async def execute_auto_sell(context, user_id, token, token_data, reason):
+    """Execute automatic sell using GMGN API"""
+    # Execute trade
+    success = await execute_trade(
+        user_id, 
+        token['contract_address'], 
+        token_data['amount'], 
+        'sell', 
+        'solana',
+        token
+    )
+    
+    if success:
+        # Remove from portfolio
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$unset': {f'portfolio.{token["contract_address"]}': ""}},
+        )
+        
+        # Record trade history
+        trade_data = {
+            'token': token['name'],
+            'symbol': token['symbol'],
+            'contract': token['contract_address'],
+            'amount': token_data['amount'],
+            'buy_price': token_data['buy_price'],
+            'sell_price': token['price_usd'],
+            'reason': reason,
+            'timestamp': datetime.now().isoformat()
+        }
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$push': {'trade_history': trade_data}}
+        )
+        
+        # Update last trade time
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'last_trade_time': time.time()}}
+        )
+        
+        await notify_user(
+            context, user_id,
+            f"🤖 AUTOSELL: Sold {token_data['amount']} SOL worth of {token['name']} at {reason}",
+            "Auto-Sell Executed"
+        )
+        return True
+    else:
+        await notify_user(
+            context, user_id,
+            f"❌ AUTOSELL FAILED: Could not sell {token['name']}",
+            "Auto-Sell Failed"
+        )
+        return False
+    
+async def notify_user(context, user_id, message, action):
+    """Notify user about auto-trade activity with logging"""
+    try:
+        await context.bot.send_message(chat_id=user_id, text=message)
+        log_user_action(user_id, action, message)
+    except Exception as e:
+        logger.error(f"Failed to notify user {user_id}: {str(e)}")
+
+
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel current operation"""
@@ -3641,19 +3830,33 @@ async def on_startup():
                     user_id=user_id,
                     name=f"token_updates_{user_id}"
                 )
-                app.job_queue.run_repeating(
+
+            if user.get('trading_mode') == 'automatic':
+                    app.job_queue.run_repeating(
+                        auto_trade,
+                        interval=30,
+                        first=5,
+                        user_id=user_id,
+                        name=f"auto_trade_{user_id}"
+                    )
+
+            app.job_queue.run_repeating(
     verify_sol_payments,
     interval=300,  # every 5 minutes
     first=10,
     name="sol_payment_verification"
 )
-                app.job_queue.run_repeating(
+            app.job_queue.run_repeating(
     update_token_performance,
     interval=3600,  # Update hourly
     first=10,
     name="token_performance_updates"
 )
-        
+        app.job_queue.run_daily(
+            send_daily_report,
+            time=datetime.time(hour=20, minute=0),
+            name="daily_report"
+        ) 
         logger.info("✅ Bot startup complete")
     except Exception as e:
         logger.critical(f"🔥 Failed to start bot: {str(e)}", exc_info=True)
