@@ -71,6 +71,7 @@ from solders.message import Message
 from solders.transaction import Transaction
 from solders.transaction import VersionedTransaction, Transaction
 from solders.message import MessageV0
+import pandas as pd
 
 
 
@@ -983,42 +984,52 @@ async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_
     
 
 async def record_token_performance(token: dict):
-    """Record initial token metrics with enhanced tracking"""
+    """Record token metrics with backward compatibility"""
     contract_address = token['contract_address']
+    
+    # Check if token exists
+    existing = token_performance_collection.find_one({'contract_address': contract_address})
+    
+    if existing:
+        # Update existing record with new fields if missing
+        update_data = {}
+        if 'first_tracked' not in existing:
+            update_data['first_tracked'] = existing.get('first_posted_at', datetime.now())
+        if 'performance_history' not in existing:
+            update_data['performance_history'] = []
+        
+        if update_data:
+            token_performance_collection.update_one(
+                {'_id': existing['_id']},
+                {'$set': update_data}
+            )
+        return
     
     # Create new performance document
     token_performance_collection.insert_one({
         'contract_address': contract_address,
         'name': token.get('name', ''),
         'symbol': token.get('symbol', ''),
-        'chain': 'solana',
         'first_tracked': datetime.now(),
-        'last_updated': datetime.now(),
+        'first_posted_at': datetime.now(),  # Backward compatibility
         'initial_metrics': {
             'price': token['price_usd'],
             'liquidity': token['liquidity'],
             'volume': token['volume'],
-            'market_cap': token.get('market_cap', 0),
-            'holders': token.get('holders', 0)
+            'market_cap': token.get('market_cap', 0)
         },
         'current_metrics': {
             'price': token['price_usd'],
             'liquidity': token['liquidity'],
             'volume': token['volume'],
-            'market_cap': token.get('market_cap', 0),
-            'holders': token.get('holders', 0)
+            'market_cap': token.get('market_cap', 0)
         },
         'performance_history': [],
         'ath': token['price_usd'],
         'ath_time': datetime.now(),
         'atl': token['price_usd'],
-        'atl_time': datetime.now(),
-        'volatility': 0,
-        'liquidity_health': 100,
-        'sentiment_score': 0,
-        'prediction': None
+        'atl_time': datetime.now()
     })
-    logger.info(f"📈 Recorded initial performance for {contract_address}")
 
 
 async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
@@ -1240,69 +1251,100 @@ def generate_prediction(token, current_data):
     }
 
 
+
+async def migrate_token_performance_data():
+    """Migrate old token performance data to new format"""
+    logger.info("🔄 Migrating token performance data...")
+    
+    # Update all documents missing the new fields
+    token_performance_collection.update_many(
+        {'first_tracked': {'$exists': False}},
+        {'$set': {
+            'first_tracked': '$first_posted_at',
+            'volatility': 0,
+            'liquidity_health': 50,
+            'sentiment_score': 50
+        }}
+    )
+    
+    # Initialize empty performance history where missing
+    token_performance_collection.update_many(
+        {'performance_history': {'$exists': False}},
+        {'$set': {'performance_history': []}}
+    )
+    
+    logger.info("✅ Token performance data migration complete")
+
 async def generate_performance_chart(token_data):
-    """Generate performance chart using QuickChart"""
-    timestamps = [pd.to_datetime(entry['timestamp']) for entry in token_data['performance_history']]
-    prices = [entry['price'] for entry in token_data['performance_history']]
-    liquidity = [entry['liquidity'] for entry in token_data['performance_history']]
-    
-    # Create DataFrame
-    df = pd.DataFrame({
-        'timestamp': timestamps,
-        'price': prices,
-        'liquidity': liquidity
-    })
-    df.set_index('timestamp', inplace=True)
-    
-    # Resample to consistent intervals
-    df = df.resample('5T').ffill()
-    
-    # Create chart config
-    chart_config = {
-        "type": "line",
-        "data": {
-            "labels": [ts.strftime('%m/%d %H:%M') for ts in df.index],
-            "datasets": [
-                {
-                    "label": "Price (USD)",
-                    "data": df['price'].tolist(),
-                    "borderColor": "rgb(75, 192, 192)",
-                    "yAxisID": "y",
-                    "fill": False
-                },
-                {
-                    "label": "Liquidity (USD)",
-                    "data": df['liquidity'].tolist(),
-                    "borderColor": "rgb(255, 99, 132)",
-                    "yAxisID": "y1",
-                    "fill": False
-                }
-            ]
-        },
-        "options": {
-            "scales": {
-                "y": {
-                    "type": "linear",
-                    "display": True,
-                    "position": "left",
-                    "title": {"text": "Price (USD)", "display": True}
-                },
-                "y1": {
-                    "type": "linear",
-                    "display": True,
-                    "position": "right",
-                    "title": {"text": "Liquidity (USD)", "display": True},
-                    "grid": {"drawOnChartArea": False}
+    """Generate performance chart with robust error handling"""
+    try:
+        performance_history = token_data.get('performance_history', [])
+        if not performance_history:
+            return None
+
+        timestamps = [pd.to_datetime(entry['timestamp']) for entry in performance_history]
+        prices = [entry['price'] for entry in performance_history]
+        liquidity = [entry['liquidity'] for entry in performance_history]
+        
+        # Create DataFrame
+        df = pd.DataFrame({
+            'timestamp': timestamps,
+            'price': prices,
+            'liquidity': liquidity
+        })
+        df.set_index('timestamp', inplace=True)
+        
+        # Resample to consistent intervals
+        df = df.resample('5T').ffill()
+        
+        # Create chart config
+        chart_config = {
+            "type": "line",
+            "data": {
+                "labels": [ts.strftime('%m/%d %H:%M') for ts in df.index],
+                "datasets": [
+                    {
+                        "label": "Price (USD)",
+                        "data": df['price'].tolist(),
+                        "borderColor": "rgb(75, 192, 192)",
+                        "yAxisID": "y",
+                        "fill": False
+                    },
+                    {
+                        "label": "Liquidity (USD)",
+                        "data": df['liquidity'].tolist(),
+                        "borderColor": "rgb(255, 99, 132)",
+                        "yAxisID": "y1",
+                        "fill": False
+                    }
+                ]
+            },
+            "options": {
+                "scales": {
+                    "y": {
+                        "type": "linear",
+                        "display": True,
+                        "position": "left",
+                        "title": {"text": "Price (USD)", "display": True}
+                    },
+                    "y1": {
+                        "type": "linear",
+                        "display": True,
+                        "position": "right",
+                        "title": {"text": "Liquidity (USD)", "display": True},
+                        "grid": {"drawOnChartArea": False}
+                    }
                 }
             }
         }
-    }
-    
-    # Generate chart URL
-    chart_url = f"https://quickchart.io/chart?c={json.dumps(chart_config)}"
-    return chart_url
+        
+        # Generate chart URL
+        chart_url = f"https://quickchart.io/chart?c={json.dumps(chart_config)}"
+        return chart_url
 
-
+    except Exception as e:
+        logger.error(f"Chart generation failed: {str(e)}")
+        return None
 
 
 
@@ -1321,101 +1363,116 @@ async def token_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return INPUT_ANALYSIS_CONTRACT
 
 async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle token contract input for analysis"""
+    """Handle token contract input with robust error handling"""
     user_id = update.effective_user.id
     contract_address = update.message.text.strip()
-    log_user_action(user_id, "ANALYSIS_CONTRACT_INPUT", contract_address)
     
-    # Show processing message
-    processing_msg = await update.message.reply_text("⏳ Performing deep analysis...")
-    
-    # Fetch performance data
-    token_data = token_performance_collection.find_one(
-        {'contract_address': contract_address}
-    )
-    
-    if not token_data:
-        await processing_msg.edit_text(
-            "❌ This token hasn't been tracked by the bot. "
-            "Only tokens posted through the bot can be analyzed."
-        )
-        return ConversationHandler.END
-    
-    # Fetch current token data
-    current_token = await fetch_token_by_contract(contract_address)
-    if not current_token:
-        await processing_msg.edit_text("❌ Failed to fetch current token data.")
-        return ConversationHandler.END
-    
-    # Generate performance chart
     try:
-        chart_url = await generate_performance_chart(token_data)
-    except Exception as e:
-        logger.error(f"Chart generation error: {str(e)}")
-        chart_url = None
-    
-    # Calculate time since first tracking
-    time_tracked = datetime.now() - token_data['first_tracked']
-    hours_tracked = time_tracked.total_seconds() / 3600
-    
-    # Calculate performance metrics
-    price_change_1h = calculate_timeframe_change(token_data, hours=1)
-    price_change_6h = calculate_timeframe_change(token_data, hours=6)
-    price_change_24h = calculate_timeframe_change(token_data, hours=24)
-    
-    # Format analysis message
-    message = (
-        f"📊 *Advanced Token Analysis - {token_data['name']} ({token_data['symbol']})*\n\n"
-        f"🔗 *Contract:* `{contract_address}`\n"
-        f"⏱️ *Tracked for:* {time_tracked.days} days, {int(hours_tracked % 24)} hours\n\n"
-        f"📈 *Price Performance*\n"
-        f"  - Current: ${current_token['price_usd']:.8f}\n"
-        f"  - Initial: ${token_data['initial_metrics']['price']:.8f}\n"
-        f"  - Change (24h): {price_change_24h:.2f}%\n"
-        f"  - ATH: ${token_data['ath']:.8f} ({token_data['ath_time'].strftime('%m/%d %H:%M')})\n"
-        f"  - ATL: ${token_data['atl']:.8f} ({token_data['atl_time'].strftime('%m/%d %H:%M')})\n\n"
-        f"📉 *Volatility*: {token_data['volatility']:.2f}%\n\n"
-        f"💧 *Liquidity Health*\n"
-        f"  - Current: ${current_token['liquidity']:,.2f}\n"
-        f"  - Health Score: {token_data['liquidity_health']}/100\n\n"
-        f"📣 *Market Sentiment*: {token_data['sentiment_score']}/100\n"
-    )
-    
-    # Add prediction if available
-    if token_data.get('prediction'):
-        pred = token_data['prediction']
-        emoji = "📈" if pred['trend'] == 'bullish' else "📉" if pred['trend'] == 'bearish' else "↔️"
-        message += (
-            f"\n🔮 *Short-term Prediction*: {emoji} {pred['trend'].capitalize()} "
-            f"(Confidence: {pred['confidence']:.1f}%)\n"
-            f"  - RSI: {pred['indicators']['rsi']:.2f}\n"
-            f"  - SMA(10): ${pred['indicators']['sma_10']:.8f}\n"
-            f"  - EMA(10): ${pred['indicators']['ema_10']:.8f}\n"
-        )
-    
-    # Add timeframe performance
-    message += (
-        f"\n⏱️ *Timeframe Performance*\n"
-        f"  - 1h: {price_change_1h:+.2f}%\n"
-        f"  - 6h: {price_change_6h:+.2f}%\n"
-        f"  - 24h: {price_change_24h:+.2f}%\n"
-    )
-    
-    # Add chart if available
-    if chart_url:
-        message += f"\n[View Full Performance Chart]({chart_url})"
-    
-    # Send message
-    try:
-        await processing_msg.delete()
-    except:
-        pass
+        # Show processing message
+        processing_msg = await update.message.reply_text("⏳ Performing deep analysis...")
         
-    await update.message.reply_text(
-        message, 
-        parse_mode='Markdown', 
-        disable_web_page_preview=not bool(chart_url)
-    )
+        # Fetch performance data
+        token_data = token_performance_collection.find_one(
+            {'contract_address': contract_address}
+        )
+        
+        if not token_data:
+            await processing_msg.edit_text(
+                "❌ This token hasn't been tracked by the bot. "
+                "Only tokens posted through the bot can be analyzed."
+            )
+            return ConversationHandler.END
+        
+        # Fetch current token data
+        current_token = await fetch_token_by_contract(contract_address)
+        if not current_token:
+            await processing_msg.edit_text("❌ Failed to fetch current token data.")
+            return ConversationHandler.END
+        
+        # Get first tracked time with fallback
+        first_tracked = token_data.get('first_tracked')
+        if not first_tracked:
+            first_tracked = token_data.get('first_posted_at', datetime.now())
+        
+        if isinstance(first_tracked, str):
+            first_tracked = datetime.fromisoformat(first_tracked)
+            
+        # Calculate time since first tracking
+        time_tracked = datetime.now() - first_tracked
+        hours_tracked = time_tracked.total_seconds() / 3600
+        
+        # Generate performance chart only if we have history
+        chart_url = None
+        performance_history = token_data.get('performance_history', [])
+        
+        if performance_history:
+            try:
+                chart_url = await generate_performance_chart(token_data)
+            except Exception as e:
+                logger.error(f"Chart generation error: {str(e)}")
+        
+        # Format analysis message with fallback values
+        ath = token_data.get('ath', current_token['price_usd'])
+        atl = token_data.get('atl', current_token['price_usd'])
+        volatility = token_data.get('volatility', 0)
+        liquidity_health = token_data.get('liquidity_health', 50)
+        sentiment_score = token_data.get('sentiment_score', 50)
+        
+        # Calculate performance metrics
+        price_change_1h = calculate_timeframe_change(token_data, hours=1) if performance_history else 0
+        price_change_6h = calculate_timeframe_change(token_data, hours=6) if performance_history else 0
+        price_change_24h = calculate_timeframe_change(token_data, hours=24) if performance_history else 0
+        
+        # Format analysis message
+        message = (
+            f"📊 *Advanced Token Analysis - {token_data.get('name', 'Unknown Token')}* "
+            f"({token_data.get('symbol', 'UNKNOWN')})\n\n"
+            f"🔗 *Contract:* `{contract_address}`\n"
+            f"⏱️ *Tracked for:* {time_tracked.days} days, {int(hours_tracked % 24)} hours\n\n"
+            f"📈 *Price Performance*\n"
+            f"  - Current: ${current_token['price_usd']:.8f}\n"
+            f"  - ATH: ${ath:.8f}\n"
+            f"  - ATL: ${atl:.8f}\n\n"
+            f"📉 *Volatility*: {volatility:.2f}%\n"
+            f"💧 *Liquidity Health*: {liquidity_health}/100\n"
+            f"📣 *Market Sentiment*: {sentiment_score}/100\n"
+            f"⏱️ *Recent Performance*\n"
+            f"  - 1h: {price_change_1h:+.2f}%\n"
+            f"  - 6h: {price_change_6h:+.2f}%\n"
+            f"  - 24h: {price_change_24h:+.2f}%\n"
+        )
+        
+        # Add prediction if available
+        if token_data.get('prediction'):
+            pred = token_data['prediction']
+            emoji = "📈" if pred['trend'] == 'bullish' else "📉" if pred['trend'] == 'bearish' else "↔️"
+            message += (
+                f"\n🔮 *Short-term Prediction*: {emoji} {pred['trend'].capitalize()} "
+                f"(Confidence: {pred['confidence']:.1f}%)\n"
+            )
+        
+        # Add chart if available
+        if chart_url:
+            message += f"\n[View Full Performance Chart]({chart_url})"
+        
+        # Send message
+        try:
+            await processing_msg.delete()
+        except:
+            pass
+            
+        await update.message.reply_text(
+            message, 
+            parse_mode='Markdown', 
+            disable_web_page_preview=not bool(chart_url)
+        )
+        
+    except Exception as e:
+        logger.error(f"Analysis error: {str(e)}")
+        await update.message.reply_text(
+            "❌ Failed to complete analysis. The token data might be incomplete or corrupted."
+        )
+    
     return ConversationHandler.END
 
 # Modified fetch_tokens_manual function
@@ -3905,7 +3962,7 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
     application.add_handler(CommandHandler("force_fetch", force_token_fetch))
     application.add_handler(CommandHandler("trade_status", trade_status))
-    application.add_handler(CallbackQueryHandler(handle_token_button, pattern='^(buy|sell)_'))
+    #application.add_handler(CallbackQueryHandler(handle_token_button, pattern='^(buy|sell)_'))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("reset_tokens", reset_tokens))
     application.add_handler(CommandHandler("debug", debug))
@@ -4005,23 +4062,27 @@ def setup_handlers(application: Application):
     application.add_handler(set_mode_handler)
 
     # Trade handler
+    # Trade handler
     trade_handler = ConversationHandler(
-        entry_points=[CommandHandler("trade", wrap_conversation_entry(trade))],
-        states={
-            INPUT_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                         wrap_conversation_state(input_contract))],
-            SELECT_TOKEN_ACTION: [CallbackQueryHandler(wrap_conversation_state(handle_token_button), 
-                                 pattern='^(buy|sell)_')],
-            BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                      wrap_conversation_state(buy_amount))],
-            SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                       wrap_conversation_state(sell_amount))],
-            CONFIRM_TRADE: [CallbackQueryHandler(wrap_conversation_state(confirm_trade), 
-                            pattern='^(confirm_trade|cancel_trade)$')]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
-    )
+    entry_points=[
+        CommandHandler("trade", wrap_conversation_entry(trade)),
+        CallbackQueryHandler(wrap_conversation_entry(handle_token_button), pattern='^(buy|sell)_')
+    ],
+    states={
+        INPUT_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                     wrap_conversation_state(input_contract))],
+        SELECT_TOKEN_ACTION: [CallbackQueryHandler(wrap_conversation_state(handle_token_button), 
+                              pattern='^(buy|sell)_')],
+        BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                 wrap_conversation_state(buy_amount))],
+        SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                  wrap_conversation_state(sell_amount))],
+        CONFIRM_TRADE: [CallbackQueryHandler(wrap_conversation_state(confirm_trade), 
+                        pattern='^(confirm_trade|cancel_trade)$')]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False
+)
     application.add_handler(trade_handler)
 
     # Transfer handler
@@ -4111,6 +4172,8 @@ async def on_startup():
             "subscription_status": "active",
             "subscription_expiry": {"$gt": datetime.now().isoformat()}
         })
+
+        await migrate_token_performance_data()
         
         for user in active_users:
             user_id = user['user_id']
