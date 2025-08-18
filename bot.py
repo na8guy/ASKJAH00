@@ -30,6 +30,9 @@ from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
 from solders.transaction import Transaction, VersionedTransaction
 try:
+    pass
+except Exception as e:
+    logger.error(f"Exception occurred: {str(e)}")
     import base58
 except ImportError:
     raise ImportError("Missing 'base58' package. Install it with: pip install base58")
@@ -72,6 +75,9 @@ from solders.transaction import Transaction
 from solders.transaction import VersionedTransaction, Transaction
 from solders.message import MessageV0
 import pandas as pd
+
+
+
 
 
 
@@ -2480,11 +2486,18 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     log_user_action(user_id, "TRADING_MODE_UPDATED", mode)
 
     if mode == 'manual':
+
+        for job in context.job_queue.jobs():
+         if job.name == f"auto_trade_{user_id}":
+            job.schedule_removal()
+            logger.info(f"Removed auto_trade job for user {user_id} on mode switch to manual")
+
+
         await query.message.reply_text(
-            "✅ Trading mode set to *Manual*.\n"
-            "Use /trade or token buttons to trade Solana tokens.",
-            parse_mode='Markdown'
-        )
+        "✅ Trading mode set to *Manual*.\n"
+        "Use /trade or token buttons to trade Solana tokens.",
+        parse_mode='Markdown'
+    )
         return ConversationHandler.END
     else:
         await query.message.reply_text(
@@ -3486,132 +3499,171 @@ async def check_balance(user_id, chain):
 
 async def execute_trade(user_id, contract_address, amount, action, chain, token_info):
     logger.info(f"🏁 Starting {action} trade for {amount} SOL of {contract_address}")
-    
-    if chain != 'solana':
-        logger.error(f"Trading not supported for {chain} yet")
-        return False
-    
-    user = users_collection.find_one({'user_id': user_id})
-    if not user:
-        logger.error(f"No user found for user_id {user_id}")
-        return False
-    
     try:
+        # Only support Solana
+        if chain != 'solana':
+            logger.error(f"Trading not supported for {chain} yet")
+            return False
+
+        # Fetch user
+        user = users_collection.find_one({'user_id': user_id})
+        if not user:
+            logger.error(f"No user found for user_id {user_id}")
+            return False
+
         # Decrypt and load wallet
         decrypted_user = await decrypt_user_wallet(user_id, user)
-        solana_private_key = decrypted_user['solana']['private_key']
+        solana_private_key = decrypted_user.get('solana', {}).get('private_key')
+
         if not solana_private_key or solana_private_key == "[Decryption Failed]":
             logger.error(f"Failed to decrypt Solana private key for user {user_id}")
             return False
-        
+
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         from_address = str(keypair.pubkey())
-        
-        # Set token_in and token_out based on trade action
+
+        # 🔹 Fetch user SOL balance
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            balance_url = f"{GMGN_API_HOST}/defi/router/v1/sol/account/get_balance"
+            balance_params = {"address": from_address}
+            balance_response = await client.get(balance_url, params=balance_params)
+
+            if balance_response.status_code != 200:
+                logger.error(f"Failed to fetch balance: {balance_response.text}")
+                return False
+
+            balance_data = balance_response.json()
+            if balance_data.get("code") != 0:
+                logger.error(f"Balance API error: {balance_data.get('msg')}")
+                return False
+
+            lamports = int(balance_data["data"]["balance"])
+            balance = lamports / 1_000_000_000  # convert to SOL
+
+        # 🔹 Verify balance (with 0.01 SOL buffer for fees)
+        required_balance = amount + 0.01
+        if balance < required_balance:
+            logger.error(
+                f"❌ Insufficient SOL balance. Have {balance:.4f} SOL, need {required_balance:.4f} SOL"
+            )
+            return False
+
+        # Set token_in and token_out based on action
         if action == 'buy':
             token_in = 'So11111111111111111111111111111111111111112'  # SOL
             token_out = contract_address
-            in_amount = int(amount * 1_000_000_000)  # Convert SOL to lamports
+            in_amount = int(amount * 1_000_000_000)  # lamports
             swap_mode = 'ExactIn'
-        else:  # Sell
+        elif action == 'sell':
             token_in = contract_address
             token_out = 'So11111111111111111111111111111111111111112'  # SOL
-            out_amount = int(amount * 1_000_000_000)  # Convert SOL to lamports
+            out_amount = int(amount * 1_000_000_000)  # lamports
             swap_mode = 'ExactOut'
-        
-        # Prepare API request with FIXED FEE PARAMETER
+        else:
+            logger.error(f"Invalid action: {action}")
+            return False
+
+        # Prepare API request
         quote_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_swap_route"
         params = {
-    'token_in_address': token_in,
-    'token_out_address': token_out,
-    'from_address': from_address,
-    'slippage': '1.0',  # 1% slippage
-    'swap_mode': swap_mode,
-    'fee': '0.005'  # Priority fee in SOL (e.g., 0.005 SOL = 5,000,000 lamports)
-}
-        
-        # Add amount based on trade type
+            'token_in_address': token_in,
+            'token_out_address': token_out,
+            'from_address': from_address,
+            'slippage': '1.0',  # 1% slippage
+            'swap_mode': swap_mode,
+            'fee': str(0.01)  # 0.01 SOL fee
+        }
+
         if action == 'buy':
             params['in_amount'] = str(in_amount)
         else:
             params['out_amount'] = str(out_amount)
-        
+
         logger.debug(f"🔄 GMGN API params: {params}")
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Get swap quote
+            # Get swap route
             response = await client.get(quote_url, params=params)
-            logger.debug(f"🔁 GMGN API response: {response.status_code} - {response.text[:200]}...")
-            
+            logger.debug(f"🔁 GMGN API response {response.status_code}: {response.text[:300]}")
+
             if response.status_code != 200:
                 logger.error(f"GMGN API failed: {response.status_code} - {response.text}")
                 return False
-                
+
             route = response.json()
-            logger.debug(f"Route data: {json.dumps(route, indent=2)[:500]}...")
-            
-            if route.get('code') != 0:
+            if route.get('code') != 0 or 'data' not in route:
                 logger.error(f"Failed to get swap route: {route.get('msg')}")
                 return False
-            
-            # Extract transaction details
-            swap_transaction = route['data']['raw_tx']['swapTransaction']
-            last_valid_block_height = route['data']['raw_tx']['lastValidBlockHeight']
-            
-            # Deserialize and sign transaction
+
+            raw_tx = route['data'].get('raw_tx')
+            if not raw_tx:
+                logger.error("No raw_tx found in route data")
+                return False
+
+            swap_transaction = raw_tx.get('swapTransaction')
+            last_valid_block_height = raw_tx.get('lastValidBlockHeight')
+            if not swap_transaction:
+                logger.error("Missing swapTransaction in response")
+                return False
+
+            # Deserialize + sign transaction
             swap_transaction_buf = base64.b64decode(swap_transaction)
             transaction = VersionedTransaction.deserialize(swap_transaction_buf)
             transaction.sign([keypair])
             signed_tx = base64.b64encode(transaction.serialize()).decode('utf-8')
-            
+
             # Submit transaction
             submit_url = f"{GMGN_API_HOST}/txproxy/v1/send_transaction"
-            payload = {
-                'chain': 'sol',
-                'signedTx': signed_tx
-            }
-            logger.debug(f"Submitting transaction: {submit_url}")
+            payload = {'chain': 'sol', 'signedTx': signed_tx}
             submit_response = await client.post(submit_url, json=payload)
-            submit_response.raise_for_status()
+
+            if submit_response.status_code != 200:
+                logger.error(f"Transaction submission failed: {submit_response.text}")
+                return False
+
             submit_result = submit_response.json()
-            
             if submit_result.get('code') != 0:
                 logger.error(f"Failed to submit transaction: {submit_result.get('msg')}")
                 return False
-            
+
             tx_hash = submit_result['data']['hash']
             logger.info(f"✅ Transaction submitted: {tx_hash}")
-            
+
             # Wait for confirmation
             max_attempts = 60
             for attempt in range(max_attempts):
                 status_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_transaction_status"
-                status_params = {
-                    'hash': tx_hash,
-                    'last_valid_height': last_valid_block_height
-                }
+                status_params = {'hash': tx_hash, 'last_valid_height': last_valid_block_height}
                 status_response = await client.get(status_url, params=status_params)
-                status_response.raise_for_status()
+
+                if status_response.status_code != 200:
+                    logger.error(f"Failed to fetch tx status: {status_response.text}")
+                    return False
+
                 status = status_response.json()
-                
                 if status.get('code') != 0:
                     logger.error(f"Failed to check transaction status: {status.get('msg')}")
                     return False
-                
-                if status['data']['success']:
+
+                if status['data'].get('success'):
                     logger.info(f"✅ Transaction {tx_hash} confirmed")
                     return True
-                elif status['data']['expired']:
+                elif status['data'].get('expired'):
                     logger.error(f"❌ Transaction {tx_hash} expired")
                     return False
-                
+
                 await asyncio.sleep(1)
-            
+
             logger.error(f"❌ Transaction {tx_hash} timed out after {max_attempts} seconds")
             return False
-    
+
     except Exception as e:
         logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
+        if "response" in locals():
+            logger.error(f"API Response: {response.status_code} - {response.text}")
+        if "submit_response" in locals():
+            logger.error(f"Submit Response: {submit_response.text}")
         return False
+
     
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
