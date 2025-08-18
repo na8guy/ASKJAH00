@@ -3485,7 +3485,6 @@ async def check_balance(user_id, chain):
         return 0.0
 
 async def execute_trade(user_id, contract_address, amount, action, chain, token_info):
-    """Execute a trade on the specified chain using GMGN API"""
     logger.info(f"🏁 Starting {action} trade for {amount} SOL of {contract_address}")
     
     if chain != 'solana':
@@ -3520,14 +3519,15 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             out_amount = int(amount * 1_000_000_000)  # Convert SOL to lamports
             swap_mode = 'ExactOut'
         
-        # Prepare API request
+        # Prepare API request with FIXED FEE PARAMETER
         quote_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_swap_route"
         params = {
             'token_in_address': token_in,
             'token_out_address': token_out,
             'from_address': from_address,
             'slippage': '1.0',  # 1% slippage
-            'swap_mode': swap_mode
+            'swap_mode': swap_mode,
+            'fee': '5000'  # Explicit fee parameter (5000 lamports)
         }
         
         # Add amount based on trade type
