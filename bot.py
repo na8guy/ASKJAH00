@@ -120,6 +120,9 @@ DEXSCREENER_NEW_TOKENS_API = "https://api.dexscreener.com/token-profiles/latest/
 DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
 MIN_LIQUIDITY = 1000  # Minimum liquidity threshold in USD
 AUTO_TRADE_COOLDOWN = 60  # 60 seconds cooldown between auto-trades
+TOKEN_PERFORMANCE_INTERVAL = 5 * 60  # 5 minutes in seconds
+PERFORMANCE_TRACKING_DAYS = 7  # Track tokens for 7 days
+
 
 # Bot states for conversation
 (WALLET_SETUP_CHOICE, SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
@@ -980,35 +983,54 @@ async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_
     
 
 async def record_token_performance(token: dict):
-    """Record initial token metrics when first posted"""
+    """Record initial token metrics with enhanced tracking"""
     contract_address = token['contract_address']
     
-    # Check if already recorded
-    if token_performance_collection.find_one({'contract_address': contract_address}):
-        return
-    
-    # Record initial metrics
+    # Create new performance document
     token_performance_collection.insert_one({
         'contract_address': contract_address,
         'name': token.get('name', ''),
         'symbol': token.get('symbol', ''),
-        'first_posted_at': datetime.now(),
-        'initial_price': token['price_usd'],
-        'initial_liquidity': token['liquidity'],
-        'initial_market_cap': token.get('market_cap', 0),
-        'all_time_high': token['price_usd'],
-        'all_time_low': token['price_usd'],
-        'performance_updates': []
+        'chain': 'solana',
+        'first_tracked': datetime.now(),
+        'last_updated': datetime.now(),
+        'initial_metrics': {
+            'price': token['price_usd'],
+            'liquidity': token['liquidity'],
+            'volume': token['volume'],
+            'market_cap': token.get('market_cap', 0),
+            'holders': token.get('holders', 0)
+        },
+        'current_metrics': {
+            'price': token['price_usd'],
+            'liquidity': token['liquidity'],
+            'volume': token['volume'],
+            'market_cap': token.get('market_cap', 0),
+            'holders': token.get('holders', 0)
+        },
+        'performance_history': [],
+        'ath': token['price_usd'],
+        'ath_time': datetime.now(),
+        'atl': token['price_usd'],
+        'atl_time': datetime.now(),
+        'volatility': 0,
+        'liquidity_health': 100,
+        'sentiment_score': 0,
+        'prediction': None
     })
-    logger.info(f"Recorded initial performance for {contract_address}")
+    logger.info(f"📈 Recorded initial performance for {contract_address}")
 
 
 async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
-    """Periodically update token performance metrics"""
+    """Update token performance metrics with advanced analysis"""
     logger.info("🔄 Updating token performance metrics...")
     
-    # Get all tokens tracked
-    tokens = token_performance_collection.find()
+    # Get all tokens being tracked
+    tokens = token_performance_collection.find({
+        'first_tracked': {
+            '$gte': datetime.now() - timedelta(days=PERFORMANCE_TRACKING_DAYS)
+        }
+    })
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         for token in tokens:
@@ -1020,50 +1042,280 @@ async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
                     continue
                 
                 # Calculate performance metrics
-                current_price = current_data['price_usd']
-                price_change = ((current_price - token['initial_price']) / token['initial_price']) * 100
+                price_change = calculate_price_change(token, current_data)
+                liquidity_health = calculate_liquidity_health(token, current_data)
+                volatility = calculate_volatility(token, current_data)
+                sentiment = await calculate_sentiment(token, client)
+                prediction = generate_prediction(token, current_data)
                 
                 # Update all-time high/low
-                new_ath = max(token['all_time_high'], current_price)
-                new_atl = min(token['all_time_low'], current_price)
+                new_ath = token['ath']
+                new_ath_time = token['ath_time']
+                new_atl = token['atl']
+                new_atl_time = token['atl_time']
+                
+                if current_data['price_usd'] > token['ath']:
+                    new_ath = current_data['price_usd']
+                    new_ath_time = datetime.now()
+                elif current_data['price_usd'] < token['atl']:
+                    new_atl = current_data['price_usd']
+                    new_atl_time = datetime.now()
                 
                 # Add performance update
                 update_data = {
                     'timestamp': datetime.now(),
-                    'price': current_price,
+                    'price': current_data['price_usd'],
                     'liquidity': current_data['liquidity'],
+                    'volume': current_data['volume'],
                     'market_cap': current_data.get('market_cap', 0),
-                    'price_change_percent': price_change
+                    'holders': current_data.get('holders', 0),
+                    'price_change': price_change,
+                    'volatility': volatility,
+                    'sentiment': sentiment
                 }
                 
                 # Update database
                 token_performance_collection.update_one(
                     {'_id': token['_id']},
-                    {
-                        '$set': {
-                            'all_time_high': new_ath,
-                            'all_time_low': new_atl
+                    {'$set': {
+                        'current_metrics': {
+                            'price': current_data['price_usd'],
+                            'liquidity': current_data['liquidity'],
+                            'volume': current_data['volume'],
+                            'market_cap': current_data.get('market_cap', 0),
+                            'holders': current_data.get('holders', 0)
                         },
-                        '$push': {
-                            'performance_updates': {
-                                '$each': [update_data],
-                                '$slice': -1000  # Keep last 1000 updates
-                            }
+                        'ath': new_ath,
+                        'ath_time': new_ath_time,
+                        'atl': new_atl,
+                        'atl_time': new_atl_time,
+                        'volatility': volatility,
+                        'liquidity_health': liquidity_health,
+                        'sentiment_score': sentiment,
+                        'prediction': prediction,
+                        'last_updated': datetime.now()
+                    },
+                    '$push': {
+                        'performance_history': {
+                            '$each': [update_data],
+                            '$slice': -500  # Keep last 500 updates
                         }
-                    }
+                    }}
                 )
                 
             except Exception as e:
                 logger.error(f"Error updating performance for {contract_address}: {str(e)}")
 
+def calculate_price_change(token, current_data):
+    """Calculate price change percentage with precision"""
+    initial_price = token['initial_metrics']['price']
+    current_price = current_data['price_usd']
+    return ((current_price - initial_price) / initial_price) * 100 
+
+
+def calculate_liquidity_health(token, current_data):
+    """Calculate liquidity health score (0-100)"""
+    initial_liquidity = token['initial_metrics']['liquidity']
+    current_liquidity = current_data['liquidity']
+    
+    # Liquidity growth factor
+    growth_factor = current_liquidity / initial_liquidity if initial_liquidity > 0 else 1
+    
+    # Liquidity to market cap ratio
+    market_cap = current_data.get('market_cap', current_liquidity * 2)
+    liquidity_ratio = current_liquidity / market_cap if market_cap > 0 else 0
+    
+    # Calculate score (weighted average)
+    score = min(100, (
+        (min(growth_factor, 10) * 40) +  # Growth contributes 40% (capped at 10x)
+        (min(liquidity_ratio * 100, 50) * 60)  # Ratio contributes 60% (max 50 score)
+    ))
+    
+    return round(score, 1)
+
+
+def calculate_volatility(token, current_data):
+    """Calculate volatility based on price history"""
+    if len(token['performance_history']) < 2:
+        return 0
+    
+    prices = [p['price'] for p in token['performance_history']]
+    prices.append(current_data['price_usd'])
+    
+    # Calculate standard deviation of logarithmic returns
+    returns = []
+    for i in range(1, len(prices)):
+        returns.append(math.log(prices[i] / prices[i-1]))
+    
+    if not returns:
+        return 0
+        
+    mean_return = sum(returns) / len(returns)
+    variance = sum((x - mean_return) ** 2 for x in returns) / len(returns)
+    std_dev = math.sqrt(variance)
+    
+    # Annualized volatility
+    volatility = std_dev * math.sqrt(365 * 24 * 60 / TOKEN_PERFORMANCE_INTERVAL)
+    return round(volatility * 100, 2)  # as percentage
+
+
+async def calculate_sentiment(token, client):
+    """Calculate market sentiment score (0-100)"""
+    try:
+        # Fetch social mentions
+        symbol = token['symbol']
+        response = await client.get(
+            f"https://api.socialinsider.io/v1/sentiment?token={symbol}&source=twitter,telegram",
+            headers={"Authorization": f"Bearer {os.getenv('SOCIAL_INSIDER_API')}"},
+            timeout=15
+        )
+        data = response.json()
+        
+        if not data.get('success'):
+            return 50  # Neutral if no data
+            
+        # Calculate sentiment score
+        positive = data.get('positive', 0)
+        negative = data.get('negative', 0)
+        total = positive + negative
+        
+        if total == 0:
+            return 50
+            
+        score = (positive / total) * 100
+        return round(score, 1)
+        
+    except Exception:
+        return 50  # Neutral on error
+    
+def generate_prediction(token, current_data):
+    """Generate short-term prediction using technical indicators"""
+    if len(token['performance_history']) < 10:
+        return None
+        
+    prices = [p['price'] for p in token['performance_history'][-50:]]
+    prices.append(current_data['price_usd'])
+    
+    # Calculate SMA and EMA
+    sma = sum(prices[-10:]) / 10
+    ema = prices[-1] * 0.2 + sma * 0.8  # Simple EMA approximation
+    
+    # Calculate RSI
+    gains = []
+    losses = []
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        if change > 0:
+            gains.append(change)
+        else:
+            losses.append(abs(change))
+            
+    avg_gain = sum(gains) / 14 if gains else 0
+    avg_loss = sum(losses) / 14 if losses else 0
+    rs = avg_gain / avg_loss if avg_loss != 0 else 100
+    rsi = 100 - (100 / (1 + rs))
+    
+    # Generate prediction
+    prediction = ""
+    confidence = 0
+    
+    if prices[-1] > ema > sma:
+        prediction = "bullish"
+        confidence = min(90, (prices[-1] - ema) / ema * 1000)
+    elif prices[-1] < ema < sma:
+        prediction = "bearish"
+        confidence = min(90, (ema - prices[-1]) / ema * 1000)
+    else:
+        prediction = "neutral"
+        confidence = 50
+    
+    return {
+        'trend': prediction,
+        'confidence': round(confidence, 1),
+        'indicators': {
+            'sma_10': round(sma, 8),
+            'ema_10': round(ema, 8),
+            'rsi': round(rsi, 2)
+        }
+    }
+
+
+async def generate_performance_chart(token_data):
+    """Generate performance chart using QuickChart"""
+    timestamps = [pd.to_datetime(entry['timestamp']) for entry in token_data['performance_history']]
+    prices = [entry['price'] for entry in token_data['performance_history']]
+    liquidity = [entry['liquidity'] for entry in token_data['performance_history']]
+    
+    # Create DataFrame
+    df = pd.DataFrame({
+        'timestamp': timestamps,
+        'price': prices,
+        'liquidity': liquidity
+    })
+    df.set_index('timestamp', inplace=True)
+    
+    # Resample to consistent intervals
+    df = df.resample('5T').ffill()
+    
+    # Create chart config
+    chart_config = {
+        "type": "line",
+        "data": {
+            "labels": [ts.strftime('%m/%d %H:%M') for ts in df.index],
+            "datasets": [
+                {
+                    "label": "Price (USD)",
+                    "data": df['price'].tolist(),
+                    "borderColor": "rgb(75, 192, 192)",
+                    "yAxisID": "y",
+                    "fill": False
+                },
+                {
+                    "label": "Liquidity (USD)",
+                    "data": df['liquidity'].tolist(),
+                    "borderColor": "rgb(255, 99, 132)",
+                    "yAxisID": "y1",
+                    "fill": False
+                }
+            ]
+        },
+        "options": {
+            "scales": {
+                "y": {
+                    "type": "linear",
+                    "display": True,
+                    "position": "left",
+                    "title": {"text": "Price (USD)", "display": True}
+                },
+                "y1": {
+                    "type": "linear",
+                    "display": True,
+                    "position": "right",
+                    "title": {"text": "Liquidity (USD)", "display": True},
+                    "grid": {"drawOnChartArea": False}
+                }
+            }
+        }
+    }
+    
+    # Generate chart URL
+    chart_url = f"https://quickchart.io/chart?c={json.dumps(chart_config)}"
+    return chart_url
+
+
+
+
+
+
+
 
 async def token_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Initiate token performance analysis"""
+    """Initiate token performance analysis with chart"""
     user_id = update.effective_user.id
     log_user_action(user_id, "TOKEN_ANALYSIS_REQUEST")
     
     await update.message.reply_text(
-        "🔍 Enter the token contract address for analysis:\n"
+        "🔍 Enter the token contract address for in-depth analysis:\n"
         "(e.g., 4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R)"
     )
     return INPUT_ANALYSIS_CONTRACT
@@ -1074,75 +1326,95 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     contract_address = update.message.text.strip()
     log_user_action(user_id, "ANALYSIS_CONTRACT_INPUT", contract_address)
     
+    # Show processing message
+    processing_msg = await update.message.reply_text("⏳ Performing deep analysis...")
+    
     # Fetch performance data
     token_data = token_performance_collection.find_one(
         {'contract_address': contract_address}
     )
     
     if not token_data:
-        await update.message.reply_text(
+        await processing_msg.edit_text(
             "❌ This token hasn't been tracked by the bot. "
             "Only tokens posted through the bot can be analyzed."
         )
         return ConversationHandler.END
     
-    # Fetch current price
+    # Fetch current token data
     current_token = await fetch_token_by_contract(contract_address)
     if not current_token:
-        await update.message.reply_text("❌ Failed to fetch current token data.")
+        await processing_msg.edit_text("❌ Failed to fetch current token data.")
         return ConversationHandler.END
     
+    # Generate performance chart
+    try:
+        chart_url = await generate_performance_chart(token_data)
+    except Exception as e:
+        logger.error(f"Chart generation error: {str(e)}")
+        chart_url = None
+    
+    # Calculate time since first tracking
+    time_tracked = datetime.now() - token_data['first_tracked']
+    hours_tracked = time_tracked.total_seconds() / 3600
+    
     # Calculate performance metrics
-    current_price = current_token['price_usd']
-    initial_price = token_data['initial_price']
-    price_change = ((current_price - initial_price) / initial_price) * 100
+    price_change_1h = calculate_timeframe_change(token_data, hours=1)
+    price_change_6h = calculate_timeframe_change(token_data, hours=6)
+    price_change_24h = calculate_timeframe_change(token_data, hours=24)
     
-    # Determine performance tier
-    multiplier = current_price / initial_price
-    if multiplier >= 10:
-        performance = "10X+ 🚀🌕"
-    elif multiplier >= 5:
-        performance = "5X+ 🔥"
-    elif multiplier >= 2:
-        performance = "2X+ ⬆️"
-    elif multiplier >= 1:
-        performance = "1X ➡️"
-    else:
-        loss_percent = (1 - multiplier) * 100
-        performance = f"DOWN {loss_percent:.1f}% ⚠️"
-
-    # Calculate time since first post
-    time_posted = token_data['first_posted_at']
-    time_elapsed = datetime.now() - time_posted
-    days_elapsed = time_elapsed.days
-    hours_elapsed = time_elapsed.seconds // 3600
-    
-    # Format message
+    # Format analysis message
     message = (
-        f"📊 *Token Performance Analysis*\n\n"
-        f"🔹 *Token:* {token_data['name']} ({token_data['symbol']})\n"
-        f"🔹 *Contract:* `{contract_address}`\n\n"
-        f"⏱️ *Tracked Since:* {time_posted.strftime('%Y-%m-%d %H:%M')} "
-        f"({days_elapsed}d {hours_elapsed}h ago)\n\n"
-        f"💰 *Price Performance*\n"
-        f"  - Initial: ${initial_price:.8f}\n"
-        f"  - Current: ${current_price:.8f}\n"
-        f"  - Change: {price_change:+.2f}% ({performance})\n"
-        f"  - All-Time High: ${token_data['all_time_high']:.8f}\n"
-        f"  - All-Time Low: ${token_data['all_time_low']:.8f}\n\n"
-        f"💧 *Liquidity*\n"
-        f"  - Initial: ${token_data['initial_liquidity']:,.2f}\n"
-        f"  - Current: ${current_token['liquidity']:,.2f}\n\n"
-        f"📈 *Market Cap*\n"
-        f"  - Initial: ${token_data.get('initial_market_cap', 0):,.2f}\n"
-        f"  - Current: ${current_token.get('market_cap', 0):,.2f}\n\n"
-        f"[View Chart]({current_token['dexscreener_url']})"
+        f"📊 *Advanced Token Analysis - {token_data['name']} ({token_data['symbol']})*\n\n"
+        f"🔗 *Contract:* `{contract_address}`\n"
+        f"⏱️ *Tracked for:* {time_tracked.days} days, {int(hours_tracked % 24)} hours\n\n"
+        f"📈 *Price Performance*\n"
+        f"  - Current: ${current_token['price_usd']:.8f}\n"
+        f"  - Initial: ${token_data['initial_metrics']['price']:.8f}\n"
+        f"  - Change (24h): {price_change_24h:.2f}%\n"
+        f"  - ATH: ${token_data['ath']:.8f} ({token_data['ath_time'].strftime('%m/%d %H:%M')})\n"
+        f"  - ATL: ${token_data['atl']:.8f} ({token_data['atl_time'].strftime('%m/%d %H:%M')})\n\n"
+        f"📉 *Volatility*: {token_data['volatility']:.2f}%\n\n"
+        f"💧 *Liquidity Health*\n"
+        f"  - Current: ${current_token['liquidity']:,.2f}\n"
+        f"  - Health Score: {token_data['liquidity_health']}/100\n\n"
+        f"📣 *Market Sentiment*: {token_data['sentiment_score']}/100\n"
     )
     
+    # Add prediction if available
+    if token_data.get('prediction'):
+        pred = token_data['prediction']
+        emoji = "📈" if pred['trend'] == 'bullish' else "📉" if pred['trend'] == 'bearish' else "↔️"
+        message += (
+            f"\n🔮 *Short-term Prediction*: {emoji} {pred['trend'].capitalize()} "
+            f"(Confidence: {pred['confidence']:.1f}%)\n"
+            f"  - RSI: {pred['indicators']['rsi']:.2f}\n"
+            f"  - SMA(10): ${pred['indicators']['sma_10']:.8f}\n"
+            f"  - EMA(10): ${pred['indicators']['ema_10']:.8f}\n"
+        )
+    
+    # Add timeframe performance
+    message += (
+        f"\n⏱️ *Timeframe Performance*\n"
+        f"  - 1h: {price_change_1h:+.2f}%\n"
+        f"  - 6h: {price_change_6h:+.2f}%\n"
+        f"  - 24h: {price_change_24h:+.2f}%\n"
+    )
+    
+    # Add chart if available
+    if chart_url:
+        message += f"\n[View Full Performance Chart]({chart_url})"
+    
+    # Send message
+    try:
+        await processing_msg.delete()
+    except:
+        pass
+        
     await update.message.reply_text(
         message, 
         parse_mode='Markdown', 
-        disable_web_page_preview=True
+        disable_web_page_preview=not bool(chart_url)
     )
     return ConversationHandler.END
 
@@ -1253,7 +1525,28 @@ async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔹 Use /setmode to configure auto-trading"
     )
     
-    await update.message.reply_text(status, parse_mode='Markdown')  
+    await update.message.reply_text(status, parse_mode='Markdown') 
+
+
+def calculate_timeframe_change(token_data, hours):
+    """Calculate price change for specific timeframe"""
+    now = datetime.now()
+    time_threshold = now - timedelta(hours=hours)
+    
+    # Find closest historical point
+    closest_point = None
+    for point in reversed(token_data['performance_history']):
+        if point['timestamp'] <= time_threshold:
+            closest_point = point
+            break
+            
+    if not closest_point:
+        return 0
+        
+    current_price = token_data['current_metrics']['price']
+    historical_price = closest_point['price']
+    
+    return ((current_price - historical_price) / historical_price) * 100 
 
 async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Start periodic token updates for a user"""
