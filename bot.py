@@ -3559,7 +3559,6 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 "userPublicKey": from_address,
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "asLegacyTransaction": True  # Request legacy transaction format
             }
             
             swap_response = await client.post(swap_url, json=swap_payload)
@@ -3574,15 +3573,30 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 logger.error("No swap transaction in response")
                 return False
 
-            # Deserialize transaction as legacy transaction
+            # Deserialize transaction using the correct method
             transaction_bytes = base64.b64decode(swap_transaction)
-            transaction = Transaction.deserialize(transaction_bytes)
             
-            # Sign the transaction
-            transaction.sign(keypair)
+            # Try different approaches to handle the transaction
+            try:
+                # Try VersionedTransaction first
+                transaction = VersionedTransaction.from_bytes(transaction_bytes)
+                
+                # Create a new signed transaction
+                signed_transaction = VersionedTransaction(transaction.message, [keypair])
+                raw_transaction = bytes(signed_transaction)
+                
+            except Exception as e:
+                logger.warning(f"VersionedTransaction failed, trying legacy: {str(e)}")
+                try:
+                    # Try legacy Transaction
+                    transaction = Transaction.from_bytes(transaction_bytes)
+                    transaction.sign(keypair)
+                    raw_transaction = transaction.serialize()
+                except Exception as e2:
+                    logger.error(f"Both transaction types failed: {str(e2)}")
+                    return False
             
             # Send transaction
-            raw_transaction = transaction.serialize()
             tx_hash = await solana_client.send_raw_transaction(raw_transaction)
             
             # Wait for confirmation
