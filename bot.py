@@ -3535,7 +3535,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
 
         # Get proxy from env if set
         proxy_env = os.getenv('HTTP_PROXY')
-        proxies = {'http://': proxy_env, 'https://': proxy_env} if proxy_env else None
+        proxies = proxy_env  # Just use the string directly for requests
 
         # 🔹 Fetch user SOL balance with retry and fallback
         max_retries = 3
@@ -3545,10 +3545,16 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
+                async with httpx.AsyncClient(timeout=30.0) as client:  # Remove proxies from client constructor
                     balance_url = f"{GMGN_API_HOST}/defi/router/v1/sol/account/get_balance"
                     balance_params = {"address": from_address}
-                    balance_response = await client.get(balance_url, params=balance_params, headers=headers)
+                    # Pass proxies directly to the request method
+                    balance_response = await client.get(
+                        balance_url, 
+                        params=balance_params, 
+                        headers=headers,
+                        proxies=proxies  # Pass proxy here
+                    )
 
                     if balance_response.status_code == 200:
                         # Handle gzipped response
@@ -3634,8 +3640,14 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         route = None
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
-                    response = await client.get(quote_url, params=params, headers=headers)
+                async with httpx.AsyncClient(timeout=30.0) as client:  # Remove proxies from client constructor
+                    # Pass proxies directly to the request method
+                    response = await client.get(
+                        quote_url, 
+                        params=params, 
+                        headers=headers,
+                        proxies=proxies  # Pass proxy here
+                    )
                     logger.debug(f"🔁 GMGN API response {response.status_code}: {response.text[:300]}")
 
                     if response.status_code != 200:
@@ -3688,8 +3700,14 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         submit_url = f"{GMGN_API_HOST}/txproxy/v1/send_transaction"
         payload = {'chain': 'sol', 'signedTx': signed_tx}
         
-        async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
-            submit_response = await client.post(submit_url, json=payload, headers=headers)
+        async with httpx.AsyncClient(timeout=30.0) as client:  # Remove proxies from client constructor
+            # Pass proxies directly to the request method
+            submit_response = await client.post(
+                submit_url, 
+                json=payload, 
+                headers=headers,
+                proxies=proxies  # Pass proxy here
+            )
 
             if submit_response.status_code != 200:
                 logger.error(f"Transaction submission failed: {submit_response.text}")
@@ -3715,7 +3733,14 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             for attempt in range(max_attempts):
                 status_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_transaction_status"
                 status_params = {'hash': tx_hash, 'last_valid_height': last_valid_block_height}
-                status_response = await client.get(status_url, params=status_params, headers=headers)
+                
+                # Pass proxies directly to the request method
+                status_response = await client.get(
+                    status_url, 
+                    params=status_params, 
+                    headers=headers,
+                    proxies=proxies  # Pass proxy here
+                )
 
                 if status_response.status_code != 200:
                     logger.error(f"Failed to fetch tx status: {status_response.text}")
