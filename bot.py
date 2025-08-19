@@ -6,6 +6,7 @@ import logging
 import json
 import httpx
 import base64
+import base58
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, 
@@ -29,13 +30,7 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
 from solders.transaction import Transaction, VersionedTransaction
-try:
-    pass
-except Exception as e:
-    logger.error(f"Exception occurred: {str(e)}")
-    import base58
-except ImportError:
-    raise ImportError("Missing 'base58' package. Install it with: pip install base58")
+
 try:
     from mnemonic import Mnemonic
 except ImportError:
@@ -75,6 +70,7 @@ from solders.transaction import Transaction
 from solders.transaction import VersionedTransaction, Transaction
 from solders.message import MessageV0
 import pandas as pd
+
 
 
 
