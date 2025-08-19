@@ -3559,6 +3559,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 "userPublicKey": from_address,
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
+                "asLegacyTransaction": True  # Request legacy transaction format
             }
             
             swap_response = await client.post(swap_url, json=swap_payload)
@@ -3573,22 +3574,15 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 logger.error("No swap transaction in response")
                 return False
 
-            # Deserialize transaction
+            # Deserialize transaction as legacy transaction
             transaction_bytes = base64.b64decode(swap_transaction)
-            transaction = VersionedTransaction.from_bytes(transaction_bytes)
+            transaction = Transaction.deserialize(transaction_bytes)
             
-            # FIXED: Sign the transaction correctly for VersionedTransaction
-            # VersionedTransaction needs to be signed differently than legacy Transaction
-            # We need to create a new transaction with the same message but signed
-            
-            # Get the message from the transaction
-            message = transaction.message
-            
-            # Create a new signed transaction
-            signed_transaction = VersionedTransaction(message, [keypair])
+            # Sign the transaction
+            transaction.sign(keypair)
             
             # Send transaction
-            raw_transaction = signed_transaction.serialize()
+            raw_transaction = transaction.serialize()
             tx_hash = await solana_client.send_raw_transaction(raw_transaction)
             
             # Wait for confirmation
