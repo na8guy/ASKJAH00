@@ -3550,15 +3550,15 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 
             quote_data = quote_response.json()
             
-            # Get swap transaction
-            swap_url = "https://quote-api.jup.ag/v6/swap"
+            # Get swap instructions
+            swap_url = "https://quote-api.jup.ag/v6/swap-instructions"
             swap_payload = {
-    "quoteResponse": quote_data,
-    "userPublicKey": from_address,
-    "wrapAndUnwrapSol": True,
-    "dynamicComputeUnitLimit": True,
-    "useTokenLedger": True
-}
+                "quoteResponse": quote_data,
+                "userPublicKey": from_address,
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+                "useTokenLedger": True
+            }
             
             swap_response = await client.post(swap_url, json=swap_payload)
             if swap_response.status_code != 200:
@@ -3566,15 +3566,36 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 return False
                 
             swap_data = swap_response.json()
-            swap_transaction = swap_data.get("swapTransaction")
             
-            if not swap_transaction:
-                logger.error("No swap transaction in response")
-                return False
+            # Get instructions
+            compute_budget_instructions = swap_data.get('computeBudgetInstructions', [])
+            setup_instructions = swap_data.get('setupInstructions', [])
+            swap_instruction = swap_data.get('swapInstruction')
+            cleanup_instructions = swap_data.get('cleanupInstructions', [])
+            token_ledger_instruction = swap_data.get('tokenLedgerInstruction')
 
-            # Deserialize transaction
-            transaction_bytes = base64.b64decode(swap_transaction)
-            transaction = VersionedTransaction.from_bytes(transaction_bytes)
+            # Get recent blockhash
+            recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
+
+            # Compile all instructions
+            instructions = []
+            instructions.extend(compute_budget_instructions)
+            instructions.extend(setup_instructions)
+            instructions.append(swap_instruction)
+            if token_ledger_instruction:
+                instructions.append(token_ledger_instruction)
+            instructions.extend(cleanup_instructions)
+
+            # Create message
+            message = MessageV0.try_compile(
+                payer=keypair.pubkey(),
+                instructions=instructions,
+                address_lookup_table_accounts=swap_data.get('addressLookupTableAccounts', []),
+                recent_blockhash=recent_blockhash
+            )
+
+            # Create transaction
+            transaction = VersionedTransaction(message, [keypair])
             
             # Sign transaction
             transaction.sign([keypair])
