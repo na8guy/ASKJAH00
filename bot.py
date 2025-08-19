@@ -3553,11 +3553,12 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             # Get swap transaction
             swap_url = "https://quote-api.jup.ag/v6/swap"
             swap_payload = {
-                "quoteResponse": quote_data,
-                "userPublicKey": from_address,
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-            }
+    "quoteResponse": quote_data,
+    "userPublicKey": from_address,
+    "wrapAndUnwrapSol": True,
+    "dynamicComputeUnitLimit": True,
+    "useTokenLedger": True
+}
             
             swap_response = await client.post(swap_url, json=swap_payload)
             if swap_response.status_code != 200:
@@ -3657,7 +3658,7 @@ async def notify_trial_ending(context: ContextTypes.DEFAULT_TYPE):
             log_user_action(user_id, "TRIAL_ENDING_NOTIFICATION")
 
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
-    """Handle automatic trading using GMGN API"""
+    """Handle automatic trading using Solana RPC and Jupiter API"""
     job = context.job
     user_id = job.user_id
     logger.info(f"🤖 Auto-trading for user {user_id}")
@@ -3732,7 +3733,7 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def execute_auto_buy(context, user_id, token, buy_amount):
-    """Execute automatic buy using GMGN API"""
+    """Execute automatic buy using Solana RPC and Jupiter API"""
     # Check balance
     balance = await check_balance(user_id, 'solana')
     if balance < buy_amount:
@@ -3784,7 +3785,7 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
     
 
 async def execute_auto_sell(context, user_id, token, token_data, reason):
-    """Execute automatic sell using GMGN API"""
+    """Execute automatic sell using Solana RPC and Jupiter API"""
     # Execute trade
     success = await execute_trade(
         user_id, 
@@ -3837,6 +3838,38 @@ async def execute_auto_sell(context, user_id, token, token_data, reason):
             "Auto-Sell Failed"
         )
         return False
+    
+
+async def jupiter_api_call(url, params=None, json_data=None, method="GET"):
+    """Helper function for Jupiter API calls with retry logic"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                if method == "GET":
+                    response = await client.get(url, params=params)
+                else:
+                    response = await client.post(url, json=json_data)
+                
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 429:
+                    # Rate limited, wait and retry
+                    wait_time = (attempt + 1) * 2
+                    logger.warning(f"Rate limited, waiting {wait_time}s before retry")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Jupiter API error: {response.status_code} - {response.text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Jupiter API call failed (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)
+    
+    return None
+
     
 async def notify_user(context, user_id, message, action):
     """Notify user about auto-trade activity with logging"""
