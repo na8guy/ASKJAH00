@@ -70,7 +70,9 @@ from solders.transaction import Transaction
 from solders.transaction import VersionedTransaction, Transaction
 from solders.message import MessageV0
 import pandas as pd
-
+from solana.rpc.types import TxOpts
+from solders.instruction import Instruction, AccountMeta
+from solders.address_lookup_table_account import AddressLookupTableAccount
 
 
 
@@ -3550,14 +3552,13 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 
             quote_data = quote_response.json()
             
-            # Get swap instructions
-            swap_url = "https://quote-api.jup.ag/v6/swap-instructions"
+            # Get swap transaction
+            swap_url = "https://quote-api.jup.ag/v6/swap"
             swap_payload = {
                 "quoteResponse": quote_data,
                 "userPublicKey": from_address,
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "useTokenLedger": True
             }
             
             swap_response = await client.post(swap_url, json=swap_payload)
@@ -3566,36 +3567,15 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 return False
                 
             swap_data = swap_response.json()
+            swap_transaction = swap_data.get("swapTransaction")
             
-            # Get instructions
-            compute_budget_instructions = swap_data.get('computeBudgetInstructions', [])
-            setup_instructions = swap_data.get('setupInstructions', [])
-            swap_instruction = swap_data.get('swapInstruction')
-            cleanup_instructions = swap_data.get('cleanupInstructions', [])
-            token_ledger_instruction = swap_data.get('tokenLedgerInstruction')
+            if not swap_transaction:
+                logger.error("No swap transaction in response")
+                return False
 
-            # Get recent blockhash
-            recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
-
-            # Compile all instructions
-            instructions = []
-            instructions.extend(compute_budget_instructions)
-            instructions.extend(setup_instructions)
-            instructions.append(swap_instruction)
-            if token_ledger_instruction:
-                instructions.append(token_ledger_instruction)
-            instructions.extend(cleanup_instructions)
-
-            # Create message
-            message = MessageV0.try_compile(
-                payer=keypair.pubkey(),
-                instructions=instructions,
-                address_lookup_table_accounts=swap_data.get('addressLookupTableAccounts', []),
-                recent_blockhash=recent_blockhash
-            )
-
-            # Create transaction
-            transaction = VersionedTransaction(message, [keypair])
+            # Deserialize transaction
+            transaction_bytes = base64.b64decode(swap_transaction)
+            transaction = VersionedTransaction.deserialize(transaction_bytes)
             
             # Sign transaction
             transaction.sign([keypair])
@@ -3617,7 +3597,6 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
     except Exception as e:
         logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
         return False
-    
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show debug information"""
