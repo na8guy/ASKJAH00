@@ -3533,17 +3533,19 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             'Sec-Fetch-Site': 'same-origin'
         }
 
-        # Get proxy from env if set
-        proxy = os.getenv('HTTP_PROXY')
-        proxies = {'http://': proxy, 'https://': proxy} if proxy else None
+        # Get proxy from env if set (dict format for per-scheme)
+        proxy_env = os.getenv('HTTP_PROXY')
+        proxies = {'http://': proxy_env, 'https://': proxy_env} if proxy_env else None
 
         # 🔹 Fetch user SOL balance with retry and fallback
         max_retries = 3
         retry_delay = 1  # seconds, exponential backoff
         balance_fetched = False
+        response = None  # Initialize to avoid unbound errors
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
+                # Use 'proxy' arg (dict supported in 0.28+)
+                async with httpx.AsyncClient(timeout=30.0, proxy=proxies) as client:
                     balance_url = f"{GMGN_API_HOST}/defi/router/v1/sol/account/get_balance"
                     balance_params = {"address": from_address}
                     balance_response = await client.get(balance_url, params=balance_params, headers=headers)
@@ -3560,6 +3562,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                             logger.warning(f"Balance API error on attempt {attempt + 1}: {balance_data.get('msg')}")
                     else:
                         logger.warning(f"Balance fetch failed on attempt {attempt + 1}: {balance_response.status_code} - {balance_response.text}")
+                    response = balance_response  # Set for logging if needed
 
             except Exception as e:
                 logger.warning(f"Balance fetch exception on attempt {attempt + 1}: {str(e)}")
@@ -3620,7 +3623,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             params['out_amount'] = str(out_amount)
 
         logger.debug(f"🔄 GMGN API params: {params}")
-        async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
+        async with httpx.AsyncClient(timeout=30.0, proxy=proxies) as client:
             # Get swap route
             response = await client.get(quote_url, params=params, headers=headers)
             logger.debug(f"🔁 GMGN API response {response.status_code}: {response.text[:300]}")
@@ -3698,10 +3701,13 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
 
     except Exception as e:
         logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
-        if "response" in locals():
+        # Safe logging: Check if response is httpx.Response
+        if "response" in locals() and hasattr(response, 'status_code'):
             logger.error(f"API Response: {response.status_code} - {response.text}")
-        if "submit_response" in locals():
-            logger.error(f"Submit Response: {submit_response.text}")
+        else:
+            logger.error(f"No HTTP response available or non-HTTP response: {str(response) if 'response' in locals() else 'None'}")
+        if "submit_response" in locals() and hasattr(submit_response, 'status_code'):
+            logger.error(f"Submit Response: {submit_response.status_code} - {submit_response.text}")
         return False
 
     
