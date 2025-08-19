@@ -3518,33 +3518,67 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         from_address = str(keypair.pubkey())
 
-        # Define browser-like headers
+        # Define enhanced browser-like headers
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Referer': 'https://gmgn.ai/',
             'Origin': 'https://gmgn.ai',
-            'Content-Type': 'application/json'  # For POST requests
+            'Content-Type': 'application/json',  # For POST requests
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin'
         }
 
-        # 🔹 Fetch user SOL balance
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            balance_url = f"{GMGN_API_HOST}/defi/router/v1/sol/account/get_balance"
-            balance_params = {"address": from_address}
-            balance_response = await client.get(balance_url, params=balance_params, headers=headers)
+        # Get proxy from env if set
+        proxy = os.getenv('HTTP_PROXY')
+        proxies = {'http://': proxy, 'https://': proxy} if proxy else None
 
-            if balance_response.status_code != 200:
-                logger.error(f"Failed to fetch balance: {balance_response.text}")
+        # 🔹 Fetch user SOL balance with retry and fallback
+        max_retries = 3
+        retry_delay = 1  # seconds, exponential backoff
+        balance_fetched = False
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
+                    balance_url = f"{GMGN_API_HOST}/defi/router/v1/sol/account/get_balance"
+                    balance_params = {"address": from_address}
+                    balance_response = await client.get(balance_url, params=balance_params, headers=headers)
+
+                    if balance_response.status_code == 200:
+                        balance_data = balance_response.json()
+                        if balance_data.get("code") == 0:
+                            lamports = int(balance_data["data"]["balance"])
+                            balance = lamports / 1_000_000_000  # convert to SOL
+                            balance_fetched = True
+                            logger.info(f"✅ Balance fetched successfully on attempt {attempt + 1}: {balance} SOL")
+                            break
+                        else:
+                            logger.warning(f"Balance API error on attempt {attempt + 1}: {balance_data.get('msg')}")
+                    else:
+                        logger.warning(f"Balance fetch failed on attempt {attempt + 1}: {balance_response.status_code} - {balance_response.text}")
+
+            except Exception as e:
+                logger.warning(f"Balance fetch exception on attempt {attempt + 1}: {str(e)}")
+
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+
+        if not balance_fetched:
+            # Fallback to direct Solana RPC for balance
+            logger.info("Fallback: Using Solana RPC for balance check")
+            try:
+                pubkey = Pubkey.from_string(from_address)
+                response = await solana_client.get_balance(pubkey)
+                balance = response.value / 1_000_000_000
+                logger.info(f"✅ Fallback balance fetched: {balance} SOL")
+            except Exception as e:
+                logger.error(f"Fallback Solana RPC failed: {str(e)}")
                 return False
-
-            balance_data = balance_response.json()
-            if balance_data.get("code") != 0:
-                logger.error(f"Balance API error: {balance_data.get('msg')}")
-                return False
-
-            lamports = int(balance_data["data"]["balance"])
-            balance = lamports / 1_000_000_000  # convert to SOL
 
         # 🔹 Verify balance (with 0.01 SOL buffer for fees)
         required_balance = amount + 0.01
@@ -3586,7 +3620,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             params['out_amount'] = str(out_amount)
 
         logger.debug(f"🔄 GMGN API params: {params}")
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
             # Get swap route
             response = await client.get(quote_url, params=params, headers=headers)
             logger.debug(f"🔁 GMGN API response {response.status_code}: {response.text[:300]}")
