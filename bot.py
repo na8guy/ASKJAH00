@@ -3518,259 +3518,82 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         from_address = str(keypair.pubkey())
 
-        # Define enhanced browser-like headers
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Referer': 'https://gmgn.ai/',
-            'Origin': 'https://gmgn.ai',
-            'Content-Type': 'application/json',
-            'Connection': 'keep-alive',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-origin'
+        # Use Jupiter Aggregator for best prices
+        jupiter_url = "https://quote-api.jup.ag/v6/quote"
+        
+        if action == 'buy':
+            input_mint = "So11111111111111111111111111111111111111112"  # SOL
+            output_mint = contract_address
+            amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
+            swap_mode = "ExactIn"
+        else:  # sell
+            input_mint = contract_address
+            output_mint = "So11111111111111111111111111111111111111112"  # SOL
+            amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
+            swap_mode = "ExactOut"
+
+        # Get quote from Jupiter
+        quote_params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount_lamports),
+            "slippageBps": "100",  # 1% slippage
+            "swapMode": swap_mode
         }
 
-        # Get proxy from env if set
-        proxy_env = os.getenv('HTTP_PROXY')
-        proxies = proxy_env if proxy_env else None
-        # 🔹 Fetch user SOL balance with retry and fallback
-        max_retries = 3
-        retry_delay = 1  # seconds, exponential backoff
-        balance_fetched = False
-        balance = 0.0
-        
-        for attempt in range(max_retries):
-            try:
-                async with httpx.AsyncClient(**({'proxies': proxies} if proxies else {}), timeout=30.0) as client:
-                    balance_url = f"{GMGN_API_HOST}/defi/router/v1/sol/account/get_balance"
-                    balance_params = {"address": from_address}
-                    balance_response = await client.get(
-                        balance_url, 
-                        params=balance_params, 
-                        headers=headers
-                    )
-
-                    if balance_response.status_code == 200:
-                        # Handle gzipped response
-                        if balance_response.headers.get('Content-Encoding') == 'gzip':
-                            import gzip
-                            decompressed_data = gzip.decompress(balance_response.content)
-                            balance_data = json.loads(decompressed_data.decode('utf-8'))
-                        else:
-                            balance_data = balance_response.json()
-                            
-                        if balance_data.get("code") == 0:
-                            lamports = int(balance_data["data"]["balance"])
-                            balance = lamports / 1_000_000_000  # convert to SOL
-                            balance_fetched = True
-                            logger.info(f"✅ Balance fetched successfully on attempt {attempt + 1}: {balance} SOL")
-                            break
-                        else:
-                            logger.warning(f"Balance API error on attempt {attempt + 1}: {balance_data.get('msg')}")
-                    else:
-                        logger.warning(f"Balance fetch failed on attempt {attempt + 1}: {balance_response.status_code} - {balance_response.text}")
-                        
-            except Exception as e:
-                logger.warning(f"Balance fetch exception on attempt {attempt + 1}: {str(e)}")
-
-            if attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-
-        if not balance_fetched:
-            # Fallback to direct Solana RPC for balance
-            logger.info("Fallback: Using Solana RPC for balance check")
-            try:
-                pubkey = Pubkey.from_string(from_address)
-                response = await solana_client.get_balance(pubkey)
-                balance = response.value / 1_000_000_000
-                logger.info(f"✅ Fallback balance fetched: {balance} SOL")
-            except Exception as e:
-                logger.error(f"Fallback Solana RPC failed: {str(e)}")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Get quote
+            quote_response = await client.get(jupiter_url, params=quote_params)
+            if quote_response.status_code != 200:
+                logger.error(f"Jupiter quote failed: {quote_response.text}")
                 return False
-
-        # 🔹 Verify balance (with 0.01 SOL buffer for fees)
-        required_balance = amount + 0.01
-        if balance < required_balance:
-            logger.error(
-                f"❌ Insufficient SOL balance. Have {balance:.4f} SOL, need {required_balance:.4f} SOL"
-            )
-            return False
-
-        # Set token_in and token_out based on action
-        if action == 'buy':
-            token_in = 'So11111111111111111111111111111111111111112'  # SOL
-            token_out = contract_address
-            in_amount = int(amount * 1_000_000_000)  # lamports
-            swap_mode = 'ExactIn'
-        elif action == 'sell':
-            token_in = contract_address
-            token_out = 'So11111111111111111111111111111111111111112'  # SOL
-            out_amount = int(amount * 1_000_000_000)  # lamports
-            swap_mode = 'ExactOut'
-        else:
-            logger.error(f"Invalid action: {action}")
-            return False
-
-        # Prepare API request
-        quote_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_swap_route"
-        params = {
-            'token_in_address': token_in,
-            'token_out_address': token_out,
-            'from_address': from_address,
-            'slippage': '1.0',  # 1% slippage
-            'swap_mode': swap_mode,
-            'fee': str(0.01)  # 0.01 SOL fee
-        }
-
-        if action == 'buy':
-            params['in_amount'] = str(in_amount)
-        else:
-            params['out_amount'] = str(out_amount)
-
-        logger.debug(f"🔄 GMGN API params: {params}")
-        
-        # Get swap route with retry
-        route = None
-        for attempt in range(max_retries):
-            try:
-                async with httpx.AsyncClient(proxies=proxies, timeout=30.0) as client:
-                    response = await client.get(
-                        quote_url, 
-                        params=params, 
-                        headers=headers
-                    )
-                    logger.debug(f"🔁 GMGN API response {response.status_code}: {response.text[:300]}")
-
-                    if response.status_code != 200:
-                        logger.error(f"GMGN API failed: {response.status_code} - {response.text}")
-                        continue
-
-                    # Handle gzipped response
-                    if response.headers.get('Content-Encoding') == 'gzip':
-                        import gzip
-                        decompressed_data = gzip.decompress(response.content)
-                        route = json.loads(decompressed_data.decode('utf-8'))
-                    else:
-                        route = response.json()
-                        
-                    if route.get('code') == 0 and 'data' in route:
-                        break
-                    else:
-                        logger.error(f"Failed to get swap route: {route.get('msg')}")
-                        route = None
-                        
-            except Exception as e:
-                logger.error(f"Swap route fetch exception on attempt {attempt + 1}: {str(e)}")
                 
-            if attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2
-
-        if not route:
-            logger.error("Failed to get swap route after all retries")
-            return False
-
-        raw_tx = route['data'].get('raw_tx')
-        if not raw_tx:
-            logger.error("No raw_tx found in route data")
-            return False
-
-        swap_transaction = raw_tx.get('swapTransaction')
-        last_valid_block_height = raw_tx.get('lastValidBlockHeight')
-        if not swap_transaction:
-            logger.error("Missing swapTransaction in response")
-            return False
-
-        # Deserialize + sign transaction
-        swap_transaction_buf = base64.b64decode(swap_transaction)
-        transaction = VersionedTransaction.deserialize(swap_transaction_buf)
-        transaction.sign([keypair])
-        signed_tx = base64.b64encode(transaction.serialize()).decode('utf-8')
-
-        # Submit transaction
-        submit_url = f"{GMGN_API_HOST}/txproxy/v1/send_transaction"
-        payload = {'chain': 'sol', 'signedTx': signed_tx}
-        
-        async with httpx.AsyncClient(proxies=proxies, timeout=30.0) as client:
-            submit_response = await client.post(
-                submit_url, 
-                json=payload, 
-                headers=headers
-            )
-
-            if submit_response.status_code != 200:
-                logger.error(f"Transaction submission failed: {submit_response.text}")
+            quote_data = quote_response.json()
+            
+            # Get swap transaction
+            swap_url = "https://quote-api.jup.ag/v6/swap"
+            swap_payload = {
+                "quoteResponse": quote_data,
+                "userPublicKey": from_address,
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+            }
+            
+            swap_response = await client.post(swap_url, json=swap_payload)
+            if swap_response.status_code != 200:
+                logger.error(f"Jupiter swap failed: {swap_response.text}")
                 return False
-
-            # Handle gzipped response
-            if submit_response.headers.get('Content-Encoding') == 'gzip':
-                import gzip
-                decompressed_data = gzip.decompress(submit_response.content)
-                submit_result = json.loads(decompressed_data.decode('utf-8'))
-            else:
-                submit_result = submit_response.json()
                 
-            if submit_result.get('code') != 0:
-                logger.error(f"Failed to submit transaction: {submit_result.get('msg')}")
+            swap_data = swap_response.json()
+            swap_transaction = swap_data.get("swapTransaction")
+            
+            if not swap_transaction:
+                logger.error("No swap transaction in response")
                 return False
 
-            tx_hash = submit_result['data']['hash']
-            logger.info(f"✅ Transaction submitted: {tx_hash}")
-
+            # Deserialize transaction
+            transaction_bytes = base64.b64decode(swap_transaction)
+            transaction = VersionedTransaction.deserialize(transaction_bytes)
+            
+            # Sign transaction
+            transaction.sign([keypair])
+            
+            # Send transaction
+            raw_transaction = transaction.serialize()
+            tx_hash = await solana_client.send_raw_transaction(raw_transaction)
+            
             # Wait for confirmation
-            max_attempts = 60
-            for attempt in range(max_attempts):
-                status_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_transaction_status"
-                status_params = {'hash': tx_hash, 'last_valid_height': last_valid_block_height}
-                
-                async with httpx.AsyncClient(proxies=proxies, timeout=30.0) as client:
-                    status_response = await client.get(
-                        status_url, 
-                        params=status_params, 
-                        headers=headers
-                    )
-
-                    if status_response.status_code != 200:
-                        logger.error(f"Failed to fetch tx status: {status_response.text}")
-                        return False
-
-                    # Handle gzipped response
-                    if status_response.headers.get('Content-Encoding') == 'gzip':
-                        import gzip
-                        decompressed_data = gzip.decompress(status_response.content)
-                        status = json.loads(decompressed_data.decode('utf-8'))
-                    else:
-                        status = status_response.json()
-                        
-                    if status.get('code') != 0:
-                        logger.error(f"Failed to check transaction status: {status.get('msg')}")
-                        return False
-
-                    if status['data'].get('success'):
-                        logger.info(f"✅ Transaction {tx_hash} confirmed")
-                        return True
-                    elif status['data'].get('expired'):
-                        logger.error(f"❌ Transaction {tx_hash} expired")
-                        return False
-
-                    await asyncio.sleep(1)
-
-            logger.error(f"❌ Transaction {tx_hash} timed out after {max_attempts} seconds")
-            return False
+            await solana_client.confirm_transaction(
+                tx_hash.value,
+                commitment="confirmed",
+                sleep_seconds=1
+            )
+            
+            logger.info(f"✅ Transaction confirmed: {tx_hash.value}")
+            return True
 
     except Exception as e:
         logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
-        # Safe logging: Check if response is httpx.Response
-        if "response" in locals() and hasattr(response, 'status_code'):
-            logger.error(f"API Response: {response.status_code} - {response.text}")
-        else:
-            logger.error(f"No HTTP response available or non-HTTP response: {str(response) if 'response' in locals() else 'None'}")
-        if "submit_response" in locals() and hasattr(submit_response, 'status_code'):
-            logger.error(f"Submit Response: {submit_response.status_code} - {submit_response.text}")
         return False
     
 
