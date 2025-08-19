@@ -3535,8 +3535,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
 
         # Get proxy from env if set
         proxy_env = os.getenv('HTTP_PROXY')
-        proxies = proxy_env  # Just use the string directly for requests
-
+        proxies = proxy_env if proxy_env else None
         # 🔹 Fetch user SOL balance with retry and fallback
         max_retries = 3
         retry_delay = 1  # seconds, exponential backoff
@@ -3545,7 +3544,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(proxies=proxies, timeout=30.0) as client:
+                async with httpx.AsyncClient(**({'proxies': proxies} if proxies else {}), timeout=30.0) as client:
                     balance_url = f"{GMGN_API_HOST}/defi/router/v1/sol/account/get_balance"
                     balance_params = {"address": from_address}
                     balance_response = await client.get(
