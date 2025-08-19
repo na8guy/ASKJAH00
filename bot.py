@@ -3573,15 +3573,22 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 logger.error("No swap transaction in response")
                 return False
 
-            # Deserialize transaction - FIXED: Use from_bytes instead of deserialize
+            # Deserialize transaction
             transaction_bytes = base64.b64decode(swap_transaction)
             transaction = VersionedTransaction.from_bytes(transaction_bytes)
             
-            # Sign transaction
-            transaction.sign([keypair])
+            # FIXED: Sign the transaction correctly for VersionedTransaction
+            # VersionedTransaction needs to be signed differently than legacy Transaction
+            # We need to create a new transaction with the same message but signed
+            
+            # Get the message from the transaction
+            message = transaction.message
+            
+            # Create a new signed transaction
+            signed_transaction = VersionedTransaction(message, [keypair])
             
             # Send transaction
-            raw_transaction = transaction.serialize()
+            raw_transaction = signed_transaction.serialize()
             tx_hash = await solana_client.send_raw_transaction(raw_transaction)
             
             # Wait for confirmation
