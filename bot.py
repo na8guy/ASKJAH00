@@ -3545,15 +3545,13 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:  # Remove proxies from client constructor
+                async with httpx.AsyncClient(proxies=proxies, timeout=30.0) as client:
                     balance_url = f"{GMGN_API_HOST}/defi/router/v1/sol/account/get_balance"
                     balance_params = {"address": from_address}
-                    # Pass proxies directly to the request method
                     balance_response = await client.get(
                         balance_url, 
                         params=balance_params, 
-                        headers=headers,
-                        proxies=proxies  # Pass proxy here
+                        headers=headers
                     )
 
                     if balance_response.status_code == 200:
@@ -3640,13 +3638,11 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         route = None
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:  # Remove proxies from client constructor
-                    # Pass proxies directly to the request method
+                async with httpx.AsyncClient(proxies=proxies, timeout=30.0) as client:
                     response = await client.get(
                         quote_url, 
                         params=params, 
-                        headers=headers,
-                        proxies=proxies  # Pass proxy here
+                        headers=headers
                     )
                     logger.debug(f"🔁 GMGN API response {response.status_code}: {response.text[:300]}")
 
@@ -3700,13 +3696,11 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         submit_url = f"{GMGN_API_HOST}/txproxy/v1/send_transaction"
         payload = {'chain': 'sol', 'signedTx': signed_tx}
         
-        async with httpx.AsyncClient(timeout=30.0) as client:  # Remove proxies from client constructor
-            # Pass proxies directly to the request method
+        async with httpx.AsyncClient(proxies=proxies, timeout=30.0) as client:
             submit_response = await client.post(
                 submit_url, 
                 json=payload, 
-                headers=headers,
-                proxies=proxies  # Pass proxy here
+                headers=headers
             )
 
             if submit_response.status_code != 200:
@@ -3734,38 +3728,37 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 status_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_transaction_status"
                 status_params = {'hash': tx_hash, 'last_valid_height': last_valid_block_height}
                 
-                # Pass proxies directly to the request method
-                status_response = await client.get(
-                    status_url, 
-                    params=status_params, 
-                    headers=headers,
-                    proxies=proxies  # Pass proxy here
-                )
+                async with httpx.AsyncClient(proxies=proxies, timeout=30.0) as client:
+                    status_response = await client.get(
+                        status_url, 
+                        params=status_params, 
+                        headers=headers
+                    )
 
-                if status_response.status_code != 200:
-                    logger.error(f"Failed to fetch tx status: {status_response.text}")
-                    return False
+                    if status_response.status_code != 200:
+                        logger.error(f"Failed to fetch tx status: {status_response.text}")
+                        return False
 
-                # Handle gzipped response
-                if status_response.headers.get('Content-Encoding') == 'gzip':
-                    import gzip
-                    decompressed_data = gzip.decompress(status_response.content)
-                    status = json.loads(decompressed_data.decode('utf-8'))
-                else:
-                    status = status_response.json()
-                    
-                if status.get('code') != 0:
-                    logger.error(f"Failed to check transaction status: {status.get('msg')}")
-                    return False
+                    # Handle gzipped response
+                    if status_response.headers.get('Content-Encoding') == 'gzip':
+                        import gzip
+                        decompressed_data = gzip.decompress(status_response.content)
+                        status = json.loads(decompressed_data.decode('utf-8'))
+                    else:
+                        status = status_response.json()
+                        
+                    if status.get('code') != 0:
+                        logger.error(f"Failed to check transaction status: {status.get('msg')}")
+                        return False
 
-                if status['data'].get('success'):
-                    logger.info(f"✅ Transaction {tx_hash} confirmed")
-                    return True
-                elif status['data'].get('expired'):
-                    logger.error(f"❌ Transaction {tx_hash} expired")
-                    return False
+                    if status['data'].get('success'):
+                        logger.info(f"✅ Transaction {tx_hash} confirmed")
+                        return True
+                    elif status['data'].get('expired'):
+                        logger.error(f"❌ Transaction {tx_hash} expired")
+                        return False
 
-                await asyncio.sleep(1)
+                    await asyncio.sleep(1)
 
             logger.error(f"❌ Transaction {tx_hash} timed out after {max_attempts} seconds")
             return False
