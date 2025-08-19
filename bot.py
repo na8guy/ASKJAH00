@@ -3573,7 +3573,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
 
             # Deserialize transaction
             transaction_bytes = base64.b64decode(swap_transaction)
-            transaction = VersionedTransaction.deserialize(transaction_bytes)
+            transaction = VersionedTransaction.from_bytes(transaction_bytes)
             
             # Sign transaction
             transaction.sign([keypair])
