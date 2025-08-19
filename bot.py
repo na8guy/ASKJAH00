@@ -3518,11 +3518,21 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         from_address = str(keypair.pubkey())
 
+        # Define browser-like headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://gmgn.ai/',
+            'Origin': 'https://gmgn.ai',
+            'Content-Type': 'application/json'  # For POST requests
+        }
+
         # 🔹 Fetch user SOL balance
         async with httpx.AsyncClient(timeout=30.0) as client:
             balance_url = f"{GMGN_API_HOST}/defi/router/v1/sol/account/get_balance"
             balance_params = {"address": from_address}
-            balance_response = await client.get(balance_url, params=balance_params)
+            balance_response = await client.get(balance_url, params=balance_params, headers=headers)
 
             if balance_response.status_code != 200:
                 logger.error(f"Failed to fetch balance: {balance_response.text}")
@@ -3578,7 +3588,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         logger.debug(f"🔄 GMGN API params: {params}")
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Get swap route
-            response = await client.get(quote_url, params=params)
+            response = await client.get(quote_url, params=params, headers=headers)
             logger.debug(f"🔁 GMGN API response {response.status_code}: {response.text[:300]}")
 
             if response.status_code != 200:
@@ -3610,7 +3620,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             # Submit transaction
             submit_url = f"{GMGN_API_HOST}/txproxy/v1/send_transaction"
             payload = {'chain': 'sol', 'signedTx': signed_tx}
-            submit_response = await client.post(submit_url, json=payload)
+            submit_response = await client.post(submit_url, json=payload, headers=headers)
 
             if submit_response.status_code != 200:
                 logger.error(f"Transaction submission failed: {submit_response.text}")
@@ -3629,7 +3639,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             for attempt in range(max_attempts):
                 status_url = f"{GMGN_API_HOST}/defi/router/v1/sol/tx/get_transaction_status"
                 status_params = {'hash': tx_hash, 'last_valid_height': last_valid_block_height}
-                status_response = await client.get(status_url, params=status_params)
+                status_response = await client.get(status_url, params=status_params, headers=headers)
 
                 if status_response.status_code != 200:
                     logger.error(f"Failed to fetch tx status: {status_response.text}")
