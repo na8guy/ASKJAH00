@@ -3526,14 +3526,14 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             'Accept-Encoding': 'gzip, deflate, br',
             'Referer': 'https://gmgn.ai/',
             'Origin': 'https://gmgn.ai',
-            'Content-Type': 'application/json',  # For POST requests
+            'Content-Type': 'application/json',
             'Connection': 'keep-alive',
             'Sec-Fetch-Dest': 'empty',
             'Sec-Fetch-Mode': 'cors',
             'Sec-Fetch-Site': 'same-origin'
         }
 
-        # Get proxy from env if set (dict format for per-scheme)
+        # Get proxy from env if set
         proxy_env = os.getenv('HTTP_PROXY')
         proxies = {'http://': proxy_env, 'https://': proxy_env} if proxy_env else None
 
@@ -3541,17 +3541,24 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         max_retries = 3
         retry_delay = 1  # seconds, exponential backoff
         balance_fetched = False
-        response = None  # Initialize to avoid unbound errors
+        balance = 0.0
+        
         for attempt in range(max_retries):
             try:
-                # Use 'proxy' arg (dict supported in 0.28+)
-                async with httpx.AsyncClient(timeout=30.0, proxy=proxies) as client:
+                async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
                     balance_url = f"{GMGN_API_HOST}/defi/router/v1/sol/account/get_balance"
                     balance_params = {"address": from_address}
                     balance_response = await client.get(balance_url, params=balance_params, headers=headers)
 
                     if balance_response.status_code == 200:
-                        balance_data = balance_response.json()
+                        # Handle gzipped response
+                        if balance_response.headers.get('Content-Encoding') == 'gzip':
+                            import gzip
+                            decompressed_data = gzip.decompress(balance_response.content)
+                            balance_data = json.loads(decompressed_data.decode('utf-8'))
+                        else:
+                            balance_data = balance_response.json()
+                            
                         if balance_data.get("code") == 0:
                             lamports = int(balance_data["data"]["balance"])
                             balance = lamports / 1_000_000_000  # convert to SOL
@@ -3562,13 +3569,12 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                             logger.warning(f"Balance API error on attempt {attempt + 1}: {balance_data.get('msg')}")
                     else:
                         logger.warning(f"Balance fetch failed on attempt {attempt + 1}: {balance_response.status_code} - {balance_response.text}")
-                    response = balance_response  # Set for logging if needed
-
+                        
             except Exception as e:
                 logger.warning(f"Balance fetch exception on attempt {attempt + 1}: {str(e)}")
 
             if attempt < max_retries - 1:
-                time.sleep(retry_delay)
+                await asyncio.sleep(retry_delay)
                 retry_delay *= 2  # Exponential backoff
 
         if not balance_fetched:
@@ -3623,47 +3629,80 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             params['out_amount'] = str(out_amount)
 
         logger.debug(f"🔄 GMGN API params: {params}")
-        async with httpx.AsyncClient(timeout=30.0, proxy=proxies) as client:
-            # Get swap route
-            response = await client.get(quote_url, params=params, headers=headers)
-            logger.debug(f"🔁 GMGN API response {response.status_code}: {response.text[:300]}")
+        
+        # Get swap route with retry
+        route = None
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
+                    response = await client.get(quote_url, params=params, headers=headers)
+                    logger.debug(f"🔁 GMGN API response {response.status_code}: {response.text[:300]}")
 
-            if response.status_code != 200:
-                logger.error(f"GMGN API failed: {response.status_code} - {response.text}")
-                return False
+                    if response.status_code != 200:
+                        logger.error(f"GMGN API failed: {response.status_code} - {response.text}")
+                        continue
 
-            route = response.json()
-            if route.get('code') != 0 or 'data' not in route:
-                logger.error(f"Failed to get swap route: {route.get('msg')}")
-                return False
+                    # Handle gzipped response
+                    if response.headers.get('Content-Encoding') == 'gzip':
+                        import gzip
+                        decompressed_data = gzip.decompress(response.content)
+                        route = json.loads(decompressed_data.decode('utf-8'))
+                    else:
+                        route = response.json()
+                        
+                    if route.get('code') == 0 and 'data' in route:
+                        break
+                    else:
+                        logger.error(f"Failed to get swap route: {route.get('msg')}")
+                        route = None
+                        
+            except Exception as e:
+                logger.error(f"Swap route fetch exception on attempt {attempt + 1}: {str(e)}")
+                
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2
 
-            raw_tx = route['data'].get('raw_tx')
-            if not raw_tx:
-                logger.error("No raw_tx found in route data")
-                return False
+        if not route:
+            logger.error("Failed to get swap route after all retries")
+            return False
 
-            swap_transaction = raw_tx.get('swapTransaction')
-            last_valid_block_height = raw_tx.get('lastValidBlockHeight')
-            if not swap_transaction:
-                logger.error("Missing swapTransaction in response")
-                return False
+        raw_tx = route['data'].get('raw_tx')
+        if not raw_tx:
+            logger.error("No raw_tx found in route data")
+            return False
 
-            # Deserialize + sign transaction
-            swap_transaction_buf = base64.b64decode(swap_transaction)
-            transaction = VersionedTransaction.deserialize(swap_transaction_buf)
-            transaction.sign([keypair])
-            signed_tx = base64.b64encode(transaction.serialize()).decode('utf-8')
+        swap_transaction = raw_tx.get('swapTransaction')
+        last_valid_block_height = raw_tx.get('lastValidBlockHeight')
+        if not swap_transaction:
+            logger.error("Missing swapTransaction in response")
+            return False
 
-            # Submit transaction
-            submit_url = f"{GMGN_API_HOST}/txproxy/v1/send_transaction"
-            payload = {'chain': 'sol', 'signedTx': signed_tx}
+        # Deserialize + sign transaction
+        swap_transaction_buf = base64.b64decode(swap_transaction)
+        transaction = VersionedTransaction.deserialize(swap_transaction_buf)
+        transaction.sign([keypair])
+        signed_tx = base64.b64encode(transaction.serialize()).decode('utf-8')
+
+        # Submit transaction
+        submit_url = f"{GMGN_API_HOST}/txproxy/v1/send_transaction"
+        payload = {'chain': 'sol', 'signedTx': signed_tx}
+        
+        async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
             submit_response = await client.post(submit_url, json=payload, headers=headers)
 
             if submit_response.status_code != 200:
                 logger.error(f"Transaction submission failed: {submit_response.text}")
                 return False
 
-            submit_result = submit_response.json()
+            # Handle gzipped response
+            if submit_response.headers.get('Content-Encoding') == 'gzip':
+                import gzip
+                decompressed_data = gzip.decompress(submit_response.content)
+                submit_result = json.loads(decompressed_data.decode('utf-8'))
+            else:
+                submit_result = submit_response.json()
+                
             if submit_result.get('code') != 0:
                 logger.error(f"Failed to submit transaction: {submit_result.get('msg')}")
                 return False
@@ -3682,7 +3721,14 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                     logger.error(f"Failed to fetch tx status: {status_response.text}")
                     return False
 
-                status = status_response.json()
+                # Handle gzipped response
+                if status_response.headers.get('Content-Encoding') == 'gzip':
+                    import gzip
+                    decompressed_data = gzip.decompress(status_response.content)
+                    status = json.loads(decompressed_data.decode('utf-8'))
+                else:
+                    status = status_response.json()
+                    
                 if status.get('code') != 0:
                     logger.error(f"Failed to check transaction status: {status.get('msg')}")
                     return False
@@ -3709,7 +3755,6 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         if "submit_response" in locals() and hasattr(submit_response, 'status_code'):
             logger.error(f"Submit Response: {submit_response.status_code} - {submit_response.text}")
         return False
-
     
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
