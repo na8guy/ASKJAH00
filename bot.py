@@ -115,7 +115,6 @@ load_dotenv()
 # Constants
 SUBSCRIPTION_SOL_AMOUNT = 0.005
 PBKDF2_ROUNDS = 2048
-GMGN_API_HOST = 'https://gmgn.ai'
 DEXSCREENER_NEW_TOKENS_API = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
 MIN_LIQUIDITY = 1000  # Minimum liquidity threshold in USD
@@ -3168,10 +3167,10 @@ def parse_geckoterminal_response(data, contract_address):
             'name': attributes.get('name', 'Unknown'),
             'symbol': attributes.get('symbol', 'UNKNOWN'),
             'contract_address': contract_address,
-            'price_usd': attributes.get('price_usd', 0),
-            'market_cap': attributes.get('fdv_usd', 0),
-            'liquidity': attributes.get('liquidity_usd', 0),
-            'volume': attributes.get('volume_usd', {}).get('h24', 0),
+            'price_usd': float(attributes.get('price_usd', 0)),
+            'market_cap': float(attributes.get('fdv_usd', 0)),
+            'liquidity': float(attributes.get('liquidity_usd', 0)),
+            'volume': float(attributes.get('volume_usd', {}).get('h24', 0)),
             'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
             'image': attributes.get('image_thumb_url', ''),
             'socials': {}  # Add if available in response
@@ -3187,10 +3186,10 @@ def parse_birdeye_response(data, contract_address):
             'name': token_data.get('name', 'Unknown'),
             'symbol': token_data.get('symbol', 'UNKNOWN'),
             'contract_address': contract_address,
-            'price_usd': token_data.get('price', 0),
-            'market_cap': token_data.get('mc', 0),
-            'liquidity': token_data.get('liquidity', 0),
-            'volume': token_data.get('v24hUSD', 0),
+            'price_usd': float(token_data.get('price', 0)),
+            'market_cap': float(token_data.get('mc', 0)),
+            'liquidity': float(token_data.get('liquidity', 0)),
+            'volume': float(token_data.get('v24hUSD', 0)),
             'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
             'image': token_data.get('image', ''),
             'socials': {}  # Birdeye doesn't provide socials in this endpoint
@@ -3895,7 +3894,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             token_decimals = await get_token_decimals(contract_address)
             amount_raw = int(token_amount * (10 ** token_decimals))
             
-            swap_mode = "ExactOut"
+            swap_mode = "ExactIn"
             amount_lamports = amount_raw
 
         # Get quote from Jupiter
@@ -3976,7 +3975,6 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
     except Exception as e:
         logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
         return False
-    
 
 
 async def get_token_decimals(token_address: str) -> int:
