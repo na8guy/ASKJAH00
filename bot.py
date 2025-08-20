@@ -3869,7 +3869,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             output_mint = contract_address
             amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
             swap_mode = "ExactIn"
-            slippage_bps = "500"  # 5% slippage for buys
+            slippage_bps = 500  # 5% slippage for buys (as integer)
         else:  # sell
             input_mint = contract_address
             output_mint = "So11111111111111111111111111111111111111112"  # SOL
@@ -3881,18 +3881,18 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             
             swap_mode = "ExactIn"  # We're specifying the exact input token amount
             amount_lamports = amount_raw
-            slippage_bps = "1000"  # 10% slippage for sells
+            slippage_bps = 1000  # 10% slippage for sells (as integer)
 
         # Get quote from Jupiter
         quote_params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
             "amount": str(amount_lamports),
-            "slippageBps": slippage_bps,
+            "slippageBps": slippage_bps,  # Use integer instead of string
             "swapMode": swap_mode,
-            "onlyDirectRoutes": "false",
-            "asLegacyTransaction": "false",
-            "maxAccounts": "64"
+            "onlyDirectRoutes": False,  # Use boolean instead of string
+            "asLegacyTransaction": False,  # Use boolean instead of string
+            "maxAccounts": 64  # Use integer instead of string
         }
 
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -3927,7 +3927,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 "userPublicKey": from_address,
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "100000",
+                "prioritizationFeeLamports": 100000,  # Use integer instead of string
                 "useSharedAccounts": True,
                 "asLegacyTransaction": False,
                 "useTokenLedger": False
