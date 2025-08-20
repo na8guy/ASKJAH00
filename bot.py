@@ -3065,11 +3065,19 @@ async def handle_token_button(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.reply_text(f"❌ You don't hold any {token['name']} tokens to sell.")
             return ConversationHandler.END
             
-        available = portfolio[contract_address]['amount']
+        # Calculate available token count from SOL investment and buy price
+        token_data = portfolio[contract_address]
+        buy_price = token_data['buy_price']
+        sol_invested = token_data['amount']
+        
+        # Calculate token count: token_count = SOL_invested / buy_price
+        available_tokens = sol_invested / buy_price
+        
         await query.message.reply_text(
             f"💸 *Sell Order for {token['name']} ({token['symbol']})*\n\n"
-            f"Available: {available:.4f} SOL worth\n"
-            f"Enter amount to sell in SOL:",
+            f"Available: {available_tokens:.2f} tokens\n"
+            f"Current Price: ${token['price_usd']:.6f}\n"
+            f"Enter number of tokens to sell:",
             parse_mode='Markdown'
         )
         return SELL_AMOUNT
