@@ -1354,7 +1354,7 @@ async def generate_performance_chart(token_data):
 
 
 async def token_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Initiate token performance analysis with chart"""
+    """Initiate token performance analysis with detailed metrics"""
     user_id = update.effective_user.id
     log_user_action(user_id, "TOKEN_ANALYSIS_REQUEST")
     
@@ -1365,7 +1365,7 @@ async def token_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return INPUT_ANALYSIS_CONTRACT
 
 async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle token contract input with robust error handling"""
+    """Handle token contract input with comprehensive analysis"""
     user_id = update.effective_user.id
     contract_address = update.message.text.strip()
     
@@ -1401,48 +1401,63 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         # Calculate time since first tracking
         time_tracked = datetime.now() - first_tracked
-        hours_tracked = time_tracked.total_seconds() / 3600
-        
-        # Generate performance chart only if we have history
-        chart_url = None
-        performance_history = token_data.get('performance_history', [])
-        
-        if performance_history:
-            try:
-                chart_url = await generate_performance_chart(token_data)
-            except Exception as e:
-                logger.error(f"Chart generation error: {str(e)}")
-        
-        # Format analysis message with fallback values
-        ath = token_data.get('ath', current_token['price_usd'])
-        atl = token_data.get('atl', current_token['price_usd'])
-        volatility = token_data.get('volatility', 0)
-        liquidity_health = token_data.get('liquidity_health', 50)
-        sentiment_score = token_data.get('sentiment_score', 50)
+        days_tracked = time_tracked.days
+        hours_tracked = time_tracked.seconds // 3600
         
         # Calculate performance metrics
-        price_change_1h = calculate_timeframe_change(token_data, hours=1) if performance_history else 0
-        price_change_6h = calculate_timeframe_change(token_data, hours=6) if performance_history else 0
-        price_change_24h = calculate_timeframe_change(token_data, hours=24) if performance_history else 0
+        initial_price = token_data['initial_metrics']['price']
+        current_price = current_token['price_usd']
         
-        # Format analysis message
+        # Calculate percentage change and multiple
+        if initial_price > 0:
+            price_change_percent = ((current_price - initial_price) / initial_price) * 100
+            price_multiple = current_price / initial_price
+        else:
+            price_change_percent = 0
+            price_multiple = 1
+            
+        # Calculate market cap changes
+        initial_mc = token_data['initial_metrics'].get('market_cap', 
+                     token_data['initial_metrics'].get('liquidity', 0) * 2)
+        current_mc = current_token.get('market_cap', current_token.get('liquidity', 0) * 2)
+        
+        if initial_mc > 0:
+            mc_change_percent = ((current_mc - initial_mc) / initial_mc) * 100
+            mc_multiple = current_mc / initial_mc
+        else:
+            mc_change_percent = 0
+            mc_multiple = 1
+        
+        # Format the analysis message
         message = (
-            f"📊 *Advanced Token Analysis - {token_data.get('name', 'Unknown Token')}* "
-            f"({token_data.get('symbol', 'UNKNOWN')})\n\n"
-            f"🔗 *Contract:* `{contract_address}`\n"
-            f"⏱️ *Tracked for:* {time_tracked.days} days, {int(hours_tracked % 24)} hours\n\n"
-            f"📈 *Price Performance*\n"
-            f"  - Current: ${current_token['price_usd']:.8f}\n"
-            f"  - ATH: ${ath:.8f}\n"
-            f"  - ATL: ${atl:.8f}\n\n"
-            f"📉 *Volatility*: {volatility:.2f}%\n"
-            f"💧 *Liquidity Health*: {liquidity_health}/100\n"
-            f"📣 *Market Sentiment*: {sentiment_score}/100\n"
-            f"⏱️ *Recent Performance*\n"
-            f"  - 1h: {price_change_1h:+.2f}%\n"
-            f"  - 6h: {price_change_6h:+.2f}%\n"
-            f"  - 24h: {price_change_24h:+.2f}%\n"
+            f"🚀 *{current_token.get('name', 'Unknown Token')} ({current_token.get('symbol', 'UNKNOWN')})*\n\n"
+            f"🔗 *Contract:* `{contract_address}`\n\n"
+            f"📊 *Performance Analysis*\n"
+            f"• *Initial Price:* ${initial_price:.8f}\n"
+            f"• *Current Price:* ${current_price:.8f}\n"
+            f"• *Price Change:* {price_change_percent:+.2f}%\n"
+            f"• *Multiple:* {price_multiple:.2f}x\n\n"
+            f"💰 *Market Cap Analysis*\n"
+            f"• *Initial MC:* ${initial_mc:,.2f}\n"
+            f"• *Current MC:* ${current_mc:,.2f}\n"
+            f"• *MC Change:* {mc_change_percent:+.2f}%\n"
+            f"• *MC Multiple:* {mc_multiple:.2f}x\n\n"
+            f"⏰ *Tracking Duration*\n"
+            f"• *First Tracked:* {first_tracked.strftime('%Y-%m-%d %H:%M UTC')}\n"
+            f"• *Time Tracked:* {days_tracked} days, {hours_tracked} hours\n\n"
+            f"📈 *Current Metrics*\n"
+            f"• *Liquidity:* ${current_token.get('liquidity', 0):,.2f}\n"
+            f"• *24h Volume:* ${current_token.get('volume', 0):,.2f}\n"
+            f"• *Holders:* {current_token.get('holders', 'N/A')}\n\n"
         )
+        
+        # Add volatility and sentiment if available
+        if 'volatility' in token_data:
+            message += f"📊 *Volatility:* {token_data.get('volatility', 0):.2f}%\n"
+        if 'sentiment_score' in token_data:
+            sentiment = token_data.get('sentiment_score', 50)
+            sentiment_emoji = "😊" if sentiment > 60 else "😐" if sentiment > 40 else "😞"
+            message += f"📣 *Market Sentiment:* {sentiment}/100 {sentiment_emoji}\n"
         
         # Add prediction if available
         if token_data.get('prediction'):
@@ -1453,9 +1468,31 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"(Confidence: {pred['confidence']:.1f}%)\n"
             )
         
-        # Add chart if available
+        # Add links section
+        solscan_url = f"https://solscan.io/token/{contract_address}"
+        dexscreener_url = f"https://dexscreener.com/solana/{contract_address}"
+        birdeye_url = f"https://birdeye.so/token/{contract_address}"
+        
+        message += (
+            f"\n🔗 *Links*\n"
+            f"• [DexScreener]({dexscreener_url})\n"
+            f"• [Solscan]({solscan_url})\n"
+            f"• [Birdeye]({birdeye_url})\n\n"
+        )
+        
+        # Add trading platforms if available
+        message += "🤖 *Trading Platforms*\n"
+        message += "• Jupiter | Raydium | Orca | Phantom | Solflare\n\n"
+        
+        # Add footer
+        message += "---\n"
+        message += "📊 *Powered by Trading Bot Analytics*\n"
+        message += "Your multi-chain trading companion"
+        
+        # Generate performance chart
+        chart_url = await generate_performance_chart(token_data)
         if chart_url:
-            message += f"\n[View Full Performance Chart]({chart_url})"
+            message += f"\n\n[View Performance Chart]({chart_url})"
         
         # Send message
         try:
@@ -4256,7 +4293,7 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def execute_auto_buy(context, user_id, token, buy_amount):
-    """Execute automatic buy using Jupiter API"""
+    """Execute automatic buy using the same logic as manual trades"""
     try:
         # Check balance
         balance = await check_balance(user_id, 'solana')
@@ -4269,7 +4306,7 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
             return False
         
         # Execute trade using the same function as manual trades
-        success = await execute_trade(
+        success, message = await execute_trade(
             user_id, 
             token['contract_address'], 
             buy_amount, 
@@ -4295,7 +4332,7 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
             )
             await notify_user(
                 context, user_id,
-                f"🤖 AUTOBUY: Purchased {buy_amount} SOL worth of {token['name']} at ${token['price_usd']:.6f}",
+                f"🤖 AUTOBUY: {message}",
                 "Auto-Buy Executed"
             )
             return True
@@ -4307,69 +4344,94 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
             )
             await notify_user(
                 context, user_id,
-                f"❌ AUTOBUY FAILED: Could not buy {token['name']} - added to blacklist",
+                f"❌ AUTOBUY FAILED: {message}",
                 "Auto-Buy Failed"
             )
             return False
             
     except Exception as e:
         logger.error(f"Auto-buy execution error: {str(e)}")
+        await notify_user(
+            context, user_id,
+            f"❌ AUTOBUY ERROR: {str(e)}",
+            "Auto-Buy Error"
+        )
         return False
     
 
 async def execute_auto_sell(context, user_id, token, token_data, reason):
-    """Execute automatic sell using Jupiter API"""
-    # Execute trade
-    success = await execute_trade(
-        user_id, 
-        token['contract_address'], 
-        token_data['amount'], 
-        'sell', 
-        'solana',
-        token
-    )
-    
-    if success:
-        # Remove from portfolio
-        users_collection.update_one(
-            {'user_id': user_id},
-            {'$unset': {f'portfolio.{token["contract_address"]}': ""}},
+    """Execute automatic sell using the same logic as manual trades"""
+    try:
+        # For sell orders, we need to calculate the token amount from SOL value
+        token_amount = token_data['amount'] / token_data['buy_price']
+        
+        # Execute trade using the same function as manual trades
+        success, message = await execute_trade(
+            user_id, 
+            token['contract_address'], 
+            token_amount,  # Pass token amount instead of SOL amount
+            'sell', 
+            'solana',
+            token
         )
         
-        # Record trade history
-        trade_data = {
-    'token': token['name'],
-    'symbol': token['symbol'],
-    'contract': token['contract_address'],
-    'amount': token_data['amount'],
-    'buy_price': token_data['buy_price'],
-    'sell_price': token['price_usd'],
-    'reason': reason,
-    'tx_hash': str(tx_hash.value) if 'tx_hash' in locals() else 'N/A',  # Convert to string
-    'timestamp': datetime.now().isoformat()
-}
-        users_collection.update_one(
-            {'user_id': user_id},
-            {'$push': {'trade_history': trade_data}}
-        )
-        
-        # Update last trade time
-        users_collection.update_one(
-            {'user_id': user_id},
-            {'$set': {'last_trade_time': time.time()}}
-        )
-        
+        if success:
+            # Extract transaction hash from the success message
+            # The message format from execute_trade is: "Trade successful! TX: {tx_hash}"
+            tx_hash = None
+            if "TX:" in message:
+                tx_hash = message.split("TX:")[1].strip()
+            
+            # Remove from portfolio
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$unset': {f'portfolio.{token["contract_address"]}': ""}},
+            )
+            
+            # Record trade history with transaction hash
+            trade_data = {
+                'token': token['name'],
+                'symbol': token['symbol'],
+                'contract': token['contract_address'],
+                'amount': token_data['amount'],
+                'buy_price': token_data['buy_price'],
+                'sell_price': token['price_usd'],
+                'reason': reason,
+                'tx_hash': tx_hash or 'N/A',  # Use the extracted hash or fallback
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$push': {'trade_history': trade_data}}
+            )
+            
+            # Update last trade time
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {'last_trade_time': time.time()}}
+            )
+            
+            await notify_user(
+                context, user_id,
+                f"🤖 AUTOSELL: {message}",
+                "Auto-Sell Executed"
+            )
+            return True
+        else:
+            await notify_user(
+                context, user_id,
+                f"❌ AUTOSELL FAILED: {message}",
+                "Auto-Sell Failed"
+            )
+            return False
+            
+    except Exception as e:
+        logger.error(f"Auto-sell execution error: {str(e)}")
         await notify_user(
             context, user_id,
-            f"🤖 AUTOSELL: Sold {token_data['amount']} SOL worth of {token['name']} at {reason}",
-            "Auto-Sell Executed"
-        )
-        return True
-    else:
-        await notify_user(
-            context, user_id,
-            f"❌ AUTOSELL FAILED: Could not sell {token['name']}",
-            "Auto-Sell Failed"
+            f"❌ AUTOSELL ERROR: {str(e)}",
+            "Auto-Sell Error"
         )
         return False
     
