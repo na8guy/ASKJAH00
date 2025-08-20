@@ -3156,8 +3156,9 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     """Handle sell amount input with proper token amount calculation"""
     user_id = update.effective_user.id
     try:
-        amount = float(update.message.text)
-        if amount <= 0:
+        # Get the token amount user wants to sell
+        token_amount = float(update.message.text)
+        if token_amount <= 0:
             await update.message.reply_text("❌ Please enter a positive amount.")
             return SELL_AMOUNT
         
@@ -3170,19 +3171,26 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         # Check token holdings
         user = users_collection.find_one({'user_id': user_id})
         portfolio = user.get('portfolio', {})
+        
         if token['contract_address'] not in portfolio:
             await update.message.reply_text(f"❌ You don't hold any {token['name']} tokens to sell.")
             return ConversationHandler.END
             
         token_data = portfolio[token['contract_address']]
         
-        # Convert SOL amount to token amount based on current price
-        token_amount = amount / token['price_usd']
-        holdings_token_amount = token_data['amount'] / token_data['buy_price']
+        # Get current token holdings in tokens (not SOL value)
+        # We need to calculate how many tokens the user actually has
+        # This requires knowing the original purchase price to calculate token count
+        buy_price = token_data['buy_price']
+        sol_invested = token_data['amount']
         
-        if token_amount > holdings_token_amount:
+        # Calculate how many tokens the user bought originally
+        # This assumes the portfolio stores SOL amount invested, not token count
+        token_count_held = sol_invested / buy_price
+        
+        if token_amount > token_count_held:
             await update.message.reply_text(
-                f"❌ Insufficient token balance. Available: {holdings_token_amount:.2f} tokens\n"
+                f"❌ Insufficient token balance. Available: {token_count_held:.2f} tokens\n"
                 f"You requested to sell {token_amount:.2f} tokens."
             )
             return SELL_AMOUNT
@@ -3193,7 +3201,7 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         # Execute trade immediately
         await update.message.reply_text(f"⏳ Executing sell order for {token_amount:.2f} {token['symbol']} tokens...")
         
-        # For sell orders, we need to pass the token amount, not SOL amount
+        # For sell orders, we need to pass the token amount
         success = await execute_trade(
             user_id, 
             token['contract_address'], 
@@ -3205,10 +3213,10 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         
         if success:
             # Update portfolio
-            new_token_amount = holdings_token_amount - token_amount
-            new_sol_amount = new_token_amount * token_data['buy_price']  # Keep original buy price
+            new_token_count = token_count_held - token_amount
+            new_sol_value = new_token_count * buy_price  # Keep original buy price for cost basis
             
-            if new_token_amount <= 0.001:  # Consider dust amounts as zero
+            if new_token_count <= 0.001:  # Consider dust amounts as zero
                 users_collection.update_one(
                     {'user_id': user_id},
                     {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
@@ -3217,11 +3225,10 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             else:
                 users_collection.update_one(
                     {'user_id': user_id},
-                    {'$set': {f'portfolio.{token["contract_address"]}.amount': new_sol_amount}}
+                    {'$set': {f'portfolio.{token["contract_address"]}.amount': new_sol_value}}
                 )
             
             # Calculate profit/loss
-            buy_price = token_data['buy_price']
             current_price = token['price_usd']
             price_change = ((current_price - buy_price) / buy_price) * 100
             profit_loss = "profit" if price_change >= 0 else "loss"
@@ -3230,7 +3237,7 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             await update.message.reply_text(
                 f"✅ Successfully sold {token_amount:.2f} {token['symbol']} tokens at ${token['price_usd']:.6f}.\n"
                 f"📈 This trade resulted in a {abs(price_change):.2f}% {profit_loss}.\n"
-                f"📊 You now hold {new_token_amount:.2f} {token['symbol']} tokens."
+                f"📊 You now hold {new_token_count:.2f} {token['symbol']} tokens."
             )
         else:
             log_user_action(user_id, "TRADE_FAILED", f"Sell {token_amount} tokens of {token['name']}", level="error")
@@ -3336,9 +3343,9 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 price_note = " (price unavailable, using buy price)"
             else:
                 current_price = token['price_usd']
-                # Calculate current value based on token amount and current price
-                token_amount = details['amount'] / details['buy_price']  # Convert SOL amount to token amount
-                current_value = token_amount * current_price
+                # Calculate token count and current value
+                token_count = details['amount'] / details['buy_price']
+                current_value = token_count * current_price
                 price_note = ""
                 
             total_portfolio_value += current_value
@@ -3348,10 +3355,14 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             profit_loss_percent = (profit_loss / details['amount']) * 100
             profit_loss_emoji = "📈" if profit_loss >= 0 else "📉"
             
+            # Calculate token count
+            token_count = details['amount'] / details['buy_price']
+            
             message += (
                 f"🔸 {details['name']} ({details['symbol']}):\n"
-                f"   - Holdings: {current_value:.4f} SOL{price_note}\n"
+                f"   - Token Amount: {token_count:.2f}\n"
                 f"   - Current Price: ${current_price:.8f}\n"
+                f"   - Buy Price: ${details['buy_price']:.8f}\n"
                 f"   - P&L: {profit_loss_emoji} {profit_loss:+.4f} SOL ({profit_loss_percent:+.2f}%)\n"
             )
         
