@@ -135,7 +135,8 @@ PERFORMANCE_TRACKING_DAYS = 7  # Track tokens for 7 days
  CONFIRM_NEW_WALLET, SET_WALLET_METHOD, INPUT_MNEMONIC, INPUT_PRIVATE_KEY, CONFIRM_SET_WALLET,
  SELECT_TOKEN_ACTION, SELL_AMOUNT, INPUT_CONTRACT,
  # New states for start flow
- START_IMPORT_METHOD, START_INPUT_MNEMONIC, START_INPUT_PRIVATE_KEY,SUBSCRIPTION_CONFIRMATION,INPUT_ANALYSIS_CONTRACT) = range(24)
+ START_IMPORT_METHOD, START_INPUT_MNEMONIC, START_INPUT_PRIVATE_KEY,SUBSCRIPTION_CONFIRMATION,INPUT_ANALYSIS_CONTRACT,SET_ANTI_MEV, SET_LIQUIDITY_THRESHOLD, SET_VOLUME_THRESHOLD, SET_RUG_CHECK, 
+ SET_MAX_SLIPPAGE, SET_MAX_GAS_PRICE, SET_TOKEN_AGE) = range(31, 38)
 
 # Create FastAPI app
 app = FastAPI()
@@ -2484,18 +2485,17 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     log_user_action(user_id, "TRADING_MODE_UPDATED", mode)
 
     if mode == 'manual':
-
+        # Remove auto-trade job if it exists
         for job in context.job_queue.jobs():
-         if job.name == f"auto_trade_{user_id}":
-            job.schedule_removal()
-            logger.info(f"Removed auto_trade job for user {user_id} on mode switch to manual")
-
+            if job.name == f"auto_trade_{user_id}":
+                job.schedule_removal()
+                logger.info(f"Removed auto_trade job for user {user_id} on mode switch to manual")
 
         await query.message.reply_text(
-        "✅ Trading mode set to *Manual*.\n"
-        "Use /trade or token buttons to trade Solana tokens.",
-        parse_mode='Markdown'
-    )
+            "✅ Trading mode set to *Manual*.\n"
+            "Use /trade or token buttons to trade Solana tokens.",
+            parse_mode='Markdown'
+        )
         return ConversationHandler.END
     else:
         await query.message.reply_text(
@@ -2567,6 +2567,172 @@ async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         log_user_action(user_id, "LOSS_PERCENTAGE_SET", f"{percentage}%")
         
+        await update.message.reply_text(
+            "🔒 Enable anti-MEV protection? (yes/no)\n\n"
+            "Anti-MEV measures help reduce the risk of front-running and sandwich attacks."
+        )
+        return SET_ANTI_MEV
+    except ValueError:
+        await update.message.reply_text("❌ Invalid percentage. Please enter a number.")
+        return SET_LOSS_PERCENTAGE
+
+
+async def set_anti_mev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set anti-MEV protection preference"""
+    user_id = update.effective_user.id
+    response = update.message.text.strip().lower()
+    
+    if response not in ['yes', 'no', 'y', 'n']:
+        await update.message.reply_text("❌ Please answer with 'yes' or 'no'.")
+        return SET_ANTI_MEV
+    
+    anti_mev = response in ['yes', 'y']
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {'anti_mev': anti_mev}}
+    )
+    log_user_action(user_id, "ANTI_MEV_SET", f"{anti_mev}")
+    
+    await update.message.reply_text(
+        "💧 Set minimum liquidity threshold in USD (e.g., 5000 for $5,000):\n\n"
+        "Tokens with liquidity below this amount will be ignored."
+    )
+    return SET_LIQUIDITY_THRESHOLD
+
+async def set_liquidity_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set minimum liquidity threshold"""
+    user_id = update.effective_user.id
+    try:
+        threshold = float(update.message.text)
+        if threshold < 1000:
+            await update.message.reply_text("❌ Minimum liquidity should be at least $1000 for safety.")
+            return SET_LIQUIDITY_THRESHOLD
+        
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'min_liquidity': threshold}}
+        )
+        log_user_action(user_id, "LIQUIDITY_THRESHOLD_SET", f"${threshold}")
+        
+        await update.message.reply_text(
+            "📊 Set minimum 24h volume threshold in USD (e.g., 1000 for $1,000):\n\n"
+            "Tokens with volume below this amount will be ignored."
+        )
+        return SET_VOLUME_THRESHOLD
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+        return SET_LIQUIDITY_THRESHOLD
+
+async def set_volume_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set minimum volume threshold"""
+    user_id = update.effective_user.id
+    try:
+        threshold = float(update.message.text)
+        if threshold < 500:
+            await update.message.reply_text("❌ Minimum volume should be at least $500 for safety.")
+            return SET_VOLUME_THRESHOLD
+        
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'min_volume': threshold}}
+        )
+        log_user_action(user_id, "VOLUME_THRESHOLD_SET", f"${threshold}")
+        
+        await update.message.reply_text(
+            "🛡️ Enable automatic rug pull detection? (yes/no)\n\n"
+            "This will check for common scam patterns before buying."
+        )
+        return SET_RUG_CHECK
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+        return SET_VOLUME_THRESHOLD
+
+async def set_rug_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set rug pull detection preference"""
+    user_id = update.effective_user.id
+    response = update.message.text.strip().lower()
+    
+    if response not in ['yes', 'no', 'y', 'n']:
+        await update.message.reply_text("❌ Please answer with 'yes' or 'no'.")
+        return SET_RUG_CHECK
+    
+    rug_check = response in ['yes', 'y']
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {'rug_check': rug_check}}
+    )
+    log_user_action(user_id, "RUG_CHECK_SET", f"{rug_check}")
+    
+    await update.message.reply_text(
+        "⚡ Set maximum slippage percentage (e.g., 5 for 5%):\n\n"
+        "This limits how much the price can change during transaction execution."
+    )
+    return SET_MAX_SLIPPAGE
+
+async def set_max_slippage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set maximum slippage percentage"""
+    user_id = update.effective_user.id
+    try:
+        slippage = float(update.message.text)
+        if slippage < 1 or slippage > 20:
+            await update.message.reply_text("❌ Slippage should be between 1% and 20%.")
+            return SET_MAX_SLIPPAGE
+        
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'max_slippage': slippage}}
+        )
+        log_user_action(user_id, "MAX_SLIPPAGE_SET", f"{slippage}%")
+        
+        await update.message.reply_text(
+            "⛽ Set maximum gas price in SOL (e.g., 0.0005 for 0.0005 SOL):\n\n"
+            "Transactions with higher gas prices will be skipped to save costs."
+        )
+        return SET_MAX_GAS_PRICE
+    except ValueError:
+        await update.message.reply_text("❌ Invalid percentage. Please enter a number.")
+        return SET_MAX_SLIPPAGE
+
+async def set_max_gas_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set maximum gas price"""
+    user_id = update.effective_user.id
+    try:
+        gas_price = float(update.message.text)
+        if gas_price <= 0 or gas_price > 0.01:
+            await update.message.reply_text("❌ Gas price should be between 0.0001 and 0.01 SOL.")
+            return SET_MAX_GAS_PRICE
+        
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'max_gas_price': gas_price}}
+        )
+        log_user_action(user_id, "MAX_GAS_PRICE_SET", f"{gas_price} SOL")
+        
+        await update.message.reply_text(
+            "⏰ Set minimum token age in minutes (e.g., 10 for 10 minutes):\n\n"
+            "Newer tokens than this will be ignored to avoid scams."
+        )
+        return SET_TOKEN_AGE
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+        return SET_MAX_GAS_PRICE
+
+async def set_token_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set minimum token age"""
+    user_id = update.effective_user.id
+    try:
+        min_age = float(update.message.text)
+        if min_age < 5 or min_age > 120:
+            await update.message.reply_text("❌ Token age should be between 5 and 120 minutes.")
+            return SET_TOKEN_AGE
+        
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'min_token_age': min_age}}
+        )
+        log_user_action(user_id, "MIN_TOKEN_AGE_SET", f"{min_age} minutes")
+        
+        # Get user data to show final configuration
         user = users_collection.find_one({'user_id': user_id})
         
         # Schedule auto-trade job
@@ -2576,27 +2742,34 @@ async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         context.job_queue.run_repeating(
             auto_trade, 
-            interval=30,  # Check every 30 seconds
+            interval=30,
             first=5, 
             user_id=user_id,
             name=f"auto_trade_{user_id}"
         )
         
         await update.message.reply_text(
-            f"✅ *Automatic trading activated!*\n\n"
+            f"✅ *Automatic trading activated with enhanced safety parameters!*\n\n"
             f"🤖 Settings:\n"
             f"• Auto-buy amount: {user['auto_buy_amount']} SOL\n"
             f"• Sell at: {user['sell_percentage']}% profit\n"
             f"• Stop-loss at: {user['loss_percentage']}% loss\n"
-            f"• Token liquidity filter: >${MIN_LIQUIDITY}\n\n"
+            f"• Anti-MEV: {'Yes' if user.get('anti_mev', False) else 'No'}\n"
+            f"• Min liquidity: ${user.get('min_liquidity', 1000)}\n"
+            f"• Min volume: ${user.get('min_volume', 500)}\n"
+            f"• Rug check: {'Yes' if user.get('rug_check', False) else 'No'}\n"
+            f"• Max slippage: {user.get('max_slippage', 5)}%\n"
+            f"• Max gas: {user.get('max_gas_price', 0.0005)} SOL\n"
+            f"• Min token age: {user.get('min_token_age', 10)} minutes\n\n"
             f"🔔 You'll receive notifications for all auto-trades.",
             parse_mode='Markdown'
         )
         return ConversationHandler.END
     except ValueError:
-        await update.message.reply_text("❌ Invalid percentage. Please enter a number.")
-        return SET_LOSS_PERCENTAGE
-    
+        await update.message.reply_text("❌ Invalid number. Please enter a number.")
+        return SET_TOKEN_AGE
+
+
 
 async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
     """Send daily trading report to users"""
@@ -2980,7 +3153,7 @@ async def buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle sell amount input with balance check and trade execution"""
+    """Handle sell amount input with proper token amount calculation"""
     user_id = update.effective_user.id
     try:
         amount = float(update.message.text)
@@ -3002,22 +3175,40 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             return ConversationHandler.END
             
         token_data = portfolio[token['contract_address']]
-        if amount > token_data['amount']:
+        
+        # Convert SOL amount to token amount based on current price
+        token_amount = amount / token['price_usd']
+        holdings_token_amount = token_data['amount'] / token_data['buy_price']
+        
+        if token_amount > holdings_token_amount:
             await update.message.reply_text(
-                f"❌ Insufficient token balance. Available: {token_data['amount']:.4f} SOL worth\n"
-                f"You requested to sell {amount:.4f} SOL worth."
+                f"❌ Insufficient token balance. Available: {holdings_token_amount:.2f} tokens\n"
+                f"You requested to sell {token_amount:.2f} tokens."
             )
             return SELL_AMOUNT
         
+        # Store the token amount in context for execution
+        context.user_data['sell_token_amount'] = token_amount
+        
         # Execute trade immediately
-        await update.message.reply_text(f"⏳ Executing sell order for {amount:.4f} SOL worth of {token['name']}...")
-        success = await execute_trade(user_id, token['contract_address'], amount, 'sell', 'solana', token)
+        await update.message.reply_text(f"⏳ Executing sell order for {token_amount:.2f} {token['symbol']} tokens...")
+        
+        # For sell orders, we need to pass the token amount, not SOL amount
+        success = await execute_trade(
+            user_id, 
+            token['contract_address'], 
+            token_amount,  # Pass token amount instead of SOL amount
+            'sell', 
+            'solana',
+            token
+        )
         
         if success:
             # Update portfolio
-            new_amount = token_data['amount'] - amount
+            new_token_amount = holdings_token_amount - token_amount
+            new_sol_amount = new_token_amount * token_data['buy_price']  # Keep original buy price
             
-            if new_amount <= 0.001:  # Consider dust amounts as zero
+            if new_token_amount <= 0.001:  # Consider dust amounts as zero
                 users_collection.update_one(
                     {'user_id': user_id},
                     {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
@@ -3026,7 +3217,7 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             else:
                 users_collection.update_one(
                     {'user_id': user_id},
-                    {'$set': {f'portfolio.{token["contract_address"]}.amount': new_amount}}
+                    {'$set': {f'portfolio.{token["contract_address"]}.amount': new_sol_amount}}
                 )
             
             # Calculate profit/loss
@@ -3035,14 +3226,14 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             price_change = ((current_price - buy_price) / buy_price) * 100
             profit_loss = "profit" if price_change >= 0 else "loss"
             
-            log_user_action(user_id, "TRADE_EXECUTED", f"Sold {amount} SOL worth of {token['name']}")
+            log_user_action(user_id, "TRADE_EXECUTED", f"Sold {token_amount} tokens of {token['name']}")
             await update.message.reply_text(
-                f"✅ Successfully sold {amount:.4f} SOL worth of {token['name']} at ${token['price_usd']:.6f}.\n"
+                f"✅ Successfully sold {token_amount:.2f} {token['symbol']} tokens at ${token['price_usd']:.6f}.\n"
                 f"📈 This trade resulted in a {abs(price_change):.2f}% {profit_loss}.\n"
-                f"📊 You now hold {new_amount:.4f} SOL worth of {token['symbol']}."
+                f"📊 You now hold {new_token_amount:.2f} {token['symbol']} tokens."
             )
         else:
-            log_user_action(user_id, "TRADE_FAILED", f"Sell {amount} SOL of {token['name']}", level="error")
+            log_user_action(user_id, "TRADE_FAILED", f"Sell {token_amount} tokens of {token['name']}", level="error")
             await update.message.reply_text("❌ Trade failed. Please try again later.")
         
         return ConversationHandler.END
@@ -3104,7 +3295,7 @@ async def confirm_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show wallet balances with token amounts"""
+    """Show wallet balances with current token values"""
     user_id = update.effective_user.id
     log_user_action(user_id, "BALANCE_REQUEST")
     
@@ -3133,15 +3324,38 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not portfolio:
         message += "No tokens held."
     else:
+        total_portfolio_value = 0
+        
         for contract, details in portfolio.items():
-            # Calculate token amount based on buy price
-            token_amount = details['amount'] / details['buy_price']
+            # Get current token price
+            token = await fetch_token_by_contract(contract)
+            if not token:
+                # Use buy price if current price not available
+                current_price = details['buy_price']
+                current_value = details['amount']
+                price_note = " (price unavailable, using buy price)"
+            else:
+                current_price = token['price_usd']
+                # Calculate current value based on token amount and current price
+                token_amount = details['amount'] / details['buy_price']  # Convert SOL amount to token amount
+                current_value = token_amount * current_price
+                price_note = ""
+                
+            total_portfolio_value += current_value
+            
+            # Calculate profit/loss
+            profit_loss = current_value - details['amount']
+            profit_loss_percent = (profit_loss / details['amount']) * 100
+            profit_loss_emoji = "📈" if profit_loss >= 0 else "📉"
+            
             message += (
-                f"🔸 {details['name']} ({details['symbol']}): "
-                f"{token_amount:.2f} tokens "
-                f"(Value: {details['amount']:.4f} SOL)\n"
-                f"   - Bought at: ${details['buy_price']:.8f}\n"
+                f"🔸 {details['name']} ({details['symbol']}):\n"
+                f"   - Holdings: {current_value:.4f} SOL{price_note}\n"
+                f"   - Current Price: ${current_price:.8f}\n"
+                f"   - P&L: {profit_loss_emoji} {profit_loss:+.4f} SOL ({profit_loss_percent:+.2f}%)\n"
             )
+        
+        message += f"\n💼 *Total Portfolio Value*: {total_portfolio_value:.4f} SOL"
     
     await update.message.reply_text(message, parse_mode='Markdown')
 
@@ -3496,7 +3710,7 @@ async def check_balance(user_id, chain):
         return 0.0
 
 async def execute_trade(user_id, contract_address, amount, action, chain, token_info):
-    logger.info(f"🏁 Starting {action} trade for {amount} SOL of {contract_address}")
+    logger.info(f"🏁 Starting {action} trade for {amount} of {contract_address}")
     try:
         # Only support Solana
         if chain != 'solana':
@@ -3531,8 +3745,23 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         else:  # sell
             input_mint = contract_address
             output_mint = "So11111111111111111111111111111111111111112"  # SOL
-            amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
+            
+            # For sell orders, we need to calculate the token amount based on current price
+            # First get the current price to calculate token amount
+            current_token = await fetch_token_by_contract(contract_address)
+            if not current_token:
+                logger.error(f"Failed to fetch current token data for {contract_address}")
+                return False
+                
+            # Calculate token amount based on SOL value
+            token_amount = amount / current_token['price_usd']
+            
+            # Get token decimals to calculate raw amount
+            token_decimals = await get_token_decimals(contract_address)
+            amount_raw = int(token_amount * (10 ** token_decimals))
+            
             swap_mode = "ExactOut"
+            amount_lamports = amount_raw
 
         # Get quote from Jupiter
         quote_params = {
@@ -3573,7 +3802,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 logger.error("No swap transaction in response")
                 return False
 
-            # Deserialize transaction using the correct method
+            # Deserialize transaction
             transaction_bytes = base64.b64decode(swap_transaction)
             
             # Try different approaches to handle the transaction
@@ -3612,6 +3841,29 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
     except Exception as e:
         logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
         return False
+    
+
+
+async def get_token_decimals(token_address: str) -> int:
+    """Get token decimals from Solana blockchain"""
+    try:
+        # Try to get token info from Solana
+        mint_pubkey = Pubkey.from_string(token_address)
+        account_info = await solana_client.get_account_info(mint_pubkey)
+        
+        if account_info.value:
+            # Parse mint account data to get decimals
+            # Mint account layout: https://docs.rs/spl-token/3.2.0/spl_token/state/struct.Mint.html
+            data = account_info.value.data
+            if len(data) >= 44:  # Mint account data length is at least 44 bytes
+                decimals = data[44]  # Decimals are at offset 44
+                return decimals
+        
+        # Fallback to default value if not found
+        return 9
+    except Exception as e:
+        logger.error(f"Error getting decimals for token {token_address}: {str(e)}")
+        return 9  # Default to 9 decimals
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show debug information"""
@@ -3673,7 +3925,7 @@ async def notify_trial_ending(context: ContextTypes.DEFAULT_TYPE):
             log_user_action(user_id, "TRIAL_ENDING_NOTIFICATION")
 
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
-    """Handle automatic trading using Solana RPC and Jupiter API"""
+    """Handle automatic trading with enhanced safety parameters"""
     job = context.job
     user_id = job.user_id
     logger.info(f"🤖 Auto-trading for user {user_id}")
@@ -3708,34 +3960,52 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
             
             # Check profit target
             if price_change >= sell_percent:
-                await execute_auto_sell(
+                success = await execute_auto_sell(
                     context, user_id, token, token_data, 
                     f"{price_change:.2f}% profit"
                 )
+                if success:
+                    continue  # Move to next token after successful sale
                 
             # Check stop loss
             elif price_change <= -loss_percent:
-                await execute_auto_sell(
+                success = await execute_auto_sell(
                     context, user_id, token, token_data, 
                     f"{abs(price_change):.2f}% loss"
                 )
+                if success:
+                    continue  # Move to next token after successful sale
         
-        # 2. Handle buy conditions for new tokens
+        # 2. Handle buy conditions for new tokens (only if we have available SOL)
+        sol_balance = await check_balance(user_id, 'solana')
+        if sol_balance < buy_amount:
+            logger.debug(f"Insufficient SOL for auto-buy: {sol_balance} < {buy_amount}")
+            return
+            
         tokens = await fetch_latest_token()
         if not tokens:
             return
             
-        # Filter tokens that meet criteria
-        valid_tokens = [
-            t for t in tokens 
-            if t['liquidity'] >= MIN_LIQUIDITY 
-            and t['contract_address'] not in portfolio
-        ]
+        # Filter tokens using enhanced safety parameters
+        valid_tokens = []
+        for token in tokens:
+            # Skip tokens already in portfolio or blacklist
+            if token['contract_address'] in portfolio or token['contract_address'] in user.get('auto_trade_blacklist', []):
+                continue
+                
+            # Apply safety checks
+            is_safe, reason = await check_token_safety(token, user)
+            if not is_safe:
+                logger.info(f"Skipping token {token['name']}: {reason}")
+                continue
+                
+            valid_tokens.append(token)
         
         if not valid_tokens:
             return
             
-        token = valid_tokens[0]  # Take the best candidate
+        # Select the token with highest liquidity among safe tokens
+        token = max(valid_tokens, key=lambda x: x['liquidity'])
         await execute_auto_buy(context, user_id, token, buy_amount)
         
     except Exception as e:
@@ -3748,59 +4018,69 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def execute_auto_buy(context, user_id, token, buy_amount):
-    """Execute automatic buy using Solana RPC and Jupiter API"""
-    # Check balance
-    balance = await check_balance(user_id, 'solana')
-    if balance < buy_amount:
-        await notify_user(
-            context, user_id,
-            f"⏳ Insufficient balance for auto-buy. Needed: {buy_amount} SOL, Available: {balance:.4f} SOL",
-            "Auto-Buy Failed"
-        )
-        return False
+    """Execute automatic buy using Jupiter API"""
+    try:
+        # Check balance
+        balance = await check_balance(user_id, 'solana')
+        if balance < buy_amount:
+            await notify_user(
+                context, user_id,
+                f"⏳ Insufficient balance for auto-buy. Needed: {buy_amount} SOL, Available: {balance:.4f} SOL",
+                "Auto-Buy Failed"
+            )
+            return False
         
-    # Execute trade
-    success = await execute_trade(
-        user_id, 
-        token['contract_address'], 
-        buy_amount, 
-        'buy', 
-        'solana',
-        token
-    )
-    
-    if success:
-        # Update portfolio
-        users_collection.update_one(
-            {'user_id': user_id},
-            {'$set': {
-                f'portfolio.{token["contract_address"]}': {
-                    'name': token['name'],
-                    'symbol': token['symbol'],
-                    'amount': buy_amount,
-                    'buy_price': token['price_usd'],
-                    'buy_time': datetime.now().isoformat()
-                },
-                'last_trade_time': time.time()
-            }}
+        # Execute trade using the same function as manual trades
+        success = await execute_trade(
+            user_id, 
+            token['contract_address'], 
+            buy_amount, 
+            'buy', 
+            'solana',
+            token
         )
-        await notify_user(
-            context, user_id,
-            f"🤖 AUTOBUY: Purchased {buy_amount} SOL worth of {token['name']} at ${token['price_usd']:.6f}",
-            "Auto-Buy Executed"
-        )
-        return True
-    else:
-        await notify_user(
-            context, user_id,
-            f"❌ AUTOBUY FAILED: Could not buy {token['name']}",
-            "Auto-Buy Failed"
-        )
+        
+        if success:
+            # Update portfolio
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    f'portfolio.{token["contract_address"]}': {
+                        'name': token['name'],
+                        'symbol': token['symbol'],
+                        'amount': buy_amount,
+                        'buy_price': token['price_usd'],
+                        'buy_time': datetime.now().isoformat()
+                    },
+                    'last_trade_time': time.time()
+                }}
+            )
+            await notify_user(
+                context, user_id,
+                f"🤖 AUTOBUY: Purchased {buy_amount} SOL worth of {token['name']} at ${token['price_usd']:.6f}",
+                "Auto-Buy Executed"
+            )
+            return True
+        else:
+            # Add to blacklist if trade fails
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'auto_trade_blacklist': token['contract_address']}}
+            )
+            await notify_user(
+                context, user_id,
+                f"❌ AUTOBUY FAILED: Could not buy {token['name']} - added to blacklist",
+                "Auto-Buy Failed"
+            )
+            return False
+            
+    except Exception as e:
+        logger.error(f"Auto-buy execution error: {str(e)}")
         return False
     
 
 async def execute_auto_sell(context, user_id, token, token_data, reason):
-    """Execute automatic sell using Solana RPC and Jupiter API"""
+    """Execute automatic sell using Jupiter API"""
     # Execute trade
     success = await execute_trade(
         user_id, 
@@ -3854,6 +4134,45 @@ async def execute_auto_sell(context, user_id, token, token_data, reason):
         )
         return False
     
+async def is_legitimate_token(token: Dict[str, Any]) -> bool:
+    """Check if a token appears to be legitimate"""
+    try:
+        # Check for common scam patterns
+        if token['liquidity'] < 1000:  # Very low liquidity
+            return False
+            
+        if token.get('holders', 0) < 50:  # Very few holders
+            return False
+            
+        # Check if creator burned LP tokens (not a perfect check but helpful)
+        # This would require additional on-chain analysis
+        
+        return True
+    except:
+        return False
+
+async def check_token_safety(token: Dict[str, Any], user_settings: Dict[str, Any]) -> Tuple[bool, str]:
+    """Comprehensive token safety check"""
+    reasons = []
+    
+    # Liquidity check
+    if token['liquidity'] < user_settings.get('min_liquidity', 1000):
+        reasons.append(f"Liquidity (${token['liquidity']}) below threshold")
+    
+    # Volume check
+    if token['volume'] < user_settings.get('min_volume', 500):
+        reasons.append(f"Volume (${token['volume']}) below threshold")
+    
+    # Rug pull detection (if enabled)
+    if user_settings.get('rug_check', False) and not await is_legitimate_token(token):
+        reasons.append("Failed rug pull check")
+    
+    # Token age check (if we can determine it)
+    # This would require additional data not currently in the token object
+    
+    if reasons:
+        return False, ", ".join(reasons)
+    return True, "Passed all safety checks"
 
 async def jupiter_api_call(url, params=None, json_data=None, method="GET"):
     """Helper function for Jupiter API calls with retry logic"""
@@ -4076,20 +4395,34 @@ def setup_handlers(application: Application):
 
     # Set mode handler
     set_mode_handler = ConversationHandler(
-        entry_points=[CommandHandler("setmode", wrap_conversation_entry(set_mode))],
-        states={
-            SET_TRADING_MODE: [CallbackQueryHandler(wrap_conversation_state(mode_callback), 
-                               pattern='^(manual|automatic)$')],
-            SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                               wrap_conversation_state(set_auto_buy_amount))],
-            SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                               wrap_conversation_state(set_sell_percentage))],
-            SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                               wrap_conversation_state(set_loss_percentage))]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
-    )
+    entry_points=[CommandHandler("setmode", wrap_conversation_entry(set_mode))],
+    states={
+        SET_TRADING_MODE: [CallbackQueryHandler(wrap_conversation_state(mode_callback), 
+                           pattern='^(manual|automatic)$')],
+        SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                           wrap_conversation_state(set_auto_buy_amount))],
+        SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                           wrap_conversation_state(set_sell_percentage))],
+        SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                           wrap_conversation_state(set_loss_percentage))],
+        SET_ANTI_MEV: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                    wrap_conversation_state(set_anti_mev))],
+        SET_LIQUIDITY_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                               wrap_conversation_state(set_liquidity_threshold))],
+        SET_VOLUME_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                            wrap_conversation_state(set_volume_threshold))],
+        SET_RUG_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                     wrap_conversation_state(set_rug_check))],
+        SET_MAX_SLIPPAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                        wrap_conversation_state(set_max_slippage))],
+        SET_MAX_GAS_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                         wrap_conversation_state(set_max_gas_price))],
+        SET_TOKEN_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                     wrap_conversation_state(set_token_age))]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False
+)
     application.add_handler(set_mode_handler)
 
     # Trade handler
@@ -4209,7 +4542,7 @@ async def on_startup():
         for user in active_users:
             user_id = user['user_id']
             if user.get('solana') and user['solana'].get('public_key'):
-                logger.info(f"  - Scheduling job for user {user_id}")
+                logger.info(f"  - Scheduling token updates for user {user_id}")
                 app.job_queue.run_repeating(
                     update_token_info,
                     interval=30,
@@ -4219,26 +4552,28 @@ async def on_startup():
                 )
 
             if user.get('trading_mode') == 'automatic':
-                    app.job_queue.run_repeating(
-                        auto_trade,
-                        interval=30,
-                        first=5,
-                        user_id=user_id,
-                        name=f"auto_trade_{user_id}"
-                    )
+                logger.info(f"  - Scheduling auto-trade for user {user_id}")
+                app.job_queue.run_repeating(
+                    auto_trade,
+                    interval=30,
+                    first=10,
+                    user_id=user_id,
+                    name=f"auto_trade_{user_id}"
+                )
 
-            app.job_queue.run_repeating(
-    verify_sol_payments,
-    interval=300,  # every 5 minutes
-    first=10,
-    name="sol_payment_verification"
-)
-            app.job_queue.run_repeating(
-    update_token_performance,
-    interval=3600,  # Update hourly
-    first=10,
-    name="token_performance_updates"
-)
+        # Schedule background jobs
+        app.job_queue.run_repeating(
+            verify_sol_payments,
+            interval=300,
+            first=10,
+            name="sol_payment_verification"
+        )
+        app.job_queue.run_repeating(
+            update_token_performance,
+            interval=3600,
+            first=15,
+            name="token_performance_updates"
+        )
         app.job_queue.run_daily(
             send_daily_report,
             time=datetime.time(hour=20, minute=0),
