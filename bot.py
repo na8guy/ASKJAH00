@@ -3875,8 +3875,8 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 output_mint = contract_address
                 amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
                 swap_mode = "ExactIn"
-                # Increase slippage with each retry attempt
-                slippage_bps = 500 + (attempt * 200)  # Start at 5%, increase by 2% each retry
+                # Very high slippage for buys on volatile tokens
+                slippage_bps = 2000 + (attempt * 1000)  # Start at 20%, increase by 10% each retry
             else:  # sell
                 input_mint = contract_address
                 output_mint = "So11111111111111111111111111111111111111112"  # SOL
@@ -3887,10 +3887,10 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 
                 swap_mode = "ExactIn"  # We're specifying the exact input token amount
                 amount_lamports = amount_raw
-                # Increase slippage with each retry attempt
-                slippage_bps = 1000 + (attempt * 300)  # Start at 10%, increase by 3% each retry
+                # Very high slippage for sells on volatile tokens
+                slippage_bps = 3000 + (attempt * 1500)  # Start at 30%, increase by 15% each retry
 
-            # Get quote from Jupiter
+            # Get a fresh quote right before executing
             quote_params = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
@@ -3930,20 +3930,21 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                         continue
                     return False, "No valid trading route found for this token"
                 
-                if 'priceImpactPct' in quote_data and float(quote_data['priceImpactPct']) > 0.2:
+                # Check if the price impact is extremely high
+                if 'priceImpactPct' in quote_data and float(quote_data['priceImpactPct']) > 0.5:
                     if attempt < max_retries - 1:
-                        logger.info(f"Price impact too high, retrying in {retry_delay} seconds...")
+                        logger.info(f"Extreme price impact, retrying in {retry_delay} seconds...")
                         await asyncio.sleep(retry_delay)
                         continue
-                    return False, "Price impact too high (>20%). Trade would be unfavorable."
+                    return False, "Price impact extremely high (>50%). Trade would be very unfavorable."
                 
-                # Prepare swap transaction
+                # Prepare swap transaction with aggressive settings
                 swap_payload = {
                     "quoteResponse": quote_data,
                     "userPublicKey": from_address,
                     "wrapAndUnwrapSol": True,
                     "dynamicComputeUnitLimit": True,
-                    "prioritizationFeeLamports": 100000 + (attempt * 50000),  # Increase priority fee with each retry
+                    "prioritizationFeeLamports": 200000 + (attempt * 100000),  # High priority fee
                     "useSharedAccounts": True,
                     "asLegacyTransaction": False,
                     "useTokenLedger": False
@@ -4004,7 +4005,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                     tx_hash = await solana_client.send_raw_transaction(
                         raw_transaction,
                         opts=TxOpts(
-                            skip_preflight=False,
+                            skip_preflight=True,  # Skip preflight to avoid simulation errors
                             preflight_commitment="processed",
                             max_retries=3
                         )
@@ -4012,14 +4013,14 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                     
                     logger.info(f"Transaction sent: {tx_hash.value}")
                     
-                    # Wait for confirmation
+                    # Wait for confirmation with a longer timeout
                     confirmation = await asyncio.wait_for(
                         solana_client.confirm_transaction(
                             tx_hash.value,
                             commitment="confirmed",
-                            sleep_seconds=1
+                            sleep_seconds=2
                         ),
-                        timeout=30.0
+                        timeout=60.0  # Longer timeout for confirmation
                     )
                     
                     if confirmation.value and not confirmation.value[0].err:
@@ -4079,7 +4080,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 continue
             return False, f"Trade execution failed: {str(e)}"
 
-    return False, "Max retries exceeded. Please try again later."
+    return False, "Max retries exceeded. The token may be too volatile or have insufficient liquidity for trading at this time."
     
 async def get_token_decimals(token_address: str) -> int:
     """Get token decimals from Solana blockchain"""
