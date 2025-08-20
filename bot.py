@@ -3839,186 +3839,168 @@ async def check_balance(user_id, chain):
 
 async def execute_trade(user_id, contract_address, amount, action, chain, token_info):
     logger.info(f"🏁 Starting {action} trade for {amount} of {contract_address}")
-    try:
-        if chain != 'solana':
-            logger.error(f"Trading not supported for {chain} yet")
-            return False, "Trading not supported for this blockchain"
+    
+    # Retry configuration
+    max_retries = 3
+    retry_delay = 2  # seconds between retries
+    
+    for attempt in range(max_retries):
+        try:
+            if chain != 'solana':
+                logger.error(f"Trading not supported for {chain} yet")
+                return False, "Trading not supported for this blockchain"
 
-        user = users_collection.find_one({'user_id': user_id})
-        if not user:
-            logger.error(f"No user found for user_id {user_id}")
-            return False, "User not found"
+            user = users_collection.find_one({'user_id': user_id})
+            if not user:
+                logger.error(f"No user found for user_id {user_id}")
+                return False, "User not found"
 
-        decrypted_user = await decrypt_user_wallet(user_id, user)
-        solana_private_key = decrypted_user.get('solana', {}).get('private_key')
+            decrypted_user = await decrypt_user_wallet(user_id, user)
+            solana_private_key = decrypted_user.get('solana', {}).get('private_key')
 
-        if not solana_private_key or solana_private_key == "[Decryption Failed]":
-            logger.error(f"Failed to decrypt Solana private key for user {user_id}")
-            return False, "Wallet decryption failed"
+            if not solana_private_key or solana_private_key == "[Decryption Failed]":
+                logger.error(f"Failed to decrypt Solana private key for user {user_id}")
+                return False, "Wallet decryption failed"
 
-        keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
-        from_address = str(keypair.pubkey())
+            keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
+            from_address = str(keypair.pubkey())
 
-        # Jupiter API endpoints
-        quote_url = "https://quote-api.jup.ag/v6/quote"
-        swap_url = "https://quote-api.jup.ag/v6/swap"
-        
-        # Determine swap parameters based on action
-        if action == 'buy':
-            input_mint = "So11111111111111111111111111111111111111112"  # SOL
-            output_mint = contract_address
-            amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
-            swap_mode = "ExactIn"
-            slippage_bps = 500  # 5% slippage for buys
-        else:  # sell
-            input_mint = contract_address
-            output_mint = "So11111111111111111111111111111111111111112"  # SOL
+            # Jupiter API endpoints
+            quote_url = "https://quote-api.jup.ag/v6/quote"
+            swap_url = "https://quote-api.jup.ag/v6/swap"
             
-            # For sell orders, amount is the token amount
-            token_decimals = await get_token_decimals(contract_address)
-            amount_raw = int(amount * (10 ** token_decimals))
-            
-            swap_mode = "ExactIn"  # We're specifying the exact input token amount
-            amount_lamports = amount_raw
-            slippage_bps = 1000  # 10% slippage for sells
-
-        # Get quote from Jupiter
-        quote_params = {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(amount_lamports),
-            "slippageBps": slippage_bps,
-            "swapMode": swap_mode,
-            "onlyDirectRoutes": False,
-            "asLegacyTransaction": False,
-            "maxAccounts": 64
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # Get quote
-            quote_response = await client.get(quote_url, params=quote_params)
-            
-            if quote_response.status_code != 200:
-                error_msg = quote_response.text
-                logger.error(f"Jupiter quote failed: {error_msg}")
+            # Determine swap parameters based on action
+            if action == 'buy':
+                input_mint = "So11111111111111111111111111111111111111112"  # SOL
+                output_mint = contract_address
+                amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
+                swap_mode = "ExactIn"
+                # Increase slippage with each retry attempt
+                slippage_bps = 500 + (attempt * 200)  # Start at 5%, increase by 2% each retry
+            else:  # sell
+                input_mint = contract_address
+                output_mint = "So11111111111111111111111111111111111111112"  # SOL
                 
-                if "COULD_NOT_FIND_ANY_ROUTE" in error_msg:
-                    return False, "No trading route found for this token. It may have low liquidity or no trading pairs."
-                elif "Invalid token" in error_msg:
-                    return False, "Invalid token address or token not found."
-                else:
-                    return False, f"Quote failed: {error_msg}"
-            
-            quote_data = quote_response.json()
-            
-            if not quote_data or 'routePlan' not in quote_data or not quote_data['routePlan']:
-                return False, "No valid trading route found for this token"
-            
-            if 'priceImpactPct' in quote_data and float(quote_data['priceImpactPct']) > 0.1:
-                return False, "Price impact too high (>10%). Trade would be unfavorable."
-            
-            # Prepare swap transaction
-            swap_payload = {
-                "quoteResponse": quote_data,
-                "userPublicKey": from_address,
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": 100000,
-                "useSharedAccounts": True,
+                # For sell orders, amount is the token amount
+                token_decimals = await get_token_decimals(contract_address)
+                amount_raw = int(amount * (10 ** token_decimals))
+                
+                swap_mode = "ExactIn"  # We're specifying the exact input token amount
+                amount_lamports = amount_raw
+                # Increase slippage with each retry attempt
+                slippage_bps = 1000 + (attempt * 300)  # Start at 10%, increase by 3% each retry
+
+            # Get quote from Jupiter
+            quote_params = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(amount_lamports),
+                "slippageBps": slippage_bps,
+                "swapMode": swap_mode,
+                "onlyDirectRoutes": False,
                 "asLegacyTransaction": False,
-                "useTokenLedger": False
+                "maxAccounts": 64
             }
-            
-            # Get swap transaction
-            swap_response = await client.post(swap_url, json=swap_payload)
-            if swap_response.status_code != 200:
-                error_msg = swap_response.text
-                logger.error(f"Jupiter swap failed: {error_msg}")
-                return False, f"Swap preparation failed: {error_msg}"
-                
-            swap_data = swap_response.json()
-            swap_transaction = swap_data.get("swapTransaction")
-            
-            if not swap_transaction:
-                return False, "No swap transaction received from Jupiter"
 
-            # Deserialize transaction
-            transaction_bytes = base64.b64decode(swap_transaction)
-            
-            try:
-                # Try to parse as VersionedTransaction
-                transaction = VersionedTransaction.from_bytes(transaction_bytes)
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Get quote
+                quote_response = await client.get(quote_url, params=quote_params)
                 
-                # Get the message to sign
-                message = transaction.message
+                if quote_response.status_code != 200:
+                    error_msg = quote_response.text
+                    logger.error(f"Jupiter quote failed: {error_msg}")
+                    
+                    if "COULD_NOT_FIND_ANY_ROUTE" in error_msg:
+                        return False, "No trading route found for this token. It may have low liquidity or no trading pairs."
+                    elif "Invalid token" in error_msg:
+                        return False, "Invalid token address or token not found."
+                    else:
+                        if attempt < max_retries - 1:
+                            logger.info(f"Retrying quote in {retry_delay} seconds...")
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        return False, f"Quote failed: {error_msg}"
                 
-                # Get recent blockhash for signing
-                recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
+                quote_data = quote_response.json()
                 
-                # Create a new transaction with the same message but signed with our keypair
-                # We need to include all required signers (Jupiter might have already signed some parts)
-                signed_transaction = VersionedTransaction(message, [keypair])
+                if not quote_data or 'routePlan' not in quote_data or not quote_data['routePlan']:
+                    if attempt < max_retries - 1:
+                        logger.info(f"Retrying quote in {retry_delay} seconds...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    return False, "No valid trading route found for this token"
+                
+                if 'priceImpactPct' in quote_data and float(quote_data['priceImpactPct']) > 0.2:
+                    if attempt < max_retries - 1:
+                        logger.info(f"Price impact too high, retrying in {retry_delay} seconds...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    return False, "Price impact too high (>20%). Trade would be unfavorable."
+                
+                # Prepare swap transaction
+                swap_payload = {
+                    "quoteResponse": quote_data,
+                    "userPublicKey": from_address,
+                    "wrapAndUnwrapSol": True,
+                    "dynamicComputeUnitLimit": True,
+                    "prioritizationFeeLamports": 100000 + (attempt * 50000),  # Increase priority fee with each retry
+                    "useSharedAccounts": True,
+                    "asLegacyTransaction": False,
+                    "useTokenLedger": False
+                }
+                
+                # Get swap transaction
+                swap_response = await client.post(swap_url, json=swap_payload)
+                if swap_response.status_code != 200:
+                    error_msg = swap_response.text
+                    logger.error(f"Jupiter swap failed: {error_msg}")
+                    if attempt < max_retries - 1:
+                        logger.info(f"Retrying swap in {retry_delay} seconds...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    return False, f"Swap preparation failed: {error_msg}"
+                    
+                swap_data = swap_response.json()
+                swap_transaction = swap_data.get("swapTransaction")
+                
+                if not swap_transaction:
+                    if attempt < max_retries - 1:
+                        logger.info(f"Retrying swap in {retry_delay} seconds...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    return False, "No swap transaction received from Jupiter"
+
+                # Deserialize transaction
+                transaction_bytes = base64.b64decode(swap_transaction)
+                
+                # Try to parse as VersionedTransaction first
+                try:
+                    transaction = VersionedTransaction.from_bytes(transaction_bytes)
+                    
+                    # Create a new signed transaction
+                    signed_transaction = VersionedTransaction(
+                        transaction.message,
+                        [keypair]  # Add our signature
+                    )
+                    raw_transaction = bytes(signed_transaction)
+                    
+                except Exception as e:
+                    logger.warning(f"VersionedTransaction failed: {str(e)}, trying legacy transaction")
+                    try:
+                        # Try legacy transaction format
+                        transaction = Transaction.from_bytes(transaction_bytes)
+                        transaction.sign(keypair)
+                        raw_transaction = transaction.serialize()
+                    except Exception as e2:
+                        logger.error(f"Both transaction formats failed: {str(e2)}")
+                        if attempt < max_retries - 1:
+                            logger.info(f"Retrying transaction in {retry_delay} seconds...")
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        return False, f"Transaction processing failed: {str(e2)}"
                 
                 # Send the transaction
-                tx_hash = await solana_client.send_raw_transaction(
-                    bytes(signed_transaction),
-                    opts=TxOpts(
-                        skip_preflight=False,
-                        preflight_commitment="processed",
-                        max_retries=3
-                    )
-                )
-                
-                logger.info(f"Transaction sent: {tx_hash.value}")
-                
-                # Wait for confirmation
-                confirmation = await asyncio.wait_for(
-                    solana_client.confirm_transaction(
-                        tx_hash.value,
-                        commitment="confirmed",
-                        sleep_seconds=1
-                    ),
-                    timeout=30.0
-                )
-                
-                if confirmation.value and not confirmation.value[0].err:
-                    logger.info(f"✅ Transaction confirmed: {tx_hash.value}")
-                    
-                    # Record the transaction in user's history
-                    trade_record = {
-                        'type': action,
-                        'token_address': contract_address,
-                        'token_name': token_info.get('name', 'Unknown'),
-                        'token_symbol': token_info.get('symbol', 'UNKNOWN'),
-                        'amount': amount,
-                        'price': token_info.get('price_usd', 0),
-                        'tx_hash': tx_hash.value,
-                        'timestamp': datetime.now().isoformat(),
-                        'status': 'completed'
-                    }
-                    
-                    users_collection.update_one(
-                        {'user_id': user_id},
-                        {'$push': {'trade_history': trade_record}}
-                    )
-                    
-                    return True, f"Trade successful! TX: {tx_hash.value}"
-                else:
-                    error_msg = confirmation.value[0].err if confirmation.value else 'Unknown error'
-                    logger.error(f"Transaction failed: {error_msg}")
-                    return False, f"Transaction failed: {error_msg}"
-                    
-            except asyncio.TimeoutError:
-                logger.error("Transaction confirmation timed out")
-                return False, "Transaction confirmation timed out"
-            except Exception as e:
-                logger.error(f"Transaction processing failed: {str(e)}")
-                # Fall back to legacy transaction if versioned transaction fails
                 try:
-                    transaction = Transaction.from_bytes(transaction_bytes)
-                    transaction.sign(keypair)
-                    raw_transaction = transaction.serialize()
-                    
                     tx_hash = await solana_client.send_raw_transaction(
                         raw_transaction,
                         opts=TxOpts(
@@ -4028,8 +4010,9 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                         )
                     )
                     
-                    logger.info(f"Transaction sent (legacy): {tx_hash.value}")
+                    logger.info(f"Transaction sent: {tx_hash.value}")
                     
+                    # Wait for confirmation
                     confirmation = await asyncio.wait_for(
                         solana_client.confirm_transaction(
                             tx_hash.value,
@@ -4040,8 +4023,9 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                     )
                     
                     if confirmation.value and not confirmation.value[0].err:
-                        logger.info(f"✅ Transaction confirmed (legacy): {tx_hash.value}")
+                        logger.info(f"✅ Transaction confirmed: {tx_hash.value}")
                         
+                        # Record the transaction in user's history
                         trade_record = {
                             'type': action,
                             'token_address': contract_address,
@@ -4062,16 +4046,40 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                         return True, f"Trade successful! TX: {tx_hash.value}"
                     else:
                         error_msg = confirmation.value[0].err if confirmation.value else 'Unknown error'
-                        logger.error(f"Legacy transaction failed: {error_msg}")
+                        logger.error(f"Transaction failed: {error_msg}")
+                        
+                        # Check if it's a slippage error (0x1789)
+                        if "0x1789" in str(error_msg) and attempt < max_retries - 1:
+                            logger.info(f"Slippage error detected, retrying with higher slippage in {retry_delay} seconds...")
+                            await asyncio.sleep(retry_delay)
+                            continue
+                            
                         return False, f"Transaction failed: {error_msg}"
                         
-                except Exception as e2:
-                    logger.error(f"Both transaction formats failed: {str(e2)}")
-                    return False, f"Transaction processing failed: {str(e2)}"
+                except Exception as e:
+                    logger.error(f"Send transaction failed: {str(e)}")
+                    if attempt < max_retries - 1:
+                        logger.info(f"Retrying transaction in {retry_delay} seconds...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    return False, f"Send transaction failed: {str(e)}"
+                    
+        except asyncio.TimeoutError:
+            logger.error("Transaction confirmation timed out")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying transaction in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                continue
+            return False, "Transaction confirmation timed out"
+        except Exception as e:
+            logger.error(f"Trade execution failed: {str(e)}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying trade in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                continue
+            return False, f"Trade execution failed: {str(e)}"
 
-    except Exception as e:
-        logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
-        return False, f"Trade execution failed: {str(e)}"
+    return False, "Max retries exceeded. Please try again later."
     
 async def get_token_decimals(token_address: str) -> int:
     """Get token decimals from Solana blockchain"""
