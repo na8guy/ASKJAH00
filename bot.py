@@ -3279,9 +3279,9 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     """Handle sell amount input with proper token amount calculation"""
     user_id = update.effective_user.id
     try:
-        # Get the SOL amount user wants to receive from the sale
-        sol_amount = float(update.message.text)
-        if sol_amount <= 0:
+        # Get the token amount user wants to sell (not SOL value)
+        token_amount = float(update.message.text)
+        if token_amount <= 0:
             await update.message.reply_text("❌ Please enter a positive amount.")
             return SELL_AMOUNT
         
@@ -3300,22 +3300,29 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             
         token_data = portfolio[token['contract_address']]
         
-        # Check if user has enough SOL worth of tokens
-        if sol_amount > token_data['amount']:
+        # Calculate how many tokens the user actually holds
+        # The portfolio stores SOL value, so we need to convert back to token amount
+        buy_price = token_data['buy_price']
+        token_amount_held = token_data['amount'] / buy_price
+        
+        if token_amount > token_amount_held:
             await update.message.reply_text(
-                f"❌ Insufficient token balance. Available: {token_data['amount']:.4f} SOL worth\n"
-                f"You requested to sell {sol_amount:.4f} SOL worth."
+                f"❌ Insufficient token balance. Available: {token_amount_held:.2f} tokens\n"
+                f"You requested to sell {token_amount:.2f} tokens."
             )
             return SELL_AMOUNT
         
-        # Execute trade immediately
-        await update.message.reply_text(f"⏳ Executing sell order for {sol_amount:.4f} SOL worth of {token['name']}...")
+        # Store the token amount in context for execution
+        context.user_data['sell_token_amount'] = token_amount
         
-        # For sell orders, we pass the SOL amount to receive
+        # Execute trade immediately
+        await update.message.reply_text(f"⏳ Executing sell order for {token_amount:.2f} {token['symbol']} tokens...")
+        
+        # For sell orders, we need to pass the token amount
         success, message = await execute_trade(
             user_id, 
             token['contract_address'], 
-            sol_amount,  # Pass SOL amount to receive
+            token_amount,  # Pass token amount instead of SOL amount
             'sell', 
             'solana',
             token
@@ -3323,9 +3330,10 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         
         if success:
             # Update portfolio
-            new_sol_amount = token_data['amount'] - sol_amount
+            new_token_amount = token_amount_held - token_amount
+            new_sol_value = new_token_amount * buy_price  # Keep original buy price for cost basis
             
-            if new_sol_amount <= 0.001:  # Consider dust amounts as zero
+            if new_token_amount <= 0.001:  # Consider dust amounts as zero
                 users_collection.update_one(
                     {'user_id': user_id},
                     {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
@@ -3334,16 +3342,22 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             else:
                 users_collection.update_one(
                     {'user_id': user_id},
-                    {'$set': {f'portfolio.{token["contract_address"]}.amount': new_sol_amount}}
+                    {'$set': {f'portfolio.{token["contract_address"]}.amount': new_sol_value}}
                 )
             
-            log_user_action(user_id, "TRADE_EXECUTED", f"Sold {sol_amount} SOL worth of {token['name']}")
+            # Calculate profit/loss
+            current_price = token['price_usd']
+            price_change = ((current_price - buy_price) / buy_price) * 100
+            profit_loss = "profit" if price_change >= 0 else "loss"
+            
+            log_user_action(user_id, "TRADE_EXECUTED", f"Sold {token_amount} tokens of {token['name']}")
             await update.message.reply_text(
-                f"✅ {message}\n\n"
-                f"📊 You now hold {new_sol_amount:.4f} SOL worth of {token['symbol']} tokens."
+                f"✅ {message}\n"
+                f"📈 This trade resulted in a {abs(price_change):.2f}% {profit_loss}.\n"
+                f"📊 You now hold {new_token_amount:.2f} {token['symbol']} tokens."
             )
         else:
-            log_user_action(user_id, "TRADE_FAILED", f"Sell {sol_amount} SOL worth of {token['name']}: {message}", level="error")
+            log_user_action(user_id, "TRADE_FAILED", f"Sell {token_amount} tokens of {token['name']}: {message}", level="error")
             await update.message.reply_text(f"❌ {message}")
         
         return ConversationHandler.END
@@ -3859,8 +3873,14 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         else:  # sell
             input_mint = contract_address
             output_mint = "So11111111111111111111111111111111111111112"  # SOL
-            amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
-            swap_mode = "ExactOut"
+            
+            # For sell orders, amount is the token amount
+            # We need to convert to the raw token amount based on decimals
+            token_decimals = await get_token_decimals(contract_address)
+            amount_raw = int(amount * (10 ** token_decimals))
+            
+            swap_mode = "ExactIn"  # We're specifying the exact input token amount
+            amount_lamports = amount_raw
             slippage_bps = "1000"  # 10% slippage for sells
 
         # Get quote from Jupiter
@@ -3996,7 +4016,6 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
     except Exception as e:
         logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
         return False, f"Trade execution failed: {str(e)}"
-
 
 async def get_token_decimals(token_address: str) -> int:
     """Get token decimals from Solana blockchain"""
