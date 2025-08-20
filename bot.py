@@ -3846,18 +3846,15 @@ async def check_balance(user_id, chain):
 async def execute_trade(user_id, contract_address, amount, action, chain, token_info):
     logger.info(f"🏁 Starting {action} trade for {amount} of {contract_address}")
     try:
-        # Only support Solana
         if chain != 'solana':
             logger.error(f"Trading not supported for {chain} yet")
             return False
 
-        # Fetch user
         user = users_collection.find_one({'user_id': user_id})
         if not user:
             logger.error(f"No user found for user_id {user_id}")
             return False
 
-        # Decrypt and load wallet
         decrypted_user = await decrypt_user_wallet(user_id, user)
         solana_private_key = decrypted_user.get('solana', {}).get('private_key')
 
@@ -3868,20 +3865,22 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         from_address = str(keypair.pubkey())
 
-        # Use Jupiter Aggregator for best prices
-        jupiter_url = "https://quote-api.jup.ag/v6/quote"
+        # Jupiter API endpoints
+        quote_url = "https://quote-api.jup.ag/v6/quote"
+        swap_url = "https://quote-api.jup.ag/v6/swap"
         
+        # Determine swap parameters based on action
         if action == 'buy':
             input_mint = "So11111111111111111111111111111111111111112"  # SOL
             output_mint = contract_address
             amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
             swap_mode = "ExactIn"
+            slippage_bps = "500"  # 5% slippage for buys
         else:  # sell
             input_mint = contract_address
             output_mint = "So11111111111111111111111111111111111111112"  # SOL
             
-            # For sell orders, we need to calculate the token amount based on current price
-            # First get the current price to calculate token amount
+            # For sell orders, we need to calculate the token amount
             current_token = await fetch_token_by_contract(contract_address)
             if not current_token:
                 logger.error(f"Failed to fetch current token data for {contract_address}")
@@ -3894,36 +3893,73 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             token_decimals = await get_token_decimals(contract_address)
             amount_raw = int(token_amount * (10 ** token_decimals))
             
-            swap_mode = "ExactIn"
+            swap_mode = "ExactOut"
             amount_lamports = amount_raw
+            slippage_bps = "1000"  # 10% slippage for sells (more volatile)
 
-        # Get quote from Jupiter
+        # Get quote from Jupiter with proper parameters
         quote_params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
             "amount": str(amount_lamports),
-            "slippageBps": "100",  # 1% slippage
-            "swapMode": swap_mode
+            "slippageBps": slippage_bps,
+            "swapMode": swap_mode,
+            "onlyDirectRoutes": "false",  # Allow all routes
+            "asLegacyTransaction": "false",  # Use versioned transactions
+            "maxAccounts": "64"  # Maximum number of accounts to use
         }
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Get quote
-            quote_response = await client.get(jupiter_url, params=quote_params)
-            if quote_response.status_code != 200:
-                logger.error(f"Jupiter quote failed: {quote_response.text}")
-                return False
-                
-            quote_data = quote_response.json()
+            # Get quote with retry logic
+            max_retries = 3
+            quote_data = None
             
-            # Get swap transaction
-            swap_url = "https://quote-api.jup.ag/v6/swap"
+            for attempt in range(max_retries):
+                try:
+                    quote_response = await client.get(quote_url, params=quote_params)
+                    if quote_response.status_code != 200:
+                        logger.error(f"Jupiter quote failed: {quote_response.text}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1)
+                            continue
+                        return False
+                        
+                    quote_data = quote_response.json()
+                    
+                    # Check if we got a valid quote
+                    if not quote_data or 'routePlan' not in quote_data or not quote_data['routePlan']:
+                        logger.error("Invalid quote received from Jupiter")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1)
+                            continue
+                        return False
+                    
+                    break
+                    
+                except Exception as e:
+                    logger.error(f"Jupiter API call failed (attempt {attempt + 1}): {str(e)}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)
+                        continue
+                    return False
+            
+            if not quote_data:
+                logger.error("Failed to get quote after retries")
+                return False
+            
+            # Prepare swap transaction
             swap_payload = {
                 "quoteResponse": quote_data,
                 "userPublicKey": from_address,
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": "100000",  # 0.0001 SOL priority fee
+                "useSharedAccounts": True,
+                "asLegacyTransaction": False,
+                "useTokenLedger": False
             }
             
+            # Get swap transaction
             swap_response = await client.post(swap_url, json=swap_payload)
             if swap_response.status_code != 200:
                 logger.error(f"Jupiter swap failed: {swap_response.text}")
@@ -3936,41 +3972,109 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 logger.error("No swap transaction in response")
                 return False
 
-            # Deserialize transaction
-            transaction_bytes = base64.b64decode(swap_transaction)
-            
-            # Try different approaches to handle the transaction
+            # Deserialize and sign transaction
             try:
-                # Try VersionedTransaction first
-                transaction = VersionedTransaction.from_bytes(transaction_bytes)
+                transaction_bytes = base64.b64decode(swap_transaction)
                 
-                # Create a new signed transaction
-                signed_transaction = VersionedTransaction(transaction.message, [keypair])
-                raw_transaction = bytes(signed_transaction)
-                
-            except Exception as e:
-                logger.warning(f"VersionedTransaction failed, trying legacy: {str(e)}")
+                # Try to parse as VersionedTransaction first
                 try:
-                    # Try legacy Transaction
-                    transaction = Transaction.from_bytes(transaction_bytes)
-                    transaction.sign(keypair)
-                    raw_transaction = transaction.serialize()
-                except Exception as e2:
-                    logger.error(f"Both transaction types failed: {str(e2)}")
-                    return False
-            
-            # Send transaction
-            tx_hash = await solana_client.send_raw_transaction(raw_transaction)
-            
-            # Wait for confirmation
-            await solana_client.confirm_transaction(
-                tx_hash.value,
-                commitment="confirmed",
-                sleep_seconds=1
-            )
-            
-            logger.info(f"✅ Transaction confirmed: {tx_hash.value}")
-            return True
+                    transaction = VersionedTransaction.from_bytes(transaction_bytes)
+                    
+                    # Verify the transaction has the correct structure
+                    if not hasattr(transaction, 'message') or not hasattr(transaction, 'signatures'):
+                        logger.error("Invalid transaction structure from Jupiter")
+                        return False
+                    
+                    # Sign the transaction
+                    transaction.sign([keypair])
+                    raw_transaction = bytes(transaction)
+                    
+                except Exception as e:
+                    logger.warning(f"VersionedTransaction failed: {str(e)}, trying legacy transaction")
+                    try:
+                        # Try legacy transaction format
+                        transaction = Transaction.from_bytes(transaction_bytes)
+                        transaction.sign(keypair)
+                        raw_transaction = transaction.serialize()
+                    except Exception as e2:
+                        logger.error(f"Both transaction formats failed: {str(e2)}")
+                        return False
+                
+                # Send transaction with retry logic
+                max_send_attempts = 2
+                for send_attempt in range(max_send_attempts):
+                    try:
+                        # Send the transaction
+                        tx_hash = await solana_client.send_raw_transaction(
+                            raw_transaction,
+                            opts=TxOpts(
+                                skip_preflight=False,  # Run preflight checks
+                                preflight_commitment="processed",
+                                max_retries=3
+                            )
+                        )
+                        
+                        logger.info(f"Transaction sent: {tx_hash.value}")
+                        
+                        # Wait for confirmation with timeout
+                        try:
+                            confirmation = await asyncio.wait_for(
+                                solana_client.confirm_transaction(
+                                    tx_hash.value,
+                                    commitment="confirmed",
+                                    sleep_seconds=1
+                                ),
+                                timeout=30.0
+                            )
+                            
+                            if confirmation.value and not confirmation.value[0].err:
+                                logger.info(f"✅ Transaction confirmed: {tx_hash.value}")
+                                
+                                # Record the transaction in user's history
+                                trade_record = {
+                                    'type': action,
+                                    'token_address': contract_address,
+                                    'token_name': token_info.get('name', 'Unknown'),
+                                    'token_symbol': token_info.get('symbol', 'UNKNOWN'),
+                                    'amount': amount,
+                                    'price': token_info.get('price_usd', 0),
+                                    'tx_hash': tx_hash.value,
+                                    'timestamp': datetime.now().isoformat(),
+                                    'status': 'completed'
+                                }
+                                
+                                users_collection.update_one(
+                                    {'user_id': user_id},
+                                    {'$push': {'trade_history': trade_record}}
+                                )
+                                
+                                return True
+                            else:
+                                error_msg = confirmation.value[0].err if confirmation.value else 'Unknown error'
+                                logger.error(f"Transaction failed: {error_msg}")
+                                
+                                if send_attempt < max_send_attempts - 1:
+                                    await asyncio.sleep(2)
+                                    continue
+                                return False
+                                
+                        except asyncio.TimeoutError:
+                            logger.error("Transaction confirmation timed out")
+                            if send_attempt < max_send_attempts - 1:
+                                await asyncio.sleep(2)
+                                continue
+                            return False
+                            
+                    except Exception as e:
+                        logger.error(f"Send transaction failed (attempt {send_attempt + 1}): {str(e)}")
+                        if send_attempt < max_send_attempts - 1:
+                            await asyncio.sleep(2)
+                            continue
+                        return False
+                        
+            except Exception as e:
+                logger.error(f"Transaction processing failed: {str(e)}")
+                return False
 
     except Exception as e:
         logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
