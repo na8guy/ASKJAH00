@@ -3869,30 +3869,29 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             output_mint = contract_address
             amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
             swap_mode = "ExactIn"
-            slippage_bps = 500  # 5% slippage for buys (as integer)
+            slippage_bps = 500  # 5% slippage for buys
         else:  # sell
             input_mint = contract_address
             output_mint = "So11111111111111111111111111111111111111112"  # SOL
             
             # For sell orders, amount is the token amount
-            # We need to convert to the raw token amount based on decimals
             token_decimals = await get_token_decimals(contract_address)
             amount_raw = int(amount * (10 ** token_decimals))
             
             swap_mode = "ExactIn"  # We're specifying the exact input token amount
             amount_lamports = amount_raw
-            slippage_bps = 1000  # 10% slippage for sells (as integer)
+            slippage_bps = 1000  # 10% slippage for sells
 
         # Get quote from Jupiter
         quote_params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
             "amount": str(amount_lamports),
-            "slippageBps": slippage_bps,  # Use integer instead of string
+            "slippageBps": slippage_bps,
             "swapMode": swap_mode,
-            "onlyDirectRoutes": False,  # Use boolean instead of string
-            "asLegacyTransaction": False,  # Use boolean instead of string
-            "maxAccounts": 64  # Use integer instead of string
+            "onlyDirectRoutes": False,
+            "asLegacyTransaction": False,
+            "maxAccounts": 64
         }
 
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -3903,7 +3902,6 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 error_msg = quote_response.text
                 logger.error(f"Jupiter quote failed: {error_msg}")
                 
-                # Handle specific error cases
                 if "COULD_NOT_FIND_ANY_ROUTE" in error_msg:
                     return False, "No trading route found for this token. It may have low liquidity or no trading pairs."
                 elif "Invalid token" in error_msg:
@@ -3913,11 +3911,9 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             
             quote_data = quote_response.json()
             
-            # Check if we got a valid quote
             if not quote_data or 'routePlan' not in quote_data or not quote_data['routePlan']:
                 return False, "No valid trading route found for this token"
             
-            # Check if the price impact is too high
             if 'priceImpactPct' in quote_data and float(quote_data['priceImpactPct']) > 0.1:
                 return False, "Price impact too high (>10%). Trade would be unfavorable."
             
@@ -3927,7 +3923,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 "userPublicKey": from_address,
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": 100000,  # Use integer instead of string
+                "prioritizationFeeLamports": 100000,
                 "useSharedAccounts": True,
                 "asLegacyTransaction": False,
                 "useTokenLedger": False
@@ -3946,20 +3942,26 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             if not swap_transaction:
                 return False, "No swap transaction received from Jupiter"
 
-            # Deserialize and sign transaction
+            # Deserialize transaction
+            transaction_bytes = base64.b64decode(swap_transaction)
+            
             try:
-                transaction_bytes = base64.b64decode(swap_transaction)
-                
                 # Try to parse as VersionedTransaction
                 transaction = VersionedTransaction.from_bytes(transaction_bytes)
                 
-                # Sign the transaction
-                transaction.sign([keypair])
-                raw_transaction = bytes(transaction)
+                # Get the message to sign
+                message = transaction.message
+                
+                # Get recent blockhash for signing
+                recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
+                
+                # Create a new transaction with the same message but signed with our keypair
+                # We need to include all required signers (Jupiter might have already signed some parts)
+                signed_transaction = VersionedTransaction(message, [keypair])
                 
                 # Send the transaction
                 tx_hash = await solana_client.send_raw_transaction(
-                    raw_transaction,
+                    bytes(signed_transaction),
                     opts=TxOpts(
                         skip_preflight=False,
                         preflight_commitment="processed",
@@ -4011,12 +4013,66 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 return False, "Transaction confirmation timed out"
             except Exception as e:
                 logger.error(f"Transaction processing failed: {str(e)}")
-                return False, f"Transaction processing failed: {str(e)}"
+                # Fall back to legacy transaction if versioned transaction fails
+                try:
+                    transaction = Transaction.from_bytes(transaction_bytes)
+                    transaction.sign(keypair)
+                    raw_transaction = transaction.serialize()
+                    
+                    tx_hash = await solana_client.send_raw_transaction(
+                        raw_transaction,
+                        opts=TxOpts(
+                            skip_preflight=False,
+                            preflight_commitment="processed",
+                            max_retries=3
+                        )
+                    )
+                    
+                    logger.info(f"Transaction sent (legacy): {tx_hash.value}")
+                    
+                    confirmation = await asyncio.wait_for(
+                        solana_client.confirm_transaction(
+                            tx_hash.value,
+                            commitment="confirmed",
+                            sleep_seconds=1
+                        ),
+                        timeout=30.0
+                    )
+                    
+                    if confirmation.value and not confirmation.value[0].err:
+                        logger.info(f"✅ Transaction confirmed (legacy): {tx_hash.value}")
+                        
+                        trade_record = {
+                            'type': action,
+                            'token_address': contract_address,
+                            'token_name': token_info.get('name', 'Unknown'),
+                            'token_symbol': token_info.get('symbol', 'UNKNOWN'),
+                            'amount': amount,
+                            'price': token_info.get('price_usd', 0),
+                            'tx_hash': tx_hash.value,
+                            'timestamp': datetime.now().isoformat(),
+                            'status': 'completed'
+                        }
+                        
+                        users_collection.update_one(
+                            {'user_id': user_id},
+                            {'$push': {'trade_history': trade_record}}
+                        )
+                        
+                        return True, f"Trade successful! TX: {tx_hash.value}"
+                    else:
+                        error_msg = confirmation.value[0].err if confirmation.value else 'Unknown error'
+                        logger.error(f"Legacy transaction failed: {error_msg}")
+                        return False, f"Transaction failed: {error_msg}"
+                        
+                except Exception as e2:
+                    logger.error(f"Both transaction formats failed: {str(e2)}")
+                    return False, f"Transaction processing failed: {str(e2)}"
 
     except Exception as e:
         logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
         return False, f"Trade execution failed: {str(e)}"
-
+    
 async def get_token_decimals(token_address: str) -> int:
     """Get token decimals from Solana blockchain"""
     try:
