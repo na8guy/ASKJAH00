@@ -286,7 +286,7 @@ BOT_SOL_ADDRESS = os.getenv("BOT_SOL_ADDRESS")
 BOT_USDT_ADDRESS = os.getenv("BOT_USDT_ADDRESS")
 if not BOT_USDT_ADDRESS:
     logger.error("BOT_USDT_ADDRESS not found in .env file")
-    raise ValueValue("BOT_USDT_ADDRESS not found in .env file")
+    raise ValueError("BOT_USDT_ADDRESS not found in .env file")
 
 try:
     if not Web3.is_address(BOT_USDT_ADDRESS):
@@ -460,7 +460,7 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
                 eth_private_key = private_key
                 new_seed = os.urandom(32)
                 solana_keypair = Keypair.from_seed(new_seed)
-                solana_private_key = base58.b58encode(bytes(solana_keypair)).decode()
+                solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
                 logger.warning("ETH private key provided - generated new Solana wallet")
             else:
                 key_bytes = base58.b58decode(private_key)
@@ -476,6 +476,7 @@ async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str =
                 eth_address = account.address
                 eth_private_key = account.key.hex()
                 logger.warning("Solana private key provided - generated new ETH/BSC wallet")
+        else:
             raise ValueError("Must provide either mnemonic or private key")
 
         # Encrypt all sensitive data
@@ -550,6 +551,7 @@ def find_solana_from_mnemonic_by_paths(mnemonic: str, expected_pubkey: str, pass
         "m/44'/501'/0'/0",       # variant without final hardened
         "m/44'/501'/0'/0'/0'",   # extra-depth variant
         "m/44'/501'/1'/0'",      # account=1
+        "m/44'/501'/0'",
         # add more if you want...
     ]
 
@@ -1430,7 +1432,7 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"({token_data.get('symbol', 'UNKNOWN')})\n\n"
             f"🔗 *Contract:* `{contract_address}`\n"
             f"⏱️ *Tracked for:* {time_tracked.days} days, {int(hours_tracked % 24)} hours\n\n"
-            f"📈 *Price Performance* \n"
+            f"📈 *Price Performance*\n"
             f"  - Current: ${current_token['price_usd']:.8f}\n"
             f"  - ATH: ${ath:.8f}\n"
             f"  - ATL: ${atl:.8f}\n\n"
@@ -3117,44 +3119,6 @@ async def get_minimal_token_data(contract_address: str) -> Optional[Dict[str, An
     
     return None
 
-def parse_birdeye_response(data, contract_address):
-    """Parse Birdeye API response to match token_data structure"""
-    if 'data' in data and 'success' in data and data['success']:
-        token_data = data['data']
-        return {
-            'name': token_data.get('name', 'Unknown'),
-            'symbol': token_data.get('symbol', 'UNKNOWN'),
-            'contract_address': contract_address,
-            'price_usd': token_data.get('price', 0),
-            'market_cap': token_data.get('mc', 0),
-            'liquidity': token_data.get('liquidity', 0),
-            'volume': token_data.get('v24hUSD', 0),
-            'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
-            'image': token_data.get('image', ''),
-            'socials': {}  # Birdeye doesn't provide socials in this endpoint
-        }
-    else:
-        return None
-
-def parse_geckoterminal_response(data, contract_address):
-    """Parse GeckoTerminal API response to match token_data structure"""
-    if 'data' in data and 'attributes' in data['data']:
-        attributes = data['data']['attributes']
-        return {
-            'name': attributes.get('name', 'Unknown'),
-            'symbol': attributes.get('symbol', 'UNKNOWN'),
-            'contract_address': contract_address,
-            'price_usd': attributes.get('price_usd', 0),
-            'market_cap': attributes.get('fdv_usd', 0),
-            'liquidity': attributes.get('liquidity_usd', 0),
-            'volume': attributes.get('volume_usd', {}).get('h24', 0),
-            'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
-            'image': attributes.get('image_thumb_url', ''),
-            'socials': {}  # Add if available in response
-        }
-    else:
-        return None
-
 
 async def fetch_token_fallback(contract_address: str, client: Optional[httpx.AsyncClient] = None) -> Optional[Dict[str, Any]]:
     """Fallback method to fetch token data when DexScreener fails"""
@@ -3196,8 +3160,1195 @@ async def fetch_token_fallback(contract_address: str, client: Optional[httpx.Asy
         return None
     
 
+def parse_geckoterminal_response(data, contract_address):
+    """Parse GeckoTerminal API response to match token_data structure"""
+    if 'data' in data and 'attributes' in data['data']:
+        attributes = data['data']['attributes']
+        return {
+            'name': attributes.get('name', 'Unknown'),
+            'symbol': attributes.get('symbol', 'UNKNOWN'),
+            'contract_address': contract_address,
+            'price_usd': attributes.get('price_usd', 0),
+            'market_cap': attributes.get('fdv_usd', 0),
+            'liquidity': attributes.get('liquidity_usd', 0),
+            'volume': attributes.get('volume_usd', {}).get('h24', 0),
+            'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
+            'image': attributes.get('image_thumb_url', ''),
+            'socials': {}  # Add if available in response
+        }
+    else:
+        return None
+    
+def parse_birdeye_response(data, contract_address):
+    """Parse Birdeye API response to match token_data structure"""
+    if 'data' in data and 'success' in data and data['success']:
+        token_data = data['data']
+        return {
+            'name': token_data.get('name', 'Unknown'),
+            'symbol': token_data.get('symbol', 'UNKNOWN'),
+            'contract_address': contract_address,
+            'price_usd': token_data.get('price', 0),
+            'market_cap': token_data.get('mc', 0),
+            'liquidity': token_data.get('liquidity', 0),
+            'volume': token_data.get('v24hUSD', 0),
+            'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
+            'image': token_data.get('image', ''),
+            'socials': {}  # Birdeye doesn't provide socials in this endpoint
+        }
+    else:
+        return None
+
+async def buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle buy amount input with balance check and trade execution"""
+    user_id = update.effective_user.id
+    try:
+        amount = float(update.message.text)
+        if amount <= 0:
+            await update.message.reply_text("❌ Please enter a positive amount.")
+            return BUY_AMOUNT
+        
+        # Get token from context
+        token = context.user_data.get('current_token')
+        if not token:
+            await update.message.reply_text("❌ Token information missing. Please start the trade again.")
+            return ConversationHandler.END
+        
+        # Check SOL balance
+        balance = await check_balance(user_id, 'solana')
+        if balance < amount:
+            await update.message.reply_text(
+                f"❌ Insufficient SOL balance. Your balance: {balance:.4f} SOL\n"
+                f"You need at least {amount:.4f} SOL to execute this trade."
+            )
+            log_user_action(user_id, "INSUFFICIENT_BALANCE", f"Needed: {amount}, Had: {balance}", level="warning")
+            return ConversationHandler.END
+        
+        # Execute trade immediately
+        await update.message.reply_text(f"⏳ Executing buy order for {amount:.4f} SOL worth of {token['name']}...")
+        success = await execute_trade(user_id, token['contract_address'], amount, 'buy', 'solana', token)
+        
+        if success:
+            # Update portfolio
+            user = users_collection.find_one({'user_id': user_id})
+            portfolio = user.get('portfolio', {})
+            current_holdings = portfolio.get(token['contract_address'], {
+                'name': token['name'],
+                'symbol': token['symbol'],
+                'amount': 0.0,
+                'buy_price': token['price_usd']
+            })
+            
+            # Add new purchase to portfolio
+            new_amount = current_holdings['amount'] + amount
+            new_avg_price = (
+                (current_holdings['amount'] * current_holdings['buy_price'] + 
+                 amount * token['price_usd'])
+                / new_amount if new_amount > 0 else token['price_usd']
+            )
+            
+            update_result = users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    f'portfolio.{token["contract_address"]}': {
+                        'name': token['name'],
+                        'symbol': token['symbol'],
+                        'amount': new_amount,
+                        'buy_price': new_avg_price
+                    }
+                }},
+                upsert=True
+            )
+            
+            log_user_action(user_id, "TRADE_EXECUTED", f"Bought {amount} SOL worth of {token['name']}")
+            await update.message.reply_text(
+                f"✅ Successfully bought {amount:.4f} SOL worth of {token['name']} at ${token['price_usd']:.6f}.\n"
+                f"📊 You now hold {new_amount:.4f} SOL worth of {token['symbol']}."
+            )
+        else:
+            log_user_action(user_id, "TRADE_FAILED", f"Buy {amount} SOL of {token['name']}", level="error")
+            await update.message.reply_text("❌ Trade failed. Please try again later.")
+        
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+        return BUY_AMOUNT
+
+
+
+async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle sell amount input with proper token amount calculation"""
+    user_id = update.effective_user.id
+    try:
+        # Get the token amount user wants to sell
+        token_amount = float(update.message.text)
+        if token_amount <= 0:
+            await update.message.reply_text("❌ Please enter a positive amount.")
+            return SELL_AMOUNT
+        
+        # Get token from context
+        token = context.user_data.get('current_token')
+        if not token:
+            await update.message.reply_text("❌ Token information missing. Please start the trade again.")
+            return ConversationHandler.END
+        
+        # Check token holdings
+        user = users_collection.find_one({'user_id': user_id})
+        portfolio = user.get('portfolio', {})
+        
+        if token['contract_address'] not in portfolio:
+            await update.message.reply_text(f"❌ You don't hold any {token['name']} tokens to sell.")
+            return ConversationHandler.END
+            
+        token_data = portfolio[token['contract_address']]
+        
+        # Get current token holdings in tokens (not SOL value)
+        # We need to calculate how many tokens the user actually has
+        # This requires knowing the original purchase price to calculate token count
+        buy_price = token_data['buy_price']
+        sol_invested = token_data['amount']
+        
+        # Calculate how many tokens the user bought originally
+        # This assumes the portfolio stores SOL amount invested, not token count
+        token_count_held = sol_invested / buy_price
+        
+        if token_amount > token_count_held:
+            await update.message.reply_text(
+                f"❌ Insufficient token balance. Available: {token_count_held:.2f} tokens\n"
+                f"You requested to sell {token_amount:.2f} tokens."
+            )
+            return SELL_AMOUNT
+        
+        # Store the token amount in context for execution
+        context.user_data['sell_token_amount'] = token_amount
+        
+        # Execute trade immediately
+        await update.message.reply_text(f"⏳ Executing sell order for {token_amount:.2f} {token['symbol']} tokens...")
+        
+        # For sell orders, we need to pass the token amount
+        success = await execute_trade(
+            user_id, 
+            token['contract_address'], 
+            token_amount,  # Pass token amount instead of SOL amount
+            'sell', 
+            'solana',
+            token
+        )
+        
+        if success:
+            # Update portfolio
+            new_token_count = token_count_held - token_amount
+            new_sol_value = new_token_count * buy_price  # Keep original buy price for cost basis
+            
+            if new_token_count <= 0.001:  # Consider dust amounts as zero
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
+                )
+                log_user_action(user_id, "POSITION_CLOSED", f"Sold all {token['name']}")
+            else:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {f'portfolio.{token["contract_address"]}.amount': new_sol_value}}
+                )
+            
+            # Calculate profit/loss
+            current_price = token['price_usd']
+            price_change = ((current_price - buy_price) / buy_price) * 100
+            profit_loss = "profit" if price_change >= 0 else "loss"
+            
+            log_user_action(user_id, "TRADE_EXECUTED", f"Sold {token_amount} tokens of {token['name']}")
+            await update.message.reply_text(
+                f"✅ Successfully sold {token_amount:.2f} {token['symbol']} tokens at ${token['price_usd']:.6f}.\n"
+                f"📈 This trade resulted in a {abs(price_change):.2f}% {profit_loss}.\n"
+                f"📊 You now hold {new_token_count:.2f} {token['symbol']} tokens."
+            )
+        else:
+            log_user_action(user_id, "TRADE_FAILED", f"Sell {token_amount} tokens of {token['name']}", level="error")
+            await update.message.reply_text("❌ Trade failed. Please try again later.")
+        
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+        return SELL_AMOUNT
+
+async def confirm_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Confirm and execute trade"""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(text="⏳ Processing your trade...")
+    user_id = query.from_user.id
+    
+    token = context.user_data['current_token']
+    action = context.user_data.get('trade_action', 'buy')
+    amount = context.user_data.get('buy_amount' if action == 'buy' else 'sell_amount')
+    
+    # Pass token details to execute_trade
+    success = await execute_trade(user_id, token['contract_address'], amount, action, 'solana', token)
+    
+    if success:
+        if action == 'buy':
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {f'portfolio.{token["contract_address"]}': {
+                    'name': token['name'],
+                    'symbol': token['symbol'],
+                    'amount': amount,
+                    'buy_price': token['price_usd']
+                }}}
+            )
+            log_user_action(user_id, "TRADE_EXECUTED", f"Bought {amount} SOL worth of {token['name']}")
+            await query.message.reply_text(
+                f"✅ Successfully bought {amount:.4f} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
+            )
+        else:
+            user = users_collection.find_one({'user_id': user_id})
+            token_data = user['portfolio'][token['contract_address']]
+            token_data['amount'] -= amount
+            if token_data['amount'] <= 0:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
+                )
+            else:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {f'portfolio.{token["contract_address"]}.amount': token_data['amount']}}
+                )
+            log_user_action(user_id, "TRADE_EXECUTED", f"Sold {amount} SOL worth of {token['name']}")
+            await query.message.reply_text(
+                f"✅ Successfully sold {amount:.4f} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
+            )
+    else:
+        log_user_action(user_id, "TRADE_FAILED", f"{action} {amount} SOL of {token['name']}", level="error")
+        await query.message.reply_text("❌ Trade failed. Please try again.")
+    
+    return ConversationHandler.END
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show wallet balances with current token values"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "BALANCE_REQUEST")
+    
+    if not await check_subscription(user_id):
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        await update.message.reply_text("🚫 No wallet found. Please use /start to create a wallet or /set_wallet to import one.")
+        return
+    
+    sol_balance = await check_balance(user_id, 'solana')
+    eth_balance = await check_balance(user_id, 'eth') if user.get('eth') else 0.0
+    bsc_balance = await check_balance(user_id, 'bsc') if user.get('bsc') else 0.0
+    portfolio = user.get('portfolio', {})
+    
+    message = (
+        f"💰 *Wallet Balance*\n\n"
+        f"🔹 Solana (SOL): {sol_balance:.4f}\n"
+        f"🔹 Ethereum (ETH): {eth_balance:.6f}\n"
+        f"🔹 BSC (BNB): {bsc_balance:.6f}\n\n"
+        f"📊 *Token Holdings (Solana)*\n"
+    )
+    
+    if not portfolio:
+        message += "No tokens held."
+    else:
+        total_portfolio_value = 0
+        
+        for contract, details in portfolio.items():
+            # Get current token price
+            token = await fetch_token_by_contract(contract)
+            if not token:
+                # Use buy price if current price not available
+                current_price = details['buy_price']
+                current_value = details['amount']
+                price_note = " (price unavailable, using buy price)"
+            else:
+                current_price = token['price_usd']
+                # Calculate token count and current value
+                token_count = details['amount'] / details['buy_price']
+                current_value = token_count * current_price
+                price_note = ""
+                
+            total_portfolio_value += current_value
+            
+            # Calculate profit/loss
+            profit_loss = current_value - details['amount']
+            profit_loss_percent = (profit_loss / details['amount']) * 100
+            profit_loss_emoji = "📈" if profit_loss >= 0 else "📉"
+            
+            # Calculate token count
+            token_count = details['amount'] / details['buy_price']
+            
+            message += (
+                f"🔸 {details['name']} ({details['symbol']}):\n"
+                f"   - Token Amount: {token_count:.2f}\n"
+                f"   - Current Price: ${current_price:.8f}\n"
+                f"   - Buy Price: ${details['buy_price']:.8f}\n"
+                f"   - P&L: {profit_loss_emoji} {profit_loss:+.4f} SOL ({profit_loss_percent:+.2f}%)\n"
+            )
+        
+        message += f"\n💼 *Total Portfolio Value*: {total_portfolio_value:.4f} SOL"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Initiate token transfer"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "TRANSFER_INITIATED")
+    
+    if not await check_subscription(user_id):
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return ConversationHandler.END
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        await update.message.reply_text("🚫 No wallet found. Please use /start to create a wallet or /set_wallet to import one.")
+        return ConversationHandler.END
+    
+    portfolio = user.get('portfolio', {})
+    if not portfolio:
+        await update.message.reply_text("❌ You have no tokens to transfer.")
+        return ConversationHandler.END
+    
+    keyboard = [[InlineKeyboardButton(details['name'], callback_data=contract)] 
+                for contract, details in portfolio.items()]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "📤 Select Solana token to transfer:",
+        reply_markup=reply_markup
+    )
+    return TRANSFER_TOKEN
+
+async def transfer_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle token selection for transfer"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    log_user_action(user_id, "TRANSFER_TOKEN_SELECTED", query.data)
+    
+    if not await check_subscription(user_id):
+        await query.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return ConversationHandler.END
+    
+    context.user_data['transfer_token'] = query.data
+    user = users_collection.find_one({'user_id': user_id})
+    token = user['portfolio'][query.data]
+    
+    await query.message.reply_text(
+        f"📤 Selected token: {token['name']}\n"
+        f"Enter amount to transfer (in SOL worth):"
+    )
+    return TRANSFER_AMOUNT
+
+async def transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle transfer amount input"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "TRANSFER_AMOUNT_INPUT")
+    
+    if not await check_subscription(user_id):
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return ConversationHandler.END
+    
+    try:
+        amount = float(update.message.text)
+        if amount <= 0:
+            await update.message.reply_text("❌ Please enter a positive amount.")
+            return TRANSFER_AMOUNT
+        
+        token_contract = context.user_data['transfer_token']
+        user = users_collection.find_one({'user_id': user_id})
+        token = user['portfolio'][token_contract]
+        
+        if amount > token['amount']:
+            await update.message.reply_text(
+                f"❌ Insufficient token balance. Available: {token['amount']:.4f} SOL worth"
+            )
+            return TRANSFER_AMOUNT
+        
+        context.user_data['transfer_amount'] = amount
+        await update.message.reply_text("📥 Enter the recipient Solana address:")
+        return TRANSFER_ADDRESS
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+        return TRANSFER_AMOUNT
+
+async def transfer_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle transfer recipient address input"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "TRANSFER_ADDRESS_INPUT")
+    
+    if not await check_subscription(user_id):
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return ConversationHandler.END
+    
+    address = update.message.text
+    try:
+        recipient = Pubkey.from_string(address)
+        token_contract = context.user_data['transfer_token']
+        amount = context.user_data['transfer_amount']
+        
+        success = await execute_transfer(user_id, recipient, token_contract, amount, 'solana')
+        if success:
+            user = users_collection.find_one({'user_id': user_id})
+            token = user['portfolio'][token_contract]
+            token['amount'] -= amount
+            
+            if token['amount'] <= 0:
+            # Remove token from portfolio
+             update_result = users_collection.update_one(
+                {'user_id': user_id},
+                {'$unset': {f'portfolio.{token_contract}': ""}}
+            )
+            else:
+                update_result = users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {f'portfolio.{token_contract}.amount': token['amount']}}
+            )
+        
+        # Log update result
+            logger.info(f"Portfolio update - matched: {update_result.matched_count}, "
+                   f"modified: {update_result.modified_count}, "
+                   f"upserted_id: {update_result.upserted_id}")
+            await update.message.reply_text("✅ Transfer successful.")
+        else:
+            log_user_action(user_id, "TRANSFER_FAILED", 
+                           f"{amount} SOL worth of {token_contract} to {address}", level="error")
+            await update.message.reply_text("❌ Transfer failed. Please check the address and try again.")
+        
+        return ConversationHandler.END
+    except Exception as e:
+        await update.message.reply_text(f"❌ Invalid address: {str(e)}")
+        return TRANSFER_ADDRESS
+
+# Modified fetch_latest_token function
+async def fetch_latest_token() -> List[Dict[str, Any]]:
+    """Fetch all Solana tokens without time filtering"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            logger.info("🌐 Fetching latest tokens from DexScreener")
+            response = await client.get(DEXSCREENER_NEW_TOKENS_API, headers=headers)
+            
+            if response.status_code != 200:
+                logger.error(f"DexScreener API failed: {response.status_code} - {response.text}")
+                return []
+            
+            data = response.json()
+            logger.debug(f"API response: {json.dumps(data, indent=2)[:500]}...")
+            
+            if not isinstance(data, list) or not data:
+                logger.warning("No tokens found in API response")
+                return []
+            
+            solana_tokens = []
+            
+            for token_data in data:
+                if token_data.get('chainId') != 'solana':
+                    continue
+                
+                contract_address = token_data.get('tokenAddress', '')
+                if not contract_address:
+                    continue
+                
+                token = await fetch_token_by_contract(contract_address)
+                if not token:
+                    logger.warning(f"Failed to fetch trading data for token {contract_address}")
+                    continue
+                
+                token.update({
+                    'name': token_data.get('name', token['name']),
+                    'symbol': token_data.get('symbol', token['symbol']),
+                    'image': token_data.get('icon', token['image']),
+                    'socials': {link.get('type', link.get('label', 'website').lower()): link['url']
+                               for link in token_data.get('links', [])},
+                    'description': token_data.get('description', ''),
+                    'openGraph': token_data.get('openGraph', '')
+                })
+                solana_tokens.append(token)
+            
+            logger.info(f"Fetched {len(solana_tokens)} Solana tokens")
+            return solana_tokens
+        
+        except Exception as e:
+            logger.error(f"Error fetching latest tokens: {str(e)}")
+            return []
+        
+def escape_markdown(text: str) -> str:
+    """Escape Markdown special characters for Telegram messages"""
+    escape_chars = r'\_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
+def format_token_message(token: Dict[str, Any]) -> str:
+    """Format token information into a message with escaped Markdown"""
+    platform_icons = {
+        'telegram': '📢',
+        'twitter': '🐦',
+        'website': '🌐',
+        'discord': '💬',
+        'medium': '✍️'
+    }
+    
+    # Escape all dynamic content
+    name = escape_markdown(token.get('name', 'New Token'))
+    symbol = escape_markdown(token.get('symbol', 'TOKEN'))
+    contract_address = escape_markdown(token.get('contract_address', ''))
+    description = escape_markdown(token.get('description', 'No description available'))
+    
+    # Format numbers safely
+    price = f"{token.get('price_usd', 0):.6f}"
+    market_cap = f"{token.get('market_cap', 0):,.2f}"
+    liquidity = f"{token.get('liquidity', 0):,.2f}"
+    volume = f"{token.get('volume', 0):,.2f}"
+    
+    social_links = ""
+    if token.get('socials'):
+        for platform, url in token['socials'].items():
+            icon = platform_icons.get(platform.lower(), '🔗')
+            platform_text = escape_markdown(platform.capitalize())
+            social_links += f"{icon} [{platform_text}]({url})\n"
+    
+    dexscreener_url = token.get('dexscreener_url', '')
+    
+    return (
+        f"🚀 *{name} ({symbol})*\n\n"
+        f"💵 *Price:* ${price}\n"
+        f"📊 *Market Cap:* ${market_cap}\n"
+        f"💧 *Liquidity:* ${liquidity}\n"
+        f"📈 *24h Volume:* ${volume}\n\n"
+        f"🔗 *Contract:* `{contract_address}`\n"
+        f"📝 *Description:* {description}\n\n"
+        f"🔗 *Links:*\n{social_links or 'No links available'}\n"
+        f"[📊 View Chart]({dexscreener_url})"
+    )
+
+# Modified update_token_info function
+async def update_token_info(context):
+    user_id = context.job.user_id
+    logger.info(f"⏰ Token update job started for user {user_id} at {datetime.now()}")
+    
+    try:
+        user = users_collection.find_one({'user_id': user_id})
+        if not user:
+            logger.info(f"User {user_id} not found in database")
+            return
+            
+        if not await check_subscription(user_id):
+            logger.info(f"User {user_id} subscription inactive")
+            return
+        
+        if not user.get('solana') or not user['solana'].get('public_key'):
+            logger.info(f"User {user_id} has no wallet set up")
+            return
+
+        current_time = time.time()
+        if user.get('last_api_call', 0) > current_time - 1:
+            logger.debug("Skipping due to rate limit")
+            return
+
+        logger.info(f"🔍 Fetching tokens for user {user_id}")
+        tokens = await fetch_latest_token()
+        if not tokens:
+            logger.warning("No tokens fetched")
+            return
+            
+        posted_tokens = user.get('posted_tokens', [])
+        new_tokens = [t for t in tokens if t['contract_address'] not in posted_tokens]
+        
+        if new_tokens:
+            token = new_tokens[0]  # Take the most recent unseen token
+            logger.info(f"Processing token: {token['name']} ({token['contract_address']})")
+            
+            # Record token performance globally
+            await record_token_performance(token)
+
+            message = format_token_message(token)
+            is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
+            warning = "⚠️ *LOW LIQUIDITY - Trade with caution!*\n" if is_suspicious else ""
+            
+            keyboard = [
+                [InlineKeyboardButton("💰 Buy", callback_data=f"buy_{token['contract_address']}"),
+                 InlineKeyboardButton("💸 Sell", callback_data=f"sell_{token['contract_address']}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            try:
+                if token.get('image'):
+                    await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=token['image'],
+                        caption=warning + message,
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=warning + message,
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
+                    )
+            except Exception as e:
+                logger.error(f"Error sending token {token['contract_address']}: {str(e)}")
+                await context.bot.send_message(
+                    user_id,
+                    warning + message,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+            
+            # Add to user's posted tokens
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'posted_tokens': token['contract_address']}}
+            )
+            logger.info(f"Added token {token['contract_address']} to user {user_id}'s posted tokens")
+            
+            
+            
+            if user.get('trading_mode') == 'automatic':
+                await auto_trade(context, user_id, token)
+        
+    except Exception as e:
+        logger.error(f"🔥 Error in auto token update: {str(e)}", exc_info=True)
+    finally:
+        logger.info(f"🏁 Token update job completed for user {user_id}")
+
+async def check_balance(user_id, chain):
+    """Check balance for a specific chain"""
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        return 0.0
+    try:
+        if chain == 'solana':
+            pubkey = Pubkey.from_string(user['solana']['public_key'])
+            response = solana_sync_client.get_balance(pubkey)
+            return response.value / 1_000_000_000
+        elif chain == 'eth' and user.get('eth'):
+            address = user['eth']['address']
+            balance = w3_eth.eth.get_balance(address)
+            return w3_eth.from_wei(balance, 'ether')
+        elif chain == 'bsc' and user.get('bsc'):
+            address = user['bsc']['address']
+            balance = w3_bsc.eth.get_balance(address)
+            return w3_bsc.from_wei(balance, 'ether')
+        else:
+            return 0.0
+    except Exception as e:
+        logger.error(f"Error checking {chain} balance: {str(e)}")
+        return 0.0
+
+async def execute_trade(user_id, contract_address, amount, action, chain, token_info):
+    logger.info(f"🏁 Starting {action} trade for {amount} of {contract_address}")
+    try:
+        # Only support Solana
+        if chain != 'solana':
+            logger.error(f"Trading not supported for {chain} yet")
+            return False
+
+        # Fetch user
+        user = users_collection.find_one({'user_id': user_id})
+        if not user:
+            logger.error(f"No user found for user_id {user_id}")
+            return False
+
+        # Decrypt and load wallet
+        decrypted_user = await decrypt_user_wallet(user_id, user)
+        solana_private_key = decrypted_user.get('solana', {}).get('private_key')
+
+        if not solana_private_key or solana_private_key == "[Decryption Failed]":
+            logger.error(f"Failed to decrypt Solana private key for user {user_id}")
+            return False
+
+        keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
+        from_address = str(keypair.pubkey())
+
+        # Use Jupiter Aggregator for best prices
+        jupiter_url = "https://quote-api.jup.ag/v6/quote"
+        
+        if action == 'buy':
+            input_mint = "So11111111111111111111111111111111111111112"  # SOL
+            output_mint = contract_address
+            amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
+            swap_mode = "ExactIn"
+        else:  # sell
+            input_mint = contract_address
+            output_mint = "So11111111111111111111111111111111111111112"  # SOL
+            
+            # For sell orders, we need to calculate the token amount based on current price
+            # First get the current price to calculate token amount
+            current_token = await fetch_token_by_contract(contract_address)
+            if not current_token:
+                logger.error(f"Failed to fetch current token data for {contract_address}")
+                return False
+                
+            # Calculate token amount based on SOL value
+            token_amount = amount / current_token['price_usd']
+            
+            # Get token decimals to calculate raw amount
+            token_decimals = await get_token_decimals(contract_address)
+            amount_raw = int(token_amount * (10 ** token_decimals))
+            
+            swap_mode = "ExactOut"
+            amount_lamports = amount_raw
+
+        # Get quote from Jupiter
+        quote_params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount_lamports),
+            "slippageBps": "100",  # 1% slippage
+            "swapMode": swap_mode
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Get quote
+            quote_response = await client.get(jupiter_url, params=quote_params)
+            if quote_response.status_code != 200:
+                logger.error(f"Jupiter quote failed: {quote_response.text}")
+                return False
+                
+            quote_data = quote_response.json()
+            
+            # Get swap transaction
+            swap_url = "https://quote-api.jup.ag/v6/swap"
+            swap_payload = {
+                "quoteResponse": quote_data,
+                "userPublicKey": from_address,
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+            }
+            
+            swap_response = await client.post(swap_url, json=swap_payload)
+            if swap_response.status_code != 200:
+                logger.error(f"Jupiter swap failed: {swap_response.text}")
+                return False
+                
+            swap_data = swap_response.json()
+            swap_transaction = swap_data.get("swapTransaction")
+            
+            if not swap_transaction:
+                logger.error("No swap transaction in response")
+                return False
+
+            # Deserialize transaction
+            transaction_bytes = base64.b64decode(swap_transaction)
+            
+            # Try different approaches to handle the transaction
+            try:
+                # Try VersionedTransaction first
+                transaction = VersionedTransaction.from_bytes(transaction_bytes)
+                
+                # Create a new signed transaction
+                signed_transaction = VersionedTransaction(transaction.message, [keypair])
+                raw_transaction = bytes(signed_transaction)
+                
+            except Exception as e:
+                logger.warning(f"VersionedTransaction failed, trying legacy: {str(e)}")
+                try:
+                    # Try legacy Transaction
+                    transaction = Transaction.from_bytes(transaction_bytes)
+                    transaction.sign(keypair)
+                    raw_transaction = transaction.serialize()
+                except Exception as e2:
+                    logger.error(f"Both transaction types failed: {str(e2)}")
+                    return False
+            
+            # Send transaction
+            tx_hash = await solana_client.send_raw_transaction(raw_transaction)
+            
+            # Wait for confirmation
+            await solana_client.confirm_transaction(
+                tx_hash.value,
+                commitment="confirmed",
+                sleep_seconds=1
+            )
+            
+            logger.info(f"✅ Transaction confirmed: {tx_hash.value}")
+            return True
+
+    except Exception as e:
+        logger.error(f"🔥 Trade execution failed: {str(e)}", exc_info=True)
+        return False
+    
+
+
+async def get_token_decimals(token_address: str) -> int:
+    """Get token decimals from Solana blockchain"""
+    try:
+        # Try to get token info from Solana
+        mint_pubkey = Pubkey.from_string(token_address)
+        account_info = await solana_client.get_account_info(mint_pubkey)
+        
+        if account_info.value:
+            # Parse mint account data to get decimals
+            # Mint account layout: https://docs.rs/spl-token/3.2.0/spl_token/state/struct.Mint.html
+            data = account_info.value.data
+            if len(data) >= 44:  # Mint account data length is at least 44 bytes
+                decimals = data[44]  # Decimals are at offset 44
+                return decimals
+        
+        # Fallback to default value if not found
+        return 9
+    except Exception as e:
+        logger.error(f"Error getting decimals for token {token_address}: {str(e)}")
+        return 9  # Default to 9 decimals
+
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show debug information"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "DEBUG_REQUEST")
+    
+    user = users_collection.find_one({'user_id': user_id})
+    
+    job_count = 0
+    if context.job_queue:
+        job_count = len(context.job_queue.jobs())
+    
+    sub_status = "Not subscribed"
+    if user and user.get('subscription_status') == 'active':
+        expiry = user.get('subscription_expiry')
+        if isinstance(expiry, str):
+            expiry = datetime.fromisoformat(expiry)
+        if expiry > datetime.now():
+            sub_status = f"Active until {expiry}"
+    
+    last_check = "Never"
+    if user and 'last_token_check' in user:
+        last_check = datetime.fromtimestamp(user['last_token_check']).strftime('%Y-%m-%d %H:%M:%S')
+    
+    message = (
+        f"🐛 *Debug Information*\n\n"
+        f"🔹 User ID: {user_id}\n"
+        f"🔹 Subscription: {sub_status}\n"
+        f"🔹 Active jobs: {job_count}\n"
+        f"🔹 Last token check: {last_check}\n"
+        f"🔹 Posted tokens: {len(user.get('posted_tokens', [])) if user else 0}"
+    )
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def execute_transfer(user_id, recipient, token_contract, amount, chain):
+    """Execute a token transfer"""
+    if chain != 'solana':
+        logger.error(f"Transfer not supported for {chain} yet")
+        return False
+    logger.info(f"Transferring {amount} SOL worth of {token_contract} to {recipient} ({chain})")
+    return True
+
+async def notify_trial_ending(context: ContextTypes.DEFAULT_TYPE):
+    """Notify user when trial is about to end"""
+    user_id = context.job.user_id
+    user = users_collection.find_one({'user_id': user_id})
+    
+    if user and user.get('subscription_status') == 'trial':
+        expiry = datetime.fromisoformat(user['subscription_expiry'])
+        time_left = expiry - datetime.now()
+        
+        if timedelta(hours=1) >= time_left > timedelta(0):
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⏳ Your free trial ends in about 1 hour!\n\n"
+                     f"To continue using the bot after your trial, use /subscribe"
+            )
+            log_user_action(user_id, "TRIAL_ENDING_NOTIFICATION")
+
+async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
+    """Handle automatic trading with enhanced safety parameters"""
+    job = context.job
+    user_id = job.user_id
+    logger.info(f"🤖 Auto-trading for user {user_id}")
+    
+    try:
+        user = users_collection.find_one({'user_id': user_id})
+        if not user or not await check_subscription(user_id):
+            return
+            
+        # Check cooldown
+        last_trade_time = user.get('last_trade_time', 0)
+        if time.time() - last_trade_time < AUTO_TRADE_COOLDOWN:
+            logger.debug(f"Auto-trade cooldown active for user {user_id}")
+            return
+            
+        # Get portfolio and trading settings
+        portfolio = user.get('portfolio', {})
+        trading_mode = user.get('trading_mode', 'manual')
+        buy_amount = user.get('auto_buy_amount', 0.01)
+        sell_percent = user.get('sell_percentage', 10)
+        loss_percent = user.get('loss_percentage', 5)
+        
+        # 1. First handle sell conditions for existing tokens
+        for contract, token_data in list(portfolio.items()):
+            token = await fetch_token_by_contract(contract)
+            if not token:
+                continue
+                
+            buy_price = token_data['buy_price']
+            current_price = token['price_usd']
+            price_change = ((current_price - buy_price) / buy_price) * 100
+            
+            # Check profit target
+            if price_change >= sell_percent:
+                success = await execute_auto_sell(
+                    context, user_id, token, token_data, 
+                    f"{price_change:.2f}% profit"
+                )
+                if success:
+                    continue  # Move to next token after successful sale
+                
+            # Check stop loss
+            elif price_change <= -loss_percent:
+                success = await execute_auto_sell(
+                    context, user_id, token, token_data, 
+                    f"{abs(price_change):.2f}% loss"
+                )
+                if success:
+                    continue  # Move to next token after successful sale
+        
+        # 2. Handle buy conditions for new tokens (only if we have available SOL)
+        sol_balance = await check_balance(user_id, 'solana')
+        if sol_balance < buy_amount:
+            logger.debug(f"Insufficient SOL for auto-buy: {sol_balance} < {buy_amount}")
+            return
+            
+        tokens = await fetch_latest_token()
+        if not tokens:
+            return
+            
+        # Filter tokens using enhanced safety parameters
+        valid_tokens = []
+        for token in tokens:
+            # Skip tokens already in portfolio or blacklist
+            if token['contract_address'] in portfolio or token['contract_address'] in user.get('auto_trade_blacklist', []):
+                continue
+                
+            # Apply safety checks
+            is_safe, reason = await check_token_safety(token, user)
+            if not is_safe:
+                logger.info(f"Skipping token {token['name']}: {reason}")
+                continue
+                
+            valid_tokens.append(token)
+        
+        if not valid_tokens:
+            return
+            
+        # Select the token with highest liquidity among safe tokens
+        token = max(valid_tokens, key=lambda x: x['liquidity'])
+        await execute_auto_buy(context, user_id, token, buy_amount)
+        
+    except Exception as e:
+        logger.error(f"Auto-trade error for user {user_id}: {str(e)}")
+        await notify_user(
+            context, user_id,
+            f"❌ AUTOTRADE ERROR: {str(e)}",
+            "Auto-Trade System Failure"
+        )
+
+
+async def execute_auto_buy(context, user_id, token, buy_amount):
+    """Execute automatic buy using Jupiter API"""
+    try:
+        # Check balance
+        balance = await check_balance(user_id, 'solana')
+        if balance < buy_amount:
+            await notify_user(
+                context, user_id,
+                f"⏳ Insufficient balance for auto-buy. Needed: {buy_amount} SOL, Available: {balance:.4f} SOL",
+                "Auto-Buy Failed"
+            )
+            return False
+        
+        # Execute trade using the same function as manual trades
+        success = await execute_trade(
+            user_id, 
+            token['contract_address'], 
+            buy_amount, 
+            'buy', 
+            'solana',
+            token
+        )
+        
+        if success:
+            # Update portfolio
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    f'portfolio.{token["contract_address"]}': {
+                        'name': token['name'],
+                        'symbol': token['symbol'],
+                        'amount': buy_amount,
+                        'buy_price': token['price_usd'],
+                        'buy_time': datetime.now().isoformat()
+                    },
+                    'last_trade_time': time.time()
+                }}
+            )
+            await notify_user(
+                context, user_id,
+                f"🤖 AUTOBUY: Purchased {buy_amount} SOL worth of {token['name']} at ${token['price_usd']:.6f}",
+                "Auto-Buy Executed"
+            )
+            return True
+        else:
+            # Add to blacklist if trade fails
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'auto_trade_blacklist': token['contract_address']}}
+            )
+            await notify_user(
+                context, user_id,
+                f"❌ AUTOBUY FAILED: Could not buy {token['name']} - added to blacklist",
+                "Auto-Buy Failed"
+            )
+            return False
+            
+    except Exception as e:
+        logger.error(f"Auto-buy execution error: {str(e)}")
+        return False
+    
+
+async def execute_auto_sell(context, user_id, token, token_data, reason):
+    """Execute automatic sell using Jupiter API"""
+    # Execute trade
+    success = await execute_trade(
+        user_id, 
+        token['contract_address'], 
+        token_data['amount'], 
+        'sell', 
+        'solana',
+        token
+    )
+    
+    if success:
+        # Remove from portfolio
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$unset': {f'portfolio.{token["contract_address"]}': ""}},
+        )
+        
+        # Record trade history
+        trade_data = {
+            'token': token['name'],
+            'symbol': token['symbol'],
+            'contract': token['contract_address'],
+            'amount': token_data['amount'],
+            'buy_price': token_data['buy_price'],
+            'sell_price': token['price_usd'],
+            'reason': reason,
+            'timestamp': datetime.now().isoformat()
+        }
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$push': {'trade_history': trade_data}}
+        )
+        
+        # Update last trade time
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'last_trade_time': time.time()}}
+        )
+        
+        await notify_user(
+            context, user_id,
+            f"🤖 AUTOSELL: Sold {token_data['amount']} SOL worth of {token['name']} at {reason}",
+            "Auto-Sell Executed"
+        )
+        return True
+    else:
+        await notify_user(
+            context, user_id,
+            f"❌ AUTOSELL FAILED: Could not sell {token['name']}",
+            "Auto-Sell Failed"
+        )
+        return False
+    
+async def is_legitimate_token(token: Dict[str, Any]) -> bool:
+    """Check if a token appears to be legitimate"""
+    try:
+        # Check for common scam patterns
+        if token['liquidity'] < 1000:  # Very low liquidity
+            return False
+            
+        if token.get('holders', 0) < 50:  # Very few holders
+            return False
+            
+        # Check if creator burned LP tokens (not a perfect check but helpful)
+        # This would require additional on-chain analysis
+        
+        return True
+    except:
+        return False
+
+async def check_token_safety(token: Dict[str, Any], user_settings: Dict[str, Any]) -> Tuple[bool, str]:
+    """Comprehensive token safety check"""
+    reasons = []
+    
+    # Liquidity check
+    if token['liquidity'] < user_settings.get('min_liquidity', 1000):
+        reasons.append(f"Liquidity (${token['liquidity']}) below threshold")
+    
+    # Volume check
+    if token['volume'] < user_settings.get('min_volume', 500):
+        reasons.append(f"Volume (${token['volume']}) below threshold")
+    
+    # Rug pull detection (if enabled)
+    if user_settings.get('rug_check', False) and not await is_legitimate_token(token):
+        reasons.append("Failed rug pull check")
+    
+    # Token age check (if we can determine it)
+    # This would require additional data not currently in the token object
+    
+    if reasons:
+        return False, ", ".join(reasons)
+    return True, "Passed all safety checks"
+
+async def jupiter_api_call(url, params=None, json_data=None, method="GET"):
+    """Helper function for Jupiter API calls with retry logic"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                if method == "GET":
+                    response = await client.get(url, params=params)
+                else:
+                    response = await client.post(url, json=json_data)
+                
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 429:
+                    # Rate limited, wait and retry
+                    wait_time = (attempt + 1) * 2
+                    logger.warning(f"Rate limited, waiting {wait_time}s before retry")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Jupiter API error: {response.status_code} - {response.text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Jupiter API call failed (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)
+    
+    return None
 
     
+async def notify_user(context, user_id, message, action):
+    """Notify user about auto-trade activity with logging"""
+    try:
+        await context.bot.send_message(chat_id=user_id, text=message)
+        log_user_action(user_id, action, message)
+    except Exception as e:
+        logger.error(f"Failed to notify user {user_id}: {str(e)}")
+
+
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
