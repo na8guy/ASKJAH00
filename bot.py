@@ -4028,16 +4028,16 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                         
                         # Record the transaction in user's history
                         trade_record = {
-                            'type': action,
-                            'token_address': contract_address,
-                            'token_name': token_info.get('name', 'Unknown'),
-                            'token_symbol': token_info.get('symbol', 'UNKNOWN'),
-                            'amount': amount,
-                            'price': token_info.get('price_usd', 0),
-                            'tx_hash': tx_hash.value,
-                            'timestamp': datetime.now().isoformat(),
-                            'status': 'completed'
-                        }
+    'type': action,
+    'token_address': contract_address,
+    'token_name': token_info.get('name', 'Unknown'),
+    'token_symbol': token_info.get('symbol', 'UNKNOWN'),
+    'amount': amount,
+    'price': token_info.get('price_usd', 0),
+    'tx_hash': str(tx_hash.value),  # Convert to string
+    'timestamp': datetime.now().isoformat(),
+    'status': 'completed'
+}
                         
                         users_collection.update_one(
                             {'user_id': user_id},
@@ -4338,15 +4338,16 @@ async def execute_auto_sell(context, user_id, token, token_data, reason):
         
         # Record trade history
         trade_data = {
-            'token': token['name'],
-            'symbol': token['symbol'],
-            'contract': token['contract_address'],
-            'amount': token_data['amount'],
-            'buy_price': token_data['buy_price'],
-            'sell_price': token['price_usd'],
-            'reason': reason,
-            'timestamp': datetime.now().isoformat()
-        }
+    'token': token['name'],
+    'symbol': token['symbol'],
+    'contract': token['contract_address'],
+    'amount': token_data['amount'],
+    'buy_price': token_data['buy_price'],
+    'sell_price': token['price_usd'],
+    'reason': reason,
+    'tx_hash': str(tx_hash.value) if 'tx_hash' in locals() else 'N/A',  # Convert to string
+    'timestamp': datetime.now().isoformat()
+}
         users_collection.update_one(
             {'user_id': user_id},
             {'$push': {'trade_history': trade_data}}
