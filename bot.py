@@ -142,6 +142,9 @@ MIN_SAFE_LIQUIDITY = 25000  # $25,000 ABSOLUTE minimum for real liquidity
 MIN_SAFE_VOLUME = 10000  # $10,000 minimum 24h volume
 MIN_HOLDERS = 100  # Minimum holder count to avoid hyper-concentrated tokens
 MAX_TOP_HOLDER_PERCENT = 25  # Maximum % a single wallet can hold
+RPC_RETRY_DELAY = 3  # seconds between RPC retries
+MAX_RPC_RETRIES = 5  # maximum RPC retry attempts
+TWITTER_ENABLED = False  # disable Twitter until properly configured
 
 
 # Bot states for conversation
@@ -3077,7 +3080,7 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return SELECT_TOKEN_ACTION
 
 async def fetch_token_by_contract(contract_address: str) -> Optional[Dict[str, Any]]:
-    """Fetch token details by contract address with rate limit handling and fallback"""
+    """Fetch token details by contract address with improved error handling"""
     # Check cache first
     if contract_address in token_cache:
         cached_data, timestamp = token_cache[contract_address]
@@ -3108,13 +3111,35 @@ async def fetch_token_by_contract(contract_address: str) -> Optional[Dict[str, A
             data = response.json()
             logger.debug(f"API response: {json.dumps(data, indent=2)[:500]}...")
             
-            if not isinstance(data, list) or not data:
+            # Handle different response formats
+            if isinstance(data, list):
+                if len(data) == 0:
+                    logger.error(f"Empty list response for token {contract_address}")
+                    return await fetch_token_fallback(contract_address, client)
+                
+                # Try to find the correct pair in the list
+                pair = None
+                for item in data:
+                    if isinstance(item, dict) and item.get('chainId') == 'solana':
+                        pair = item
+                        break
+                
+                if not pair:
+                    logger.error(f"No Solana pairs found in list response for token {contract_address}")
+                    return await fetch_token_fallback(contract_address, client)
+            elif isinstance(data, dict):
+                # Handle object response
+                if 'pairs' in data and isinstance(data['pairs'], list):
+                    # Find Solana pair in pairs array
+                    pair = next((p for p in data['pairs'] if p.get('chainId') == 'solana'), None)
+                    if not pair:
+                        logger.error(f"No Solana pairs found in object response for token {contract_address}")
+                        return await fetch_token_fallback(contract_address, client)
+                else:
+                    # Assume it's a single pair object
+                    pair = data
+            else:
                 logger.error(f"Unexpected response format: {type(data)}")
-                return await fetch_token_fallback(contract_address, client)
-            
-            pair = next((p for p in data if p.get('chainId') == 'solana'), None)
-            if not pair:
-                logger.error(f"No Solana pairs found for token {contract_address}")
                 return await fetch_token_fallback(contract_address, client)
                 
             base_token = pair.get('baseToken', {})
@@ -4053,7 +4078,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 slippage_bps = min(30, base_slippage * (attempt + 1))  # Normal increase
                 
             logger.info(f"Using {slippage_bps}% slippage for {action} (attempt {attempt+1}, liquidity ratio: {liquidity_ratio:.2f})")
-
+                 
             # Get a fresh quote right before executing
             quote_params = {
                 "inputMint": input_mint,
@@ -4148,6 +4173,11 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                         [keypair]  # Add our signature
                     )
                     raw_transaction = bytes(signed_transaction)
+
+                    recent_blockhash = await solana_rpc_call_with_retry(
+                solana_client.get_latest_blockhash
+            )
+            
                     
                 except Exception as e:
                     logger.warning(f"VersionedTransaction failed: {str(e)}, trying legacy transaction")
@@ -4208,6 +4238,8 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
     {'user_id': user_id},
     {'$push': {'trade_history': trade_record}}
 )
+
+
                         
                         return True, f"Trade successful! TX: {tx_hash.value}"
                     else:
@@ -4248,15 +4280,17 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
     return False, "Max retries exceeded. The token may be too volatile or have insufficient liquidity for trading at this time."
 
 async def get_token_decimals(token_address: str) -> int:
-    """Get token decimals from Solana blockchain"""
+    """Get token decimals from Solana blockchain with retry logic"""
     try:
-        # Try to get token info from Solana
         mint_pubkey = Pubkey.from_string(token_address)
-        account_info = await solana_client.get_account_info(mint_pubkey)
+        
+        # Use retry logic for RPC calls
+        account_info = await solana_rpc_call_with_retry(
+            solana_client.get_account_info, mint_pubkey
+        )
         
         if account_info.value:
             # Parse mint account data to get decimals
-            # Mint account layout: https://docs.rs/spl-token/3.2.0/spl_token/state/struct.Mint.html
             data = account_info.value.data
             if len(data) >= 44:  # Mint account data length is at least 44 bytes
                 decimals = data[44]  # Decimals are at offset 44
@@ -4267,6 +4301,46 @@ async def get_token_decimals(token_address: str) -> int:
     except Exception as e:
         logger.error(f"Error getting decimals for token {token_address}: {str(e)}")
         return 9  # Default to 9 decimals
+
+async def solana_rpc_call_with_retry(func, *args, **kwargs):
+    """Execute Solana RPC call with retry logic for rate limiting"""
+    for attempt in range(MAX_RPC_RETRIES):
+        try:
+            result = await func(*args, **kwargs)
+            return result
+        except Exception as e:
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                wait_time = RPC_RETRY_DELAY * (attempt + 1)
+                logger.warning(f"RPC rate limited, waiting {wait_time}s before retry (attempt {attempt+1}/{MAX_RPC_RETRIES})")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                raise e
+    raise Exception(f"RPC call failed after {MAX_RPC_RETRIES} attempts due to rate limiting") 
+# Add a function to handle RPC rate limiting in all Solana interactions
+async def handle_solana_rpc_rate_limiting():
+    """Monitor and handle Solana RPC rate limiting"""
+    global RPC_RETRY_DELAY
+    
+    # Check if we're being rate limited and adjust retry delay
+    recent_errors = [log for log in logger.handlers[0].buffer if "429" in log.msg or "Too Many Requests" in log.msg]
+    
+    if len(recent_errors) > 5:
+        # Increase retry delay if we're getting rate limited frequently
+        RPC_RETRY_DELAY = min(RPC_RETRY_DELAY * 1.5, 30)  # Cap at 30 seconds
+        logger.warning(f"Increased RPC retry delay to {RPC_RETRY_DELAY}s due to frequent rate limiting")
+    elif len(recent_errors) < 2 and RPC_RETRY_DELAY > 3:
+        # Decrease retry delay if rate limiting is less frequent
+        RPC_RETRY_DELAY = max(RPC_RETRY_DELAY * 0.8, 3)  # Don't go below 3 seconds
+        logger.info(f"Decreased RPC retry delay to {RPC_RETRY_DELAY}s")
+
+# Add this to your job scheduler
+app.job_queue.run_repeating(
+    handle_solana_rpc_rate_limiting,
+    interval=300,  # Check every 5 minutes
+    first=60,
+    name="rpc_rate_limit_monitor"
+)
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show debug information"""
