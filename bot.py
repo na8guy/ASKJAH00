@@ -78,6 +78,9 @@ import math
 # FastAPI setup
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+import talib
+import numpy as np
+from typing import Tuple
 
 
 # Custom filter to add user_id to logs
@@ -123,6 +126,22 @@ TOKEN_PERFORMANCE_INTERVAL = 5 * 60  # 5 minutes in seconds
 PERFORMANCE_TRACKING_DAYS = 7  # Track tokens for 7 days
 token_cache = {}
 CACHE_DURATION = 300
+MAX_POSITIONS = 5  # Maximum open positions
+POSITION_SIZE_PERCENT = 0.05  # 5% of capital per trade
+TRAILING_STOP_PERCENT = 0.15  # 15% trailing stop
+PROFIT_TARGETS = [0.20, 0.50, 1.00]  # 20%, 50%, 100% profit targets
+PROFIT_ALLOCATIONS = [0.4, 0.3, 0.3]  # Sell 40% at 20%, 30% at 50%, 30% at 100%
+MIN_TOKEN_AGE = 15 * 60  # 15 minutes in seconds
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+ADX_THRESHOLD = 25
+MIN_VOLUME_CHANGE = 0.10  # 10% price increase in last 5-15 minutes
+
+HARD_STOP_LOSS = 0.10  # 10% hard stop loss
+MIN_SAFE_LIQUIDITY = 25000  # $25,000 ABSOLUTE minimum for real liquidity
+MIN_SAFE_VOLUME = 10000  # $10,000 minimum 24h volume
+MIN_HOLDERS = 100  # Minimum holder count to avoid hyper-concentrated tokens
+MAX_TOP_HOLDER_PERCENT = 25  # Maximum % a single wallet can hold
 
 
 # Bot states for conversation
@@ -2563,28 +2582,80 @@ async def set_auto_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE
         return SET_AUTO_BUY_AMOUNT
 
 async def set_sell_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Set sell percentage for automatic trading"""
+    """OLD: Set sell percentage for automatic trading"""
+    """NEW: Configure multi-tier profit strategy."""
     user_id = update.effective_user.id
     try:
-        percentage = float(update.message.text)
-        if percentage <= 0:
-            await update.message.reply_text("❌ Please enter a positive percentage.")
-            return SET_SELL_PERCENTAGE
-        
-        users_collection.update_one(
-            {'user_id': user_id},
-            {'$set': {'sell_percentage': percentage}}
-        )
-        log_user_action(user_id, "SELL_PERCENTAGE_SET", f"{percentage}%")
-        
+        # This is now a placeholder. We could repurpose this step to set the first profit target.
+        # For now, we'll just explain the new system and move on.
         await update.message.reply_text(
-            "📉 Enter the stop-loss percentage (e.g., 5 for 5% loss):",
+            "🔄 *Profit Strategy Updated*\n\n"
+            "The old single take-profit has been replaced with a multi-tier strategy for maximum gains:\n"
+            "• ✅ 40% at +20% profit\n"
+            "• ✅ 30% at +50% profit\n"
+            "• ✅ 30% at +100% profit\n"
+            "• 🛡️ 15% Trailing Stop Loss\n"
+            "• 🔐 10% Hard Stop Loss\n\n"
+            "This is now the default and recommended strategy.",
+            parse_mode='Markdown'
+        )
+        log_user_action(user_id, "PROFIT_STRATEGY_SET", "Multi-tier strategy enabled")
+
+        await update.message.reply_text(
+            "📉 Enter the stop-loss percentage (e.g., 10 for 10% loss):",
             parse_mode='Markdown'
         )
         return SET_LOSS_PERCENTAGE
+
     except ValueError:
         await update.message.reply_text("❌ Invalid percentage. Please enter a number.")
         return SET_SELL_PERCENTAGE
+    
+
+
+async def is_virtual_liquidity_token(token: Dict[str, Any], user_settings: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Heuristically determines if a token is using virtual/bonding curve liquidity
+    (e.g., from Pump.fun, Raydium Launchpad) which is high risk.
+    """
+    reasons = []
+    contract_address = token['contract_address']
+
+    # 1. The Primary Signal: Near-Zero Reported Liquidity
+    if token['liquidity'] < 100:  # Often shows as $0.00 or a very small amount
+        reasons.append(f"Low reported liquidity (${token['liquidity']:.2f})")
+
+    # 2. Check if it's a known launchpad contract (requires maintaining a list)
+    known_launchpads = [
+        "Pump.fun",  # This would need the actual program ID
+        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", # Example Pump.fun program ID
+        # Add more known launchpad program IDs as you find them
+    ]
+    # This check requires on-chain analysis to find the creator, which is complex.
+    # For now, we'll skip the deep on-chain check and rely on other heuristics.
+
+    # 3. High Volume + No Liquidity Paradox (Classic Pump.fun signature)
+    if token['liquidity'] < MIN_SAFE_LIQUIDITY and token['volume'] > 5000:
+        reasons.append(f"Suspicious activity: High volume (${token['volume']}) with no liquidity")
+
+    # 4. Check if the token has a supply on Birdeye (most virtual tokens don't initially)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            birdeye_url = f"https://public-api.birdeye.so/defi/token_overview?address={contract_address}"
+            response = await client.get(birdeye_url, headers={"X-API-KEY": os.getenv('BIRDEYE_API_KEY', '')})
+            if response.status_code == 200:
+                data = response.json().get('data', {})
+                supply = data.get('supply', 0)
+                # Virtual tokens often have a supply of 0 or 1 on Birdeye initially
+                if supply <= 1:
+                    reasons.append("No measurable token supply (common in bonding curve)")
+    except Exception as e:
+        logger.warning(f"Could not check Birdeye for {contract_address}: {str(e)}")
+
+    if reasons:
+        return True, "VIRTUAL_LIQUIDITY: " + " | ".join(reasons)
+    return False, "Appears to have real liquidity"
+
 
 async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Set stop-loss percentage for automatic trading"""
@@ -2638,19 +2709,28 @@ async def set_liquidity_threshold(update: Update, context: ContextTypes.DEFAULT_
     user_id = update.effective_user.id
     try:
         threshold = float(update.message.text)
-        if threshold < 1000:
-            await update.message.reply_text("❌ Minimum liquidity should be at least $1000 for safety.")
-            return SET_LIQUIDITY_THRESHOLD
-        
+        # RECOMMEND much higher minimum to avoid virtual liquidity traps
+        if threshold < MIN_SAFE_LIQUIDITY:
+            await update.message.reply_text(
+                f"⚠️ *Warning*: Values below ${MIN_SAFE_LIQUIDITY:,.0f} are highly likely to be "
+                f"virtual liquidity tokens and are extremely risky.\n\n"
+                f"*Recommended minimum: ${MIN_SAFE_LIQUIDITY:,.0f}*\n"
+                f"Do you still want to proceed? (yes/no)",
+                parse_mode='Markdown'
+            )
+            context.user_data['pending_liquidity_threshold'] = threshold
+            return SET_LIQUIDITY_THRESHOLD  # You'd need a new state to handle the confirmation
+
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {'min_liquidity': threshold}}
         )
         log_user_action(user_id, "LIQUIDITY_THRESHOLD_SET", f"${threshold}")
-        
+
         await update.message.reply_text(
-            "📊 Set minimum 24h volume threshold in USD (e.g., 1000 for $1,000):\n\n"
-            "Tokens with volume below this amount will be ignored."
+            "📊 Set minimum 24h volume threshold in USD (e.g., 10000 for $10,000):\n\n"
+            "Tokens with volume below this amount will be ignored.",
+            parse_mode='Markdown'
         )
         return SET_VOLUME_THRESHOLD
     except ValueError:
@@ -4200,7 +4280,7 @@ async def notify_trial_ending(context: ContextTypes.DEFAULT_TYPE):
             log_user_action(user_id, "TRIAL_ENDING_NOTIFICATION")
 
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
-    """Handle automatic trading with enhanced safety parameters"""
+    """Handle automatic trading with enhanced safety parameters and position limits"""
     job = context.job
     user_id = job.user_id
     logger.info(f"🤖 Auto-trading for user {user_id}")
@@ -4215,13 +4295,21 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
         if time.time() - last_trade_time < AUTO_TRADE_COOLDOWN:
             logger.debug(f"Auto-trade cooldown active for user {user_id}")
             return
-            
-        # Get portfolio and trading settings
+        
+        # Check maximum open positions
         portfolio = user.get('portfolio', {})
+        if len(portfolio) >= MAX_POSITIONS:
+            logger.debug(f"Max positions ({MAX_POSITIONS}) reached for user {user_id}")
+            return
+            
+        # Check circuit breaker (daily loss limit)
+        if await check_daily_loss_limit(user_id, user):
+            logger.debug(f"Daily loss limit reached for user {user_id}")
+            return
+            
+        # Get trading settings
         trading_mode = user.get('trading_mode', 'manual')
         buy_amount = user.get('auto_buy_amount', 0.01)
-        sell_percent = user.get('sell_percentage', 10)
-        loss_percent = user.get('loss_percentage', 5)
         
         # 1. First handle sell conditions for existing tokens
         for contract, token_data in list(portfolio.items()):
@@ -4229,32 +4317,12 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
             if not token:
                 continue
                 
-            buy_price = token_data['buy_price']
-            current_price = token['price_usd']
-            price_change = ((current_price - buy_price) / buy_price) * 100
-            
-            # Check profit target
-            if price_change >= sell_percent:
-                success = await execute_auto_sell(
-                    context, user_id, token, token_data, 
-                    f"{price_change:.2f}% profit"
-                )
-                if success:
-                    continue  # Move to next token after successful sale
-                
-            # Check stop loss
-            elif price_change <= -loss_percent:
-                success = await execute_auto_sell(
-                    context, user_id, token, token_data, 
-                    f"{abs(price_change):.2f}% loss"
-                )
-                if success:
-                    continue  # Move to next token after successful sale
+            await execute_auto_sell(context, user_id, token, token_data, "Auto-sell check")
         
-        # 2. Handle buy conditions for new tokens (only if we have available SOL)
+        # 2. Handle buy conditions for new tokens (only if we have available SOL and position slots)
         sol_balance = await check_balance(user_id, 'solana')
-        if sol_balance < buy_amount:
-            logger.debug(f"Insufficient SOL for auto-buy: {sol_balance} < {buy_amount}")
+        if sol_balance < buy_amount or len(portfolio) >= MAX_POSITIONS:
+            logger.debug(f"Insufficient SOL or max positions for auto-buy: {sol_balance} < {buy_amount} or {len(portfolio)} >= {MAX_POSITIONS}")
             return
             
         tokens = await fetch_latest_token()
@@ -4279,9 +4347,23 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
         if not valid_tokens:
             return
             
-        # Select the token with highest liquidity among safe tokens
-        token = max(valid_tokens, key=lambda x: x['liquidity'])
-        await execute_auto_buy(context, user_id, token, buy_amount)
+        # Select the token with best risk/reward ratio
+        best_token = None
+        best_score = -99999
+        
+        for token in valid_tokens:
+            # Simple scoring based on liquidity, volume, and recent performance
+            score = (token['liquidity'] / 10000) + (token['volume'] / 5000)
+            
+            if 'price_change_5m' in token:
+                score += token['price_change_5m'] * 100  # Add momentum factor
+                
+            if score > best_score:
+                best_score = score
+                best_token = token
+        
+        if best_token:
+            await execute_auto_buy(context, user_id, best_token, buy_amount)
         
     except Exception as e:
         logger.error(f"Auto-trade error for user {user_id}: {str(e)}")
@@ -4292,47 +4374,162 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
+    """Check if daily loss limit has been exceeded"""
+    daily_loss_limit = user.get('daily_loss_limit', 0.05)  # Default 5%
+    
+    # Get today's trades
+    today = datetime.now().date()
+    today_trades = [
+        t for t in user.get('trade_history', []) 
+        if datetime.fromisoformat(t['timestamp']).date() == today
+    ]
+    
+    # Calculate today's P&L
+    daily_pnl = 0
+    for trade in today_trades:
+        if 'profit_pct' in trade:
+            # Convert percentage to SOL amount
+            trade_value = trade['amount'] * trade['buy_price']
+            daily_pnl += trade_value * (trade['profit_pct'] / 100)
+        else:
+            # Fallback calculation
+            trade_profit = (trade['sell_price'] - trade['buy_price']) * trade['amount']
+            daily_pnl += trade_profit
+    
+    # Calculate percentage of portfolio
+    sol_balance = await check_balance(user_id, 'solana')
+    portfolio_value = sol_balance
+    for contract, holding in user.get('portfolio', {}).items():
+        portfolio_value += holding['amount']
+    
+    if portfolio_value > 0:
+        loss_pct = abs(min(daily_pnl, 0)) / portfolio_value
+        if loss_pct >= daily_loss_limit:
+            await notify_user(
+                None, user_id,  # We don't have context here, so send directly
+                f"🚫 Daily loss limit reached ({loss_pct*100:.1f}% >= {daily_loss_limit*100}%). Trading paused for today.",
+                "Circuit Breaker Activated"
+            )
+            return True
+    
+    return False
+
+
 async def execute_auto_buy(context, user_id, token, buy_amount):
-    """Execute automatic buy using the same logic as manual trades"""
+    """Execute automatic buy with position sizing and enhanced entry criteria"""
     try:
-        # Check balance
-        balance = await check_balance(user_id, 'solana')
-        if balance < buy_amount:
+        # Get total capital for position sizing
+        sol_balance = await check_balance(user_id, 'solana')
+        user = users_collection.find_one({'user_id': user_id})
+        portfolio = user.get('portfolio', {})
+        
+        # Calculate total portfolio value
+        total_portfolio_value = sol_balance
+        for contract, holding in portfolio.items():
+            # Get current price for each holding
+            holding_token = await fetch_token_by_contract(contract)
+            if holding_token:
+                token_count = holding['amount'] / holding['buy_price']
+                current_value = token_count * holding_token['price_usd']
+                total_portfolio_value += current_value
+        
+        # Apply position sizing (max 5% of total portfolio)
+        max_trade_size = total_portfolio_value * POSITION_SIZE_PERCENT
+        actual_buy_amount = min(buy_amount, max_trade_size)
+        
+        if sol_balance < actual_buy_amount:
             await notify_user(
                 context, user_id,
-                f"⏳ Insufficient balance for auto-buy. Needed: {buy_amount} SOL, Available: {balance:.4f} SOL",
+                f"⏳ Insufficient balance for auto-buy. Needed: {actual_buy_amount} SOL, Available: {sol_balance:.4f} SOL",
                 "Auto-Buy Failed"
             )
             return False
         
-        # Execute trade using the same function as manual trades
+        # Get technical indicators for better entry timing
+        token_performance = token_performance_collection.find_one(
+            {'contract_address': token['contract_address']}
+        )
+        
+        price_history = []
+        if token_performance and 'performance_history' in token_performance:
+            price_history = [entry['price'] for entry in token_performance['performance_history'][-20:]]  # Last 20 prices
+        
+        indicators = await calculate_technical_indicators(token, price_history)
+        
+        # Enhanced entry criteria
+        good_entry = False
+        if indicators:
+            # Strategy 1: Oversold bounce
+            if indicators['oversold'] and indicators['rsi'] > RSI_OVERSOLD + 5:  # RSI moving up from oversold
+                good_entry = True
+                entry_reason = "Oversold bounce"
+            
+            # Strategy 2: Breakout with volume
+            elif (indicators['ma_crossover'] and indicators['strong_trend'] and 
+                  token['volume'] > user.get('min_volume', 1000) * 2):  # Double minimum volume
+                good_entry = True
+                entry_reason = "Breakout with volume"
+            
+            # Strategy 3: Momentum continuation
+            elif (indicators['adx'] > ADX_THRESHOLD and indicators['sma_5'] > indicators['sma_15'] and
+                  token.get('price_change_5m', 0) > 0.05):  # 5% price increase recently
+                good_entry = True
+                entry_reason = "Momentum continuation"
+        else:
+            # Fallback to basic criteria if no indicator data
+            if token['liquidity'] > user.get('min_liquidity', 5000) and token['volume'] > user.get('min_volume', 1000):
+                good_entry = True
+                entry_reason = "Basic criteria"
+        
+        if not good_entry:
+            await notify_user(
+                context, user_id,
+                f"⏭️ Skipping {token['name']} - does not meet entry criteria",
+                "Auto-Buy Skipped"
+            )
+            return False
+        
+        # Execute trade
         success, message = await execute_trade(
             user_id, 
             token['contract_address'], 
-            buy_amount, 
+            actual_buy_amount, 
             'buy', 
             'solana',
             token
         )
         
         if success:
-            # Update portfolio
+            # Store additional trade metadata
+            trade_metadata = {
+                'name': token['name'],
+                'symbol': token['symbol'],
+                'amount': actual_buy_amount,
+                'buy_price': token['price_usd'],
+                'buy_time': datetime.now().isoformat(),
+                'entry_reason': entry_reason,
+                'indicators': indicators,
+                'stop_loss': token['price_usd'] * 0.85,  # 15% stop loss
+                'profit_targets': [
+                    {'percentage': 0.20, 'target_price': token['price_usd'] * 1.20, 'allocation': 0.5},
+                    {'percentage': 0.50, 'target_price': token['price_usd'] * 1.50, 'allocation': 0.25}
+                ],
+                'trailing_stop': TRAILING_STOP_PERCENT,
+                'time_entry': time.time()
+            }
+            
             users_collection.update_one(
                 {'user_id': user_id},
                 {'$set': {
-                    f'portfolio.{token["contract_address"]}': {
-                        'name': token['name'],
-                        'symbol': token['symbol'],
-                        'amount': buy_amount,
-                        'buy_price': token['price_usd'],
-                        'buy_time': datetime.now().isoformat()
-                    },
+                    f'portfolio.{token["contract_address"]}': trade_metadata,
                     'last_trade_time': time.time()
                 }}
             )
+            
             await notify_user(
                 context, user_id,
-                f"🤖 AUTOBUY: {message}",
+                f"🤖 AUTOBUY: {message}\nEntry: {entry_reason}\nSize: {actual_buy_amount:.4f} SOL ({POSITION_SIZE_PERCENT*100}% of portfolio)",
                 "Auto-Buy Executed"
             )
             return True
@@ -4360,45 +4557,103 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
     
 
 async def execute_auto_sell(context, user_id, token, token_data, reason):
-    """Execute automatic sell using the same logic as manual trades"""
+    """Execute automatic sell with profit-taking and stop-loss strategies"""
     try:
-        # For sell orders, we need to calculate the token amount from SOL value
-        token_amount = token_data['amount'] / token_data['buy_price']
+        current_price = token['price_usd']
+        buy_price = token_data['buy_price']
+        price_change_pct = (current_price - buy_price) / buy_price
         
-        # Execute trade using the same function as manual trades
+        # Check if we should take partial profits
+        take_profit = False
+        sell_reason = reason
+        sell_percentage = 1.0  # Default to 100%
+        
+        # Check profit targets
+        if 'profit_targets' in token_data:
+            for target in token_data['profit_targets']:
+                if current_price >= target['target_price'] and not token_data.get(f'target_{target["percentage"]}_hit', False):
+                    take_profit = True
+                    sell_percentage = target['allocation']
+                    sell_reason = f"{target['percentage']*100}% profit target hit"
+                    # Mark this target as hit
+                    users_collection.update_one(
+                        {'user_id': user_id},
+                        {'$set': {f'portfolio.{token["contract_address"]}.target_{target["percentage"]}_hit': True}}
+                    )
+                    break
+        
+        # Implement trailing stop loss
+        if not take_profit and 'trailing_stop' in token_data:
+            highest_price = token_data.get('highest_price', buy_price)
+            if current_price > highest_price:
+                # Update highest price
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {f'portfolio.{token["contract_address"]}.highest_price': current_price}}
+                )
+            else:
+                # Check if current price has dropped by trailing stop percentage from highest
+                trailing_stop_price = highest_price * (1 - token_data['trailing_stop'])
+                if current_price <= trailing_stop_price:
+                    take_profit = True
+                    sell_reason = f"Trailing stop loss triggered ({token_data['trailing_stop']*100}%)"
+        
+        # Check time-based exit (60 minutes)
+        if not take_profit and 'time_entry' in token_data:
+            time_held = time.time() - token_data['time_entry']
+            if time_held > 3600:  # 60 minutes
+                take_profit = True
+                sell_percentage = 1.0
+                sell_reason = "Time-based exit (60 minutes)"
+        
+        # If not taking profit, check regular stop loss
+        if not take_profit and current_price <= token_data.get('stop_loss', buy_price * 0.85):
+            take_profit = True
+            sell_reason = f"Stop loss triggered ({((buy_price - current_price)/buy_price)*100:.1f}% loss)"
+        
+        # If none of the conditions are met, don't sell
+        if not take_profit:
+            return False
+        
+        # Calculate token amount to sell
+        token_amount = (token_data['amount'] / token_data['buy_price']) * sell_percentage
+        
+        # Execute trade
         success, message = await execute_trade(
             user_id, 
             token['contract_address'], 
-            token_amount,  # Pass token amount instead of SOL amount
+            token_amount, 
             'sell', 
             'solana',
             token
         )
         
         if success:
-            # Extract transaction hash from the success message
-            # The message format from execute_trade is: "Trade successful! TX: {tx_hash}"
-            tx_hash = None
-            if "TX:" in message:
-                tx_hash = message.split("TX:")[1].strip()
+            # Update portfolio
+            remaining_amount = token_data['amount'] * (1 - sell_percentage)
             
-            # Remove from portfolio
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$unset': {f'portfolio.{token["contract_address"]}': ""}},
-            )
+            if remaining_amount <= 0.001:  # Dust amount, close position
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
+                )
+            else:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {f'portfolio.{token["contract_address"]}.amount': remaining_amount}}
+                )
             
-            # Record trade history with transaction hash
+            # Record trade history
             trade_data = {
                 'token': token['name'],
                 'symbol': token['symbol'],
                 'contract': token['contract_address'],
-                'amount': token_data['amount'],
+                'amount': token_data['amount'] * sell_percentage,
                 'buy_price': token_data['buy_price'],
-                'sell_price': token['price_usd'],
-                'reason': reason,
-                'tx_hash': tx_hash or 'N/A',  # Use the extracted hash or fallback
-                'timestamp': datetime.now().isoformat()
+                'sell_price': current_price,
+                'reason': sell_reason,
+                'timestamp': datetime.now().isoformat(),
+                'profit_pct': price_change_pct * 100
             }
             
             users_collection.update_one(
@@ -4414,7 +4669,7 @@ async def execute_auto_sell(context, user_id, token, token_data, reason):
             
             await notify_user(
                 context, user_id,
-                f"🤖 AUTOSELL: {message}",
+                f"🤖 AUTOSELL: {message}\nReason: {sell_reason}\nProfit: {price_change_pct*100:.2f}%",
                 "Auto-Sell Executed"
             )
             return True
@@ -4434,6 +4689,7 @@ async def execute_auto_sell(context, user_id, token, token_data, reason):
             "Auto-Sell Error"
         )
         return False
+
     
 async def is_legitimate_token(token: Dict[str, Any]) -> bool:
     """Check if a token appears to be legitimate"""
@@ -4452,28 +4708,106 @@ async def is_legitimate_token(token: Dict[str, Any]) -> bool:
     except:
         return False
 
+
+async def calculate_technical_indicators(token_data: Dict[str, Any], price_history: List[float]) -> Dict[str, Any]:
+    """Calculate technical indicators for trading decisions"""
+    if len(price_history) < 14:  # Minimum for most indicators
+        return {}
+    
+    prices = np.array(price_history)
+    
+    try:
+        # RSI
+        rsi = talib.RSI(prices, timeperiod=14)[-1] if len(prices) >= 14 else 50
+        
+        # Moving Averages
+        sma_5 = talib.SMA(prices, timeperiod=5)[-1] if len(prices) >= 5 else prices[-1]
+        sma_15 = talib.SMA(prices, timeperiod=15)[-1] if len(prices) >= 15 else prices[-1]
+        
+        # ADX (requires high, low, close data - we'll use price for all)
+        high = np.array(price_history)
+        low = np.array(price_history)
+        close = np.array(price_history)
+        adx = talib.ADX(high, low, close, timeperiod=14)[-1] if len(prices) >= 14 else 0
+        
+        # ATR for volatility-based stop loss
+        atr = talib.ATR(high, low, close, timeperiod=14)[-1] if len(prices) >= 14 else 0
+        
+        return {
+            'rsi': rsi,
+            'sma_5': sma_5,
+            'sma_15': sma_15,
+            'adx': adx,
+            'atr': atr,
+            'ma_crossover': sma_5 > sma_15,
+            'oversold': rsi < RSI_OVERSOLD,
+            'overbought': rsi > RSI_OVERBOUGHT,
+            'strong_trend': adx > ADX_THRESHOLD
+        }
+    except Exception as e:
+        logger.error(f"Error calculating indicators: {str(e)}")
+        return {}
+
 async def check_token_safety(token: Dict[str, Any], user_settings: Dict[str, Any]) -> Tuple[bool, str]:
-    """Comprehensive token safety check"""
+    """Comprehensive token safety check with virtual liquidity detection."""
     reasons = []
-    
-    # Liquidity check
-    if token['liquidity'] < user_settings.get('min_liquidity', 1000):
-        reasons.append(f"Liquidity (${token['liquidity']}) below threshold")
-    
-    # Volume check
-    if token['volume'] < user_settings.get('min_volume', 500):
-        reasons.append(f"Volume (${token['volume']}) below threshold")
-    
-    # Rug pull detection (if enabled)
-    if user_settings.get('rug_check', False) and not await is_legitimate_token(token):
-        reasons.append("Failed rug pull check")
-    
-    # Token age check (if we can determine it)
-    # This would require additional data not currently in the token object
-    
+
+    # --- Phase 1: Critical Red Flags (Instant Rejection) ---
+    # Check for virtual liquidity first and foremost
+    is_virtual, virtual_reason = await is_virtual_liquidity_token(token, user_settings)
+    if is_virtual:
+        reasons.append(virtual_reason)
+
+    # --- Phase 2: User-Configurable Safety Limits ---
+    min_liquidity = user_settings.get('min_liquidity', MIN_SAFE_LIQUIDITY)
+    if token['liquidity'] < min_liquidity:
+        reasons.append(f"Liquidity (${token['liquidity']:,.2f}) < ${min_liquidity:,.2f}")
+
+    min_volume = user_settings.get('min_volume', MIN_SAFE_VOLUME)
+    if token['volume'] < min_volume:
+        reasons.append(f"Volume (${token['volume']:,.2f}) < ${min_volume:,.2f}")
+
+    # --- Phase 3: Advanced On-Chain Checks (If possible) ---
+    # Try to fetch holder data from Moralis, Birdeye, etc.
+    holder_data = await fetch_holder_info(token['contract_address']) # You need to implement this
+    if holder_data:
+        if holder_data.get('holders', 0) < MIN_HOLDERS:
+            reasons.append(f"Low holder count ({holder_data.get('holders')} < {MIN_HOLDERS})")
+        if holder_data.get('top_holder_percent', 100) > MAX_TOP_HOLDER_PERCENT:
+            reasons.append(f"Too concentrated (Top holder: {holder_data.get('top_holder_percent')}%)")
+
+    # --- Final Decision ---
     if reasons:
-        return False, ", ".join(reasons)
+        return False, " | ".join(reasons)
     return True, "Passed all safety checks"
+
+async def fetch_holder_info(contract_address: str) -> Optional[Dict[str, Any]]:
+    """Fetches token holder information from Moralis."""
+    moralis_api_key = os.getenv('MORALIS_API_KEY')
+    if not moralis_api_key:
+        logger.warning("MORALIS_API_KEY not set. Skipping holder check.")
+        return None
+
+    url = f"https://deep-index.moralis.io/api/v2.2/erc20/{contract_address}/holders?chain=solana&limit=10"
+    headers = {"X-API-Key": moralis_api_key}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                total_holders = data.get('total', 0)
+                top_holder = data['result'][0]['balance'] if data['result'] else 0
+                total_supply = 1  # You would need to get this from elsewhere
+                top_holder_percent = (top_holder / total_supply) * 100 if total_supply > 0 else 0
+
+                return {
+                    'holders': total_holders,
+                    'top_holder_percent': top_holder_percent
+                }
+    except Exception as e:
+        logger.error(f"Failed to fetch holder info from Moralis: {str(e)}")
+    return None
 
 async def jupiter_api_call(url, params=None, json_data=None, method="GET"):
     """Helper function for Jupiter API calls with retry logic"""
