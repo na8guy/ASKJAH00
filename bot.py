@@ -615,6 +615,7 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
     
     return decrypted_user
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /start command"""
     user_id = update.effective_user.id
@@ -1802,7 +1803,31 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return SUBSCRIPTION_CONFIRMATION
 
-
+async def check_trade_feasibility(token: Dict[str, Any], trade_amount_sol: float) -> Tuple[bool, str]:
+    """
+    Check if a trade is feasible based on liquidity and market conditions.
+    Returns (is_feasible, reason)
+    """
+    # Calculate approximate trade size in USD
+    trade_size_usd = trade_amount_sol * 150  # Approximate SOL price
+    
+    # Rule 1: Absolute liquidity minimum
+    if token['liquidity'] < 500:  # $500 absolute minimum
+        return False, f"Insufficient liquidity (${token['liquidity']} < $500)"
+    
+    # Rule 2: Trade size should be less than 5% of liquidity
+    if trade_size_usd > token['liquidity'] * 0.05:
+        return False, f"Trade size (${trade_size_usd:.2f}) > 5% of liquidity (${token['liquidity']})"
+    
+    # Rule 3: Check if token is in a death spiral (price dropping rapidly)
+    if 'price_change_5m' in token and token['price_change_5m'] < -0.3:  # 30% drop in 5min
+        return False, f"Token price crashing ({token['price_change_5m']*100:.1f}% in 5min)"
+    
+    # Rule 4: Check if volume has dried up
+    if token['volume'] < 1000:  # Less than $1000 volume
+        return False, f"Low volume (${token['volume']} < $1000)"
+    
+    return True, "Trade is feasible"
 
 async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle subscription confirmation and execute SOL payment"""
@@ -2639,20 +2664,11 @@ async def is_virtual_liquidity_token(token: Dict[str, Any], user_settings: Dict[
     if token['liquidity'] < 100:  # Often shows as $0.00 or a very small amount
         reasons.append(f"Low reported liquidity (${token['liquidity']:.2f})")
 
-    # 2. Check if it's a known launchpad contract (requires maintaining a list)
-    known_launchpads = [
-        "Pump.fun",  # This would need the actual program ID
-        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", # Example Pump.fun program ID
-        # Add more known launchpad program IDs as you find them
-    ]
-    # This check requires on-chain analysis to find the creator, which is complex.
-    # For now, we'll skip the deep on-chain check and rely on other heuristics.
-
-    # 3. High Volume + No Liquidity Paradox (Classic Pump.fun signature)
+    # 2. High Volume + No Liquidity Paradox (Classic Pump.fun signature)
     if token['liquidity'] < MIN_SAFE_LIQUIDITY and token['volume'] > 5000:
         reasons.append(f"Suspicious activity: High volume (${token['volume']}) with no liquidity")
 
-    # 4. Check if the token has a supply on Birdeye (most virtual tokens don't initially)
+    # 3. Check if the token has a supply on Birdeye (most virtual tokens don't initially)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             birdeye_url = f"https://public-api.birdeye.so/defi/token_overview?address={contract_address}"
@@ -2669,7 +2685,6 @@ async def is_virtual_liquidity_token(token: Dict[str, Any], user_settings: Dict[
     if reasons:
         return True, "VIRTUAL_LIQUIDITY: " + " | ".join(reasons)
     return False, "Appears to have real liquidity"
-
 
 async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Set stop-loss percentage for automatic trading"""
@@ -3971,6 +3986,12 @@ async def check_balance(user_id, chain):
 async def execute_trade(user_id, contract_address, amount, action, chain, token_info):
     logger.info(f"🏁 Starting {action} trade for {amount} of {contract_address}")
     
+    # Check trade feasibility first for sell orders
+    if action == 'sell':
+        is_feasible, reason = await check_trade_feasibility(token_info, amount)
+        if not is_feasible:
+            return False, f"Cannot execute trade: {reason}"
+    
     # Retry configuration
     max_retries = 3
     retry_delay = 2  # seconds between retries
@@ -3990,8 +4011,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             solana_private_key = decrypted_user.get('solana', {}).get('private_key')
 
             if not solana_private_key or solana_private_key == "[Decryption Failed]":
-                logger.error(f"Failed to decrypt Solana private key for user {user_id}")
-                return False, "Wallet decryption failed"
+                raise ValueError("Failed to decrypt Solana private key")
 
             keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
             from_address = str(keypair.pubkey())
@@ -4006,8 +4026,6 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 output_mint = contract_address
                 amount_lamports = int(amount * 10**9)  # Convert SOL to lamports
                 swap_mode = "ExactIn"
-                # Very high slippage for buys on volatile tokens
-                slippage_bps = 2000 + (attempt * 1000)  # Start at 20%, increase by 10% each retry
             else:  # sell
                 input_mint = contract_address
                 output_mint = "So11111111111111111111111111111111111111112"  # SOL
@@ -4016,17 +4034,27 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 token_decimals = await get_token_decimals(contract_address)
                 amount_raw = int(amount * (10 ** token_decimals))
                 
-                swap_mode = "ExactIn"  # We're specifying the exact input token amount
+                swap_mode = "ExactIn"
                 amount_lamports = amount_raw
-                # Very high slippage for sells on volatile tokens
-                slippage_bps = 3000 + (attempt * 1500)  # Start at 30%, increase by 15% each retry
+
+            # Dynamic slippage based on liquidity and attempt
+            base_slippage = user.get('max_slippage', 5)
+            
+            # Increase slippage for low liquidity tokens or retries
+            liquidity_ratio = token_info['liquidity'] / (amount * 150) if token_info['liquidity'] > 0 else 100
+            if liquidity_ratio < 10:  # Low liquidity
+                slippage_bps = min(100, base_slippage * (2 ** attempt))  # Up to 100% slippage!
+            else:
+                slippage_bps = min(30, base_slippage * (attempt + 1))  # Normal increase
+                
+            logger.info(f"Using {slippage_bps}% slippage for {action} (attempt {attempt+1}, liquidity ratio: {liquidity_ratio:.2f})")
 
             # Get a fresh quote right before executing
             quote_params = {
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount_lamports),
-                "slippageBps": slippage_bps,
+                "slippageBps": int(slippage_bps * 100),  # Convert percentage to basis points
                 "swapMode": swap_mode,
                 "onlyDirectRoutes": False,
                 "asLegacyTransaction": False,
@@ -4159,16 +4187,16 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                         
                         # Record the transaction in user's history
                         trade_record = {
-    'type': action,
-    'token_address': contract_address,
-    'token_name': token_info.get('name', 'Unknown'),
-    'token_symbol': token_info.get('symbol', 'UNKNOWN'),
-    'amount': amount,
-    'price': token_info.get('price_usd', 0),
-    'tx_hash': str(tx_hash.value),  # Convert to string
-    'timestamp': datetime.now().isoformat(),
-    'status': 'completed'
-}
+                            'type': action,
+                            'token_address': contract_address,
+                            'token_name': token_info.get('name', 'Unknown'),
+                            'token_symbol': token_info.get('symbol', 'UNKNOWN'),
+                            'amount': amount,
+                            'price': token_info.get('price_usd', 0),
+                            'tx_hash': str(tx_hash.value),
+                            'timestamp': datetime.now().isoformat(),
+                            'status': 'completed'
+                        }
                         
                         users_collection.update_one(
                             {'user_id': user_id},
@@ -4212,7 +4240,7 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             return False, f"Trade execution failed: {str(e)}"
 
     return False, "Max retries exceeded. The token may be too volatile or have insufficient liquidity for trading at this time."
-    
+
 async def get_token_decimals(token_address: str) -> int:
     """Get token decimals from Solana blockchain"""
     try:
@@ -4484,7 +4512,7 @@ async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
 
 
 async def execute_auto_buy(context, user_id, token, buy_amount):
-    """Execute automatic buy with position sizing and enhanced entry criteria"""
+    """Execute automatic buy with liquidity-aware position sizing"""
     try:
         # Get total capital for position sizing
         sol_balance = await check_balance(user_id, 'solana')
@@ -4501,15 +4529,28 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
                 current_value = token_count * holding_token['price_usd']
                 total_portfolio_value += current_value
         
-        # Apply position sizing (max 5% of total portfolio)
-        max_trade_size = total_portfolio_value * POSITION_SIZE_PERCENT
-        actual_buy_amount = min(buy_amount, max_trade_size)
+        # Calculate maximum position size based on liquidity
+        liquidity_max = token['liquidity'] * 0.05 / 150  # 5% of liquidity converted to SOL
+        portfolio_max = total_portfolio_value * POSITION_SIZE_PERCENT
         
-        if sol_balance < actual_buy_amount:
+        # Use the smaller of the two limits
+        actual_buy_amount = min(buy_amount, liquidity_max, portfolio_max)
+        
+        if actual_buy_amount < 0.001:  # Minimum trade size
             await notify_user(
                 context, user_id,
-                f"⏳ Insufficient balance for auto-buy. Needed: {actual_buy_amount} SOL, Available: {sol_balance:.4f} SOL",
-                "Auto-Buy Failed"
+                f"⏭️ Skipping {token['name']} - liquidity too low for any position",
+                "Auto-Buy Skipped"
+            )
+            return False
+        
+        # Check if we can actually execute this trade
+        is_feasible, reason = await check_trade_feasibility(token, actual_buy_amount)
+        if not is_feasible:
+            await notify_user(
+                context, user_id,
+                f"⏭️ Skipping {token['name']} - {reason}",
+                "Auto-Buy Skipped"
             )
             return False
         
@@ -4525,19 +4566,18 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
         indicators = calculate_technical_indicators(price_history)
         
         # Enhanced entry criteria
-        # Enhanced entry criteria
         good_entry = False
         entry_reason = ""
-
+        
         if indicators:
             # Strategy 1: Oversold bounce
-            if indicators['oversold'] and indicators['rsi'] > RSI_OVERSOLD + 5:  # RSI moving up from oversold
+            if indicators['oversold'] and indicators['rsi'] > 30 + 5:  # RSI moving up from oversold
                 good_entry = True
                 entry_reason = "Oversold bounce"
             
             # Strategy 2: Breakout with volume and momentum
             elif (indicators['ma_crossover'] and indicators['positive_momentum'] and 
-                token['volume'] > user.get('min_volume', 1000) * 2):  # Double minimum volume
+                  token['volume'] > user.get('min_volume', 1000) * 2):  # Double minimum volume
                 good_entry = True
                 entry_reason = "Breakout with volume and momentum"
             
@@ -4579,13 +4619,15 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
                 'buy_time': datetime.now().isoformat(),
                 'entry_reason': entry_reason,
                 'indicators': indicators,
-                'stop_loss': token['price_usd'] * 0.85,  # 15% stop loss
+                'stop_loss': token['price_usd'] * (1 - HARD_STOP_LOSS),  # Hard stop loss
                 'profit_targets': [
-                    {'percentage': 0.20, 'target_price': token['price_usd'] * 1.20, 'allocation': 0.5},
-                    {'percentage': 0.50, 'target_price': token['price_usd'] * 1.50, 'allocation': 0.25}
+                    {'percentage': 0.20, 'target_price': token['price_usd'] * 1.20, 'allocation': 0.4},
+                    {'percentage': 0.50, 'target_price': token['price_usd'] * 1.50, 'allocation': 0.3},
+                    {'percentage': 1.00, 'target_price': token['price_usd'] * 2.00, 'allocation': 0.3}
                 ],
                 'trailing_stop': TRAILING_STOP_PERCENT,
-                'time_entry': time.time()
+                'time_entry': time.time(),
+                'buy_time_liquidity': token['liquidity']  # Store liquidity at time of purchase
             }
             
             users_collection.update_one(
@@ -4596,10 +4638,9 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
                 }}
             )
             
-            token_info = f"{token['name']} ({token['symbol']})\nContract: {token['contract_address']}"
             await notify_user(
                 context, user_id,
-                f"🤖 AUTOBUY: {message}\nToken: {token_info}\nEntry: {entry_reason}\nSize: {actual_buy_amount:.4f} SOL ({POSITION_SIZE_PERCENT*100}% of portfolio)",
+                f"🤖 AUTOBUY: {message}\nEntry: {entry_reason}\nSize: {actual_buy_amount:.4f} SOL ({POSITION_SIZE_PERCENT*100}% of portfolio)",
                 "Auto-Buy Executed"
             )
             return True
@@ -4609,43 +4650,78 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
                 {'user_id': user_id},
                 {'$addToSet': {'auto_trade_blacklist': token['contract_address']}}
             )
-            token_info = f"{token['name']} ({token['contract_address']})"
             await notify_user(
                 context, user_id,
-                f"❌ AUTOBUY FAILED: {message}\nToken: {token_info}",
+                f"❌ AUTOBUY FAILED: {message}",
                 "Auto-Buy Failed"
             )
             return False
             
     except Exception as e:
         logger.error(f"Auto-buy execution error: {str(e)}")
-        # Include token info in error notification
-        token_info = f"{token['name']} ({token['contract_address']})" if token else "Unknown token"
         await notify_user(
             context, user_id,
-            f"❌ AUTOBUY ERROR: {str(e)}\nToken: {token_info}",
+            f"❌ AUTOBUY ERROR: {str(e)}",
             "Auto-Buy Error"
         )
         return False
     
-
-async def execute_auto_sell(context, user_id, token, token_data, reason):
-    """Execute automatic sell with profit-taking and stop-loss strategies"""
+async def emergency_sell_protocol(context, user_id, token, token_data):
+    """
+    Try to sell tokens that have become illiquid using aggressive parameters
+    """
+    contract_address = token['contract_address']
+    
+    # Try with extremely high slippage
+    user = users_collection.find_one({'user_id': user_id})
+    original_slippage = user.get('max_slippage', 5)
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {'emergency_sell_mode': True, 'max_slippage': 50}}  # 50% slippage!
+    )
+    
     try:
-        # Add defensive checks for required keys
-        if 'buy_price' not in token_data:
-            logger.error(f"Missing 'buy_price' in token_data for user {user_id}")
+        # Calculate token amount
+        token_amount = token_data['amount'] / token_data['buy_price']
+        
+        # Try to sell with aggressive settings
+        success, message = await execute_trade(
+            user_id, contract_address, token_amount, 'sell', 'solana', token
+        )
+        
+        if success:
+            await notify_user(
+                context, user_id,
+                f"🚨 EMERGENCY SELL: {message}",
+                "Emergency Sell Executed"
+            )
+            return True
+        else:
+            # Mark token as unsellable
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'unsellable_tokens': contract_address}}
+            )
+            await notify_user(
+                context, user_id,
+                f"💀 Token {token['name']} appears completely illiquid and cannot be sold.",
+                "Token Possibly Rugged"
+            )
             return False
             
+    finally:
+        # Restore original settings
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'max_slippage': original_slippage}, '$unset': {'emergency_sell_mode': True}}
+        )
+
+async def execute_auto_sell(context, user_id, token, token_data, reason):
+    """Execute automatic sell with emergency fallback"""
+    try:
         current_price = token['price_usd']
         buy_price = token_data['buy_price']
-        
-        # Calculate price change safely
-        if buy_price > 0:
-            price_change_pct = (current_price - buy_price) / buy_price
-        else:
-            price_change_pct = 0
-            
+        price_change_pct = (current_price - buy_price) / buy_price
         
         # Check if we should take partial profits
         take_profit = False
@@ -4691,7 +4767,7 @@ async def execute_auto_sell(context, user_id, token, token_data, reason):
                 sell_reason = "Time-based exit (60 minutes)"
         
         # If not taking profit, check regular stop loss
-        if not take_profit and current_price <= token_data.get('stop_loss', buy_price * 0.85):
+        if not take_profit and current_price <= token_data.get('stop_loss', buy_price * (1 - HARD_STOP_LOSS)):
             take_profit = True
             sell_reason = f"Stop loss triggered ({((buy_price - current_price)/buy_price)*100:.1f}% loss)"
         
@@ -4729,16 +4805,16 @@ async def execute_auto_sell(context, user_id, token, token_data, reason):
             
             # Record trade history
             trade_data = {
-    'token': token['name'],
-    'symbol': token['symbol'],
-    'contract': token['contract_address'],
-    'amount': token_data['amount'] * sell_percentage,
-    'buy_price': token_data['buy_price'],
-    'sell_price': current_price,  # Make sure this is always included
-    'reason': sell_reason,
-    'timestamp': datetime.now().isoformat(),
-    'profit_pct': price_change_pct * 100  # Make sure this is always included
-}
+                'token': token['name'],
+                'symbol': token['symbol'],
+                'contract': token['contract_address'],
+                'amount': token_data['amount'] * sell_percentage,
+                'buy_price': token_data['buy_price'],
+                'sell_price': current_price,
+                'reason': sell_reason,
+                'timestamp': datetime.now().isoformat(),
+                'profit_pct': price_change_pct * 100
+            }
             
             users_collection.update_one(
                 {'user_id': user_id},
@@ -4751,34 +4827,107 @@ async def execute_auto_sell(context, user_id, token, token_data, reason):
                 {'$set': {'last_trade_time': time.time()}}
             )
             
-            token_info = f"{token['name']} ({token['symbol']})\nContract: {token['contract_address']}"
             await notify_user(
                 context, user_id,
-                f"🤖 AUTOSELL: {message}\nToken: {token_info}\nReason: {sell_reason}\nProfit: {price_change_pct*100:.2f}%",
+                f"🤖 AUTOSELL: {message}\nReason: {sell_reason}\nProfit: {price_change_pct*100:.2f}%",
                 "Auto-Sell Executed"
             )
             return True
         else:
-            # Handle failed trades with token info
-            token_info = f"{token['name']} ({token['contract_address']})"
-            await notify_user(
-                context, user_id,
-                f"❌ AUTOSELL FAILED: {message}\nToken: {token_info}",
-                "Auto-Sell Failed"
-            )
-            return False
+            # Check if this might be a liquidity issue and try emergency protocol
+            if "6025" in message or "liquidity" in message.lower() or "slippage" in message.lower():
+                return await emergency_sell_protocol(context, user_id, token, token_data)
+            else:
+                await notify_user(
+                    context, user_id,
+                    f"❌ AUTOSELL FAILED: {message}",
+                    "Auto-Sell Failed"
+                )
+                return False
             
     except Exception as e:
         logger.error(f"Auto-sell execution error: {str(e)}")
-        # Include token info in error notification
-        token_info = f"{token['name']} ({token['contract_address']})" if token else "Unknown token"
-        await notify_user(
-            context, user_id,
-            f"❌ AUTOSELL ERROR: {str(e)}\nToken: {token_info}",
-            "Auto-Sell Error"
-        )
-        return False
+        
+        # Check if this might be a liquidity issue
+        if "6025" in str(e) or "liquidity" in str(e).lower():
+            return await emergency_sell_protocol(context, user_id, token, token_data)
+        else:
+            await notify_user(
+                context, user_id,
+                f"❌ AUTOSELL ERROR: {str(e)}",
+                "Auto-Sell Error"
+            )
+            return False
 
+async def monitor_portfolio_liquidity(context: ContextTypes.DEFAULT_TYPE):
+    """Monitor liquidity of tokens in portfolio and alert if deteriorating"""
+    logger.info("🔍 Monitoring portfolio liquidity...")
+    
+    active_users = users_collection.find({
+        "subscription_status": "active",
+        "subscription_expiry": {"$gt": datetime.now().isoformat()}
+    })
+    
+    for user in active_users:
+        user_id = user['user_id']
+        portfolio = user.get('portfolio', {})
+        
+        for contract, token_data in portfolio.items():
+            token = await fetch_token_by_contract(contract)
+            if not token:
+                continue
+                
+            # Check if liquidity has dropped significantly
+            if (token_data.get('buy_time_liquidity', 0) > 0 and 
+                token['liquidity'] < token_data['buy_time_liquidity'] * 0.5):
+                
+                await notify_user(
+                    context, user_id,
+                    f"⚠️ Liquidity Alert: {token_data['name']}\n"
+                    f"Liquidity dropped from ${token_data['buy_time_liquidity']:,.2f} "
+                    f"to ${token['liquidity']:,.2f} (-{((1 - token['liquidity']/token_data['buy_time_liquidity'])*100):.1f}%)",
+                    "Liquidity Warning"
+                )
+                
+                # Suggest selling if liquidity is critically low
+                if token['liquidity'] < 1000:
+                    await notify_user(
+                        context, user_id,
+                        f"🚨 CRITICAL: {token_data['name']} liquidity is now only ${token['liquidity']:,.2f}. "
+                        f"Consider emergency sell with /emergency_sell {contract}",
+                        "Critical Liquidity Alert"
+                    )
+
+async def emergency_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual emergency sell command for illiquid tokens"""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text("Please specify a token contract address: /emergency_sell <contract>")
+        return
+        
+    contract_address = context.args[0]
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user or contract_address not in user.get('portfolio', {}):
+        await update.message.reply_text("You don't hold this token in your portfolio.")
+        return
+        
+    token_data = user['portfolio'][contract_address]
+    token = await fetch_token_by_contract(contract_address)
+    
+    if not token:
+        await update.message.reply_text("Could not fetch token data.")
+        return
+        
+    await update.message.reply_text(f"🚨 Attempting emergency sell of {token_data['name']}...")
+    
+    success = await emergency_sell_protocol(context, user_id, token, token_data)
+    
+    if success:
+        await update.message.reply_text("Emergency sell completed!")
+    else:
+        await update.message.reply_text("Emergency sell failed. Token may be completely illiquid.")                    
     
 async def is_legitimate_token(token: Dict[str, Any]) -> bool:
     """Check if a token appears to be legitimate"""
@@ -4848,8 +4997,8 @@ def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]
             'sma_15': sma_15,
             'roc_5': roc,
             'ma_crossover': sma_5 > sma_15,
-            'oversold': rsi < RSI_OVERSOLD,
-            'overbought': rsi > RSI_OVERBOUGHT,
+            'oversold': rsi < 30,  # RSI_OVERSOLD
+            'overbought': rsi > 70,  # RSI_OVERBOUGHT
             'positive_momentum': roc > 5,  # 5% price increase in 5 periods
         }
     except Exception as e:
@@ -4857,16 +5006,15 @@ def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]
         return {}
     
 async def check_token_safety(token: Dict[str, Any], user_settings: Dict[str, Any]) -> Tuple[bool, str]:
-    """Comprehensive token safety check with virtual liquidity detection."""
+    """Comprehensive token safety check with virtual liquidity detection"""
     reasons = []
-
-    # --- Phase 1: Critical Red Flags (Instant Rejection) ---
+    
     # Check for virtual liquidity first and foremost
     is_virtual, virtual_reason = await is_virtual_liquidity_token(token, user_settings)
     if is_virtual:
         reasons.append(virtual_reason)
-
-    # --- Phase 2: User-Configurable Safety Limits ---
+    
+    # User-Configurable Safety Limits
     min_liquidity = user_settings.get('min_liquidity', MIN_SAFE_LIQUIDITY)
     if token['liquidity'] < min_liquidity:
         reasons.append(f"Liquidity (${token['liquidity']:,.2f}) < ${min_liquidity:,.2f}")
@@ -4875,16 +5023,16 @@ async def check_token_safety(token: Dict[str, Any], user_settings: Dict[str, Any
     if token['volume'] < min_volume:
         reasons.append(f"Volume (${token['volume']:,.2f}) < ${min_volume:,.2f}")
 
-    # --- Phase 3: Advanced On-Chain Checks (If possible) ---
-    # Try to fetch holder data from Moralis, Birdeye, etc.
-    holder_data = await fetch_holder_info(token['contract_address']) # You need to implement this
-    if holder_data:
-        if holder_data.get('holders', 0) < MIN_HOLDERS:
-            reasons.append(f"Low holder count ({holder_data.get('holders')} < {MIN_HOLDERS})")
-        if holder_data.get('top_holder_percent', 100) > MAX_TOP_HOLDER_PERCENT:
-            reasons.append(f"Too concentrated (Top holder: {holder_data.get('top_holder_percent')}%)")
+    # Liquidity sustainability check
+    if 'market_cap' in token and token['market_cap'] > 0:
+        liquidity_ratio = token['liquidity'] / token['market_cap']
+        if liquidity_ratio < 0.1:  # Less than 10% of MCap as liquidity
+            reasons.append(f"Low liquidity ratio ({liquidity_ratio:.2f} < 0.1)")
+    
+    # Check if liquidity is declining rapidly
+    if 'liquidity_change_24h' in token and token['liquidity_change_24h'] < -0.5:
+        reasons.append(f"Liquidity dropping rapidly ({token['liquidity_change_24h']*100:.1f}%)")
 
-    # --- Final Decision ---
     if reasons:
         return False, " | ".join(reasons)
     return True, "Passed all safety checks"
@@ -5055,6 +5203,7 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
     application.add_handler(CommandHandler("force_fetch", force_token_fetch))
     application.add_handler(CommandHandler("trade_status", trade_status))
+    application.add_handler(CommandHandler("emergency_sell", emergency_sell))
     #application.add_handler(CallbackQueryHandler(handle_token_button, pattern='^(buy|sell)_'))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("reset_tokens", reset_tokens))
@@ -5303,6 +5452,13 @@ async def on_startup():
                     user_id=user_id,
                     name=f"auto_trade_{user_id}"
                 )
+
+            app.job_queue.run_repeating(
+        monitor_portfolio_liquidity,
+        interval=3600,  # Check every hour
+        first=30,
+        name="portfolio_liquidity_monitoring"
+    )
 
         # Schedule background jobs
         app.job_queue.run_repeating(
