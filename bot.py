@@ -4192,21 +4192,22 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                         
                         # Record the transaction in user's history
                         trade_record = {
-                            'type': action,
-                            'token_address': contract_address,
-                            'token_name': token_info.get('name', 'Unknown'),
-                            'token_symbol': token_info.get('symbol', 'UNKNOWN'),
-                            'amount': amount,
-                            'price': token_info.get('price_usd', 0),
-                            'tx_hash': str(tx_hash.value),
-                            'timestamp': datetime.now().isoformat(),
-                            'status': 'completed'
-                        }
+    'type': action,
+    'token_address': contract_address,
+    'token_name': token_info.get('name', 'Unknown'),
+    'token_symbol': token_info.get('symbol', 'UNKNOWN'),
+    'amount': amount,
+    'price': token_info.get('price_usd', 0),
+    'tx_hash': str(tx_hash.value),  # Convert Signature to string
+    'timestamp': datetime.now().isoformat(),
+    'status': 'completed'
+}
+
                         
                         users_collection.update_one(
-                            {'user_id': user_id},
-                            {'$push': {'trade_history': trade_record}}
-                        )
+    {'user_id': user_id},
+    {'$push': {'trade_history': trade_record}}
+)
                         
                         return True, f"Trade successful! TX: {tx_hash.value}"
                     else:
