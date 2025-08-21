@@ -1207,33 +1207,39 @@ def calculate_volatility(token, current_data):
 
 
 async def calculate_sentiment(token, client):
-    """Calculate market sentiment score (0-100)"""
     try:
-        # Fetch social mentions
         symbol = token['symbol']
+        # Twitter API v2 endpoint for recent tweets
         response = await client.get(
-            f"https://api.socialinsider.io/v1/sentiment?token={symbol}&source=twitter,telegram",
-            headers={"Authorization": f"Bearer {os.getenv('SOCIAL_INSIDER_API')}"},
+            f"https://api.twitter.com/2/tweets/search/recent?query={symbol}&max_results=50",
+            headers={"Authorization": f"Bearer {os.getenv('TWITTER_BEARER_TOKEN')}"},
             timeout=15
         )
         data = response.json()
         
-        if not data.get('success'):
-            return 50  # Neutral if no data
-            
-        # Calculate sentiment score
-        positive = data.get('positive', 0)
-        negative = data.get('negative', 0)
-        total = positive + negative
+        # Simple sentiment analysis (you'd need to implement proper NLP)
+        positive_words = ['bullish', 'moon', 'buy', 'good', 'great']
+        negative_words = ['bearish', 'dump', 'sell', 'bad', 'scam']
         
+        positive_count = 0
+        negative_count = 0
+        
+        for tweet in data.get('data', []):
+            text = tweet['text'].lower()
+            if any(word in text for word in positive_words):
+                positive_count += 1
+            if any(word in text for word in negative_words):
+                negative_count += 1
+        
+        total = positive_count + negative_count
         if total == 0:
             return 50
             
-        score = (positive / total) * 100
+        score = (positive_count / total) * 100
         return round(score, 1)
         
     except Exception:
-        return 50  # Neutral on error
+        return 50
     
 def generate_prediction(token, current_data):
     """Generate short-term prediction using technical indicators"""
@@ -3868,7 +3874,7 @@ def format_token_message(token: Dict[str, Any]) -> str:
     )
 
 # Modified update_token_info function
-async def update_token_info(context):
+async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.user_id
     logger.info(f"⏰ Token update job started for user {user_id} at {datetime.now()}")
     
@@ -3949,9 +3955,8 @@ async def update_token_info(context):
             )
             logger.info(f"Added token {token['contract_address']} to user {user_id}'s posted tokens")
             
-            
-            
             if user.get('trading_mode') == 'automatic':
+                # Call auto_trade with the specific token
                 await auto_trade(context, user_id, token)
         
     except Exception as e:
@@ -4321,10 +4326,14 @@ async def notify_trial_ending(context: ContextTypes.DEFAULT_TYPE):
             )
             log_user_action(user_id, "TRIAL_ENDING_NOTIFICATION")
 
-async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
+async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, token: Dict[str, Any] = None):
     """Handle automatic trading with enhanced safety parameters and position limits"""
-    job = context.job
-    user_id = job.user_id
+    # If user_id and token are provided, this is an immediate trade from update_token_info
+    # Otherwise, this is a scheduled job run
+    if user_id is None:
+        job = context.job
+        user_id = job.user_id
+    
     logger.info(f"🤖 Auto-trading for user {user_id}")
     
     try:
@@ -4355,71 +4364,74 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
         
         # 1. First handle sell conditions for existing tokens
         for contract, token_data in list(portfolio.items()):
-            token = await fetch_token_by_contract(contract)
-            if not token:
+            current_token = await fetch_token_by_contract(contract)
+            if not current_token:
                 continue
                 
-            await execute_auto_sell(context, user_id, token, token_data, "Auto-sell check")
+            await execute_auto_sell(context, user_id, current_token, token_data, "Auto-sell check")
         
-        # 2. Handle buy conditions for new tokens (only if we have available SOL and position slots)
-        sol_balance = await check_balance(user_id, 'solana')
-        if sol_balance < buy_amount or len(portfolio) >= MAX_POSITIONS:
-            logger.debug(f"Insufficient SOL or max positions for auto-buy: {sol_balance} < {buy_amount} or {len(portfolio)} >= {MAX_POSITIONS}")
-            return
-            
-        tokens = await fetch_latest_token()
-        if not tokens:
-            return
-            
-        # Filter tokens using enhanced safety parameters
-        valid_tokens = []
-        for token in tokens:
-            # Skip tokens already in portfolio or blacklist
-            if token['contract_address'] in portfolio or token['contract_address'] in user.get('auto_trade_blacklist', []):
-                continue
+        # 2. Handle buy conditions
+        # If a specific token was provided, use it
+        if token is not None:
+            # Skip if already in portfolio or blacklist
+            if (token['contract_address'] in portfolio or 
+                token['contract_address'] in user.get('auto_trade_blacklist', [])):
+                return
                 
             # Apply safety checks
             is_safe, reason = await check_token_safety(token, user)
             if not is_safe:
                 logger.info(f"Skipping token {token['name']}: {reason}")
-                continue
+                return
                 
-            valid_tokens.append(token)
-        
-        if not valid_tokens:
-            return
-            
-        # Select the token with best risk/reward ratio
-        best_token = None
-        best_score = -99999
-        
-        for token in valid_tokens:
-            # Simple scoring based on liquidity, volume, and recent performance
-            score = (token['liquidity'] / 10000) + (token['volume'] / 5000)
-            
-            if 'price_change_5m' in token:
-                score += token['price_change_5m'] * 100  # Add momentum factor
-                
-            if score > best_score:
-                best_score = score
-                best_token = token
-        
-        if best_token:
-            await execute_auto_buy(context, user_id, best_token, buy_amount)
-        
-    except KeyError as e:
-        if 'sell_price' in str(e):
-            logger.error(f"KeyError in auto_trade for user {user_id}: {e}. Fixing trade records.")
-            # Try to fix incomplete trade records
-            await fix_incomplete_trade_records(user_id)
+            await execute_auto_buy(context, user_id, token, buy_amount)
         else:
-            logger.error(f"KeyError in auto_trade for user {user_id}: {e}")
+            # Original logic for scheduled trading
+            sol_balance = await check_balance(user_id, 'solana')
+            if sol_balance < buy_amount or len(portfolio) >= MAX_POSITIONS:
+                logger.debug(f"Insufficient SOL or max positions for auto-buy: {sol_balance} < {buy_amount} or {len(portfolio)} >= {MAX_POSITIONS}")
+                return
+                
+            tokens = await fetch_latest_token()
+            if not tokens:
+                return
+                
+            # Filter tokens using enhanced safety parameters
+            valid_tokens = []
+            for t in tokens:
+                # Skip tokens already in portfolio or blacklist
+                if t['contract_address'] in portfolio or t['contract_address'] in user.get('auto_trade_blacklist', []):
+                    continue
+                    
+                # Apply safety checks
+                is_safe, reason = await check_token_safety(t, user)
+                if not is_safe:
+                    logger.info(f"Skipping token {t['name']}: {reason}")
+                    continue
+                    
+                valid_tokens.append(t)
+            
+            if not valid_tokens:
+                return
+                
+            # Select the token with best risk/reward ratio
+            best_token = None
+            best_score = -99999
+            
+            for t in valid_tokens:
+                # Simple scoring based on liquidity, volume, and recent performance
+                score = (t['liquidity'] / 10000) + (t['volume'] / 5000)
+                
+                if 'price_change_5m' in t:
+                    score += t['price_change_5m'] * 100  # Add momentum factor
+                    
+                if score > best_score:
+                    best_score = score
+                    best_token = t
+            
+            if best_token:
+                await execute_auto_buy(context, user_id, best_token, buy_amount)
         
-        await notify_user(
-            context, user_id,
-            f"❌ AUTOTRADE ERROR: Data inconsistency detected. Please check your trade history.",
-            "Auto-Trade System Error"
-        )
     except Exception as e:
         logger.error(f"Auto-trade error for user {user_id}: {str(e)}")
         await notify_user(
@@ -5445,20 +5457,14 @@ async def on_startup():
 
             if user.get('trading_mode') == 'automatic':
                 logger.info(f"  - Scheduling auto-trade for user {user_id}")
+                # Schedule with a partial function that only passes context
                 app.job_queue.run_repeating(
-                    auto_trade,
+                    lambda ctx: auto_trade(ctx),
                     interval=30,
                     first=10,
                     user_id=user_id,
                     name=f"auto_trade_{user_id}"
                 )
-
-            app.job_queue.run_repeating(
-        monitor_portfolio_liquidity,
-        interval=3600,  # Check every hour
-        first=30,
-        name="portfolio_liquidity_monitoring"
-    )
 
         # Schedule background jobs
         app.job_queue.run_repeating(
@@ -5477,7 +5483,14 @@ async def on_startup():
             send_daily_report,
             time=datetime.time(hour=20, minute=0),
             name="daily_report"
-        ) 
+        )
+        # Add portfolio liquidity monitoring job
+        app.job_queue.run_repeating(
+            monitor_portfolio_liquidity,
+            interval=3600,  # Check every hour
+            first=30,
+            name="portfolio_liquidity_monitoring"
+        )
         logger.info("✅ Bot startup complete")
     except Exception as e:
         logger.critical(f"🔥 Failed to start bot: {str(e)}", exc_info=True)
