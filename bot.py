@@ -5500,14 +5500,15 @@ async def setup_bot():
         await application.start()
         logger.info("🤖 Bot started successfully")
     
-    return application
+    return application  # Make sure to return the application instance
 
 @app.on_event("startup")
 async def on_startup():
     """FastAPI startup event handler"""
     logger.info("🚀 Starting bot...")
     try:
-        app = await setup_bot()
+        # Get the Telegram application instance
+        telegram_app = await setup_bot()
         logger.info("✅ Bot setup complete")
         
         logger.info("⏳ Scheduling jobs for active subscribers...")
@@ -5522,7 +5523,7 @@ async def on_startup():
             user_id = user['user_id']
             if user.get('solana') and user['solana'].get('public_key'):
                 logger.info(f"  - Scheduling token updates for user {user_id}")
-                app.job_queue.run_repeating(
+                telegram_app.job_queue.run_repeating(  # Use telegram_app instead of app
                     update_token_info,
                     interval=30,
                     first=5,
@@ -5533,7 +5534,7 @@ async def on_startup():
             if user.get('trading_mode') == 'automatic':
                 logger.info(f"  - Scheduling auto-trade for user {user_id}")
                 # Schedule with a partial function that only passes context
-                app.job_queue.run_repeating(
+                telegram_app.job_queue.run_repeating(  # Use telegram_app instead of app
                     lambda ctx: auto_trade(ctx),
                     interval=30,
                     first=10,
@@ -5541,26 +5542,26 @@ async def on_startup():
                     name=f"auto_trade_{user_id}"
                 )
 
-        # Schedule background jobs
-        app.job_queue.run_repeating(
+        # Schedule background jobs using the Telegram application
+        telegram_app.job_queue.run_repeating(
             verify_sol_payments,
             interval=300,
             first=10,
             name="sol_payment_verification"
         )
-        app.job_queue.run_repeating(
+        telegram_app.job_queue.run_repeating(
             update_token_performance,
             interval=3600,
             first=15,
             name="token_performance_updates"
         )
-        app.job_queue.run_daily(
+        telegram_app.job_queue.run_daily(
             send_daily_report,
             time=datetime.time(hour=20, minute=0),
             name="daily_report"
         )
         # Add portfolio liquidity monitoring job
-        app.job_queue.run_repeating(
+        telegram_app.job_queue.run_repeating(
             monitor_portfolio_liquidity,
             interval=3600,  # Check every hour
             first=30,
