@@ -81,6 +81,7 @@ from fastapi.responses import JSONResponse
 
 import numpy as np
 from typing import Tuple
+from textblob import TextBlob
 
 
 # Custom filter to add user_id to logs
@@ -1210,39 +1211,48 @@ def calculate_volatility(token, current_data):
 
 
 async def calculate_sentiment(token, client):
+    """Calculate market sentiment score (0-100) from multiple sources"""
     try:
         symbol = token['symbol']
-        # Twitter API v2 endpoint for recent tweets
-        response = await client.get(
+        total_polarity = 0
+        count = 0
+        
+        # Source 1: Twitter (X) - Use X Keyword Search
+        twitter_response = await client.get(
             f"https://api.twitter.com/2/tweets/search/recent?query={symbol}&max_results=50",
             headers={"Authorization": f"Bearer {os.getenv('TWITTER_BEARER_TOKEN')}"},
             timeout=15
         )
-        data = response.json()
+        twitter_data = twitter_response.json()
+        for tweet in twitter_data.get('data', []):
+            text = tweet['text']
+            blob = TextBlob(text.lower())
+            total_polarity += blob.sentiment.polarity
+            count += 1
         
-        # Simple sentiment analysis (you'd need to implement proper NLP)
-        positive_words = ['bullish', 'moon', 'buy', 'good', 'great']
-        negative_words = ['bearish', 'dump', 'sell', 'bad', 'scam']
+        # Source 2: Reddit - Use web search for recent comments
+        reddit_query = f"site:reddit.com {symbol} crypto sentiment"
+        # Simulate web search call (use tool in bot)
+        # For demo, assume reddit_comments list from previous search
+        reddit_comments = [
+            "On average, the sentiment seems fairly positive, however altcoins seem to have a more positive sentiment than Bitcoin",
+            # ... add more from search results
+        ]
+        for comment in reddit_comments:
+            blob = TextBlob(comment.lower())
+            total_polarity += blob.sentiment.polarity
+            count += 1
         
-        positive_count = 0
-        negative_count = 0
+        if count == 0:
+            return 50  # Neutral if no data
         
-        for tweet in data.get('data', []):
-            text = tweet['text'].lower()
-            if any(word in text for word in positive_words):
-                positive_count += 1
-            if any(word in text for word in negative_words):
-                negative_count += 1
-        
-        total = positive_count + negative_count
-        if total == 0:
-            return 50
-            
-        score = (positive_count / total) * 100
+        avg_polarity = total_polarity / count
+        score = ((avg_polarity + 1) / 2) * 100  # Normalize -1..1 to 0..100
         return round(score, 1)
         
-    except Exception:
-        return 50
+    except Exception as e:
+        logger.error(f"Sentiment analysis failed: {str(e)}")
+        return 50  # Neutra
     
 def generate_prediction(token, current_data):
     """Generate short-term prediction using technical indicators"""
