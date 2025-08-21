@@ -4104,15 +4104,15 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 
                 # Prepare swap transaction with aggressive settings
                 swap_payload = {
-                    "quoteResponse": quote_data,
-                    "userPublicKey": from_address,
-                    "wrapAndUnwrapSol": True,
-                    "dynamicComputeUnitLimit": True,
-                    "prioritizationFeeLamports": 200000 + (attempt * 100000),  # High priority fee
-                    "useSharedAccounts": True,
-                    "asLegacyTransaction": False,
-                    "useTokenLedger": False
-                }
+    "quoteResponse": quote_data,
+    "userPublicKey": from_address,
+    "wrapAndUnwrapSol": True,
+    "dynamicComputeUnitLimit": True,
+    "prioritizationFeeLamports": 200000 + (attempt * 100000),
+    "useSharedAccounts": False,  # Change to False
+    "asLegacyTransaction": False,
+    "useTokenLedger": False
+}
                 
                 # Get swap transaction
                 swap_response = await client.post(swap_url, json=swap_payload)
