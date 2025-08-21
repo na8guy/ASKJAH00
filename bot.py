@@ -4529,9 +4529,10 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
                 }}
             )
             
+            token_info = f"{token['name']} ({token['symbol']})\nContract: {token['contract_address']}"
             await notify_user(
                 context, user_id,
-                f"🤖 AUTOBUY: {message}\nEntry: {entry_reason}\nSize: {actual_buy_amount:.4f} SOL ({POSITION_SIZE_PERCENT*100}% of portfolio)",
+                f"🤖 AUTOBUY: {message}\nToken: {token_info}\nEntry: {entry_reason}\nSize: {actual_buy_amount:.4f} SOL ({POSITION_SIZE_PERCENT*100}% of portfolio)",
                 "Auto-Buy Executed"
             )
             return True
@@ -4541,18 +4542,21 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
                 {'user_id': user_id},
                 {'$addToSet': {'auto_trade_blacklist': token['contract_address']}}
             )
+            token_info = f"{token['name']} ({token['contract_address']})"
             await notify_user(
                 context, user_id,
-                f"❌ AUTOBUY FAILED: {message}",
+                f"❌ AUTOBUY FAILED: {message}\nToken: {token_info}",
                 "Auto-Buy Failed"
             )
             return False
             
     except Exception as e:
         logger.error(f"Auto-buy execution error: {str(e)}")
+        # Include token info in error notification
+        token_info = f"{token['name']} ({token['contract_address']})" if token else "Unknown token"
         await notify_user(
             context, user_id,
-            f"❌ AUTOBUY ERROR: {str(e)}",
+            f"❌ AUTOBUY ERROR: {str(e)}\nToken: {token_info}",
             "Auto-Buy Error"
         )
         return False
@@ -4561,9 +4565,20 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
 async def execute_auto_sell(context, user_id, token, token_data, reason):
     """Execute automatic sell with profit-taking and stop-loss strategies"""
     try:
+        # Add defensive checks for required keys
+        if 'buy_price' not in token_data:
+            logger.error(f"Missing 'buy_price' in token_data for user {user_id}")
+            return False
+            
         current_price = token['price_usd']
         buy_price = token_data['buy_price']
-        price_change_pct = (current_price - buy_price) / buy_price
+        
+        # Calculate price change safely
+        if buy_price > 0:
+            price_change_pct = (current_price - buy_price) / buy_price
+        else:
+            price_change_pct = 0
+            
         
         # Check if we should take partial profits
         take_profit = False
@@ -4669,25 +4684,30 @@ async def execute_auto_sell(context, user_id, token, token_data, reason):
                 {'$set': {'last_trade_time': time.time()}}
             )
             
+            token_info = f"{token['name']} ({token['symbol']})\nContract: {token['contract_address']}"
             await notify_user(
                 context, user_id,
-                f"🤖 AUTOSELL: {message}\nReason: {sell_reason}\nProfit: {price_change_pct*100:.2f}%",
+                f"🤖 AUTOSELL: {message}\nToken: {token_info}\nReason: {sell_reason}\nProfit: {price_change_pct*100:.2f}%",
                 "Auto-Sell Executed"
             )
             return True
         else:
+            # Handle failed trades with token info
+            token_info = f"{token['name']} ({token['contract_address']})"
             await notify_user(
                 context, user_id,
-                f"❌ AUTOSELL FAILED: {message}",
+                f"❌ AUTOSELL FAILED: {message}\nToken: {token_info}",
                 "Auto-Sell Failed"
             )
             return False
             
     except Exception as e:
         logger.error(f"Auto-sell execution error: {str(e)}")
+        # Include token info in error notification
+        token_info = f"{token['name']} ({token['contract_address']})" if token else "Unknown token"
         await notify_user(
             context, user_id,
-            f"❌ AUTOSELL ERROR: {str(e)}",
+            f"❌ AUTOSELL ERROR: {str(e)}\nToken: {token_info}",
             "Auto-Sell Error"
         )
         return False
