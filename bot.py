@@ -628,7 +628,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {'$set': {
                 'subscription_status': 'trial',
                 'subscription_expiry': expiry.isoformat(),
-                'created_at': datetime.now().isoformat()
+                'created_at': datetime.now().isoformat(),
+                'trade_history': [],
+                'portfolio': {},
+                'auto_trade_blacklist': []
             }},
             upsert=True
         )
@@ -643,6 +646,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = users_collection.find_one({'user_id': user_id})
     
     if not user or not user.get('solana') or not user['solana'].get('public_key'):
+
+         # Initialize with empty trade_history array
+        users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {
+            'trade_history': [],
+            'portfolio': {},
+            'auto_trade_blacklist': []
+        }},
+        upsert=True
+    )
         keyboard = [
             [InlineKeyboardButton("✨ Generate New Wallet", callback_data='generate_wallet')],
             [InlineKeyboardButton("🔑 Import Existing Wallet", callback_data='import_wallet')]
@@ -4365,6 +4379,19 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
         if best_token:
             await execute_auto_buy(context, user_id, best_token, buy_amount)
         
+    except KeyError as e:
+        if 'sell_price' in str(e):
+            logger.error(f"KeyError in auto_trade for user {user_id}: {e}. Fixing trade records.")
+            # Try to fix incomplete trade records
+            await fix_incomplete_trade_records(user_id)
+        else:
+            logger.error(f"KeyError in auto_trade for user {user_id}: {e}")
+        
+        await notify_user(
+            context, user_id,
+            f"❌ AUTOTRADE ERROR: Data inconsistency detected. Please check your trade history.",
+            "Auto-Trade System Error"
+        )
     except Exception as e:
         logger.error(f"Auto-trade error for user {user_id}: {str(e)}")
         await notify_user(
@@ -4373,9 +4400,40 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
             "Auto-Trade System Failure"
         )
 
+async def fix_incomplete_trade_records(user_id: int):
+    """Fix trade records that might be missing required fields"""
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        return
+    
+    updated = False
+    trade_history = user.get('trade_history', [])
+    
+    for i, trade in enumerate(trade_history):
+        # Ensure all trade records have both sell_price and profit_pct
+        if 'sell_price' not in trade and 'buy_price' in trade and 'amount' in trade:
+            # Try to get current price for the token
+            try:
+                token = await fetch_token_by_contract(trade.get('contract', ''))
+                if token:
+                    trade_history[i]['sell_price'] = token['price_usd']
+                    # Calculate profit percentage
+                    buy_price = trade['buy_price']
+                    profit_pct = ((token['price_usd'] - buy_price) / buy_price) * 100
+                    trade_history[i]['profit_pct'] = profit_pct
+                    updated = True
+            except Exception as e:
+                logger.error(f"Could not fix trade record for user {user_id}: {e}")
+    
+    if updated:
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'trade_history': trade_history}}
+        )
+        logger.info(f"Fixed incomplete trade records for user {user_id}")
 
 async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
-    """Check if daily loss limit has been exceeded"""
+    """Check if daily loss limit has been exceeded with proper error handling"""
     daily_loss_limit = user.get('daily_loss_limit', 0.05)  # Default 5%
     
     # Get today's trades
@@ -4385,17 +4443,24 @@ async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
         if datetime.fromisoformat(t['timestamp']).date() == today
     ]
     
-    # Calculate today's P&L
+    # Calculate today's P&L with proper error handling
     daily_pnl = 0
     for trade in today_trades:
-        if 'profit_pct' in trade:
-            # Convert percentage to SOL amount
-            trade_value = trade['amount'] * trade['buy_price']
-            daily_pnl += trade_value * (trade['profit_pct'] / 100)
-        else:
-            # Fallback calculation
-            trade_profit = (trade['sell_price'] - trade['buy_price']) * trade['amount']
-            daily_pnl += trade_profit
+        try:
+            if 'profit_pct' in trade:
+                # Convert percentage to SOL amount
+                trade_value = trade['amount'] * trade['buy_price']
+                daily_pnl += trade_value * (trade['profit_pct'] / 100)
+            elif 'sell_price' in trade and 'buy_price' in trade:
+                # Fallback calculation
+                trade_profit = (trade['sell_price'] - trade['buy_price']) * trade['amount']
+                daily_pnl += trade_profit
+            else:
+                logger.warning(f"Incomplete trade record for P&L calculation: {trade}")
+                continue
+        except KeyError as e:
+            logger.error(f"Missing field in trade record: {e}. Trade: {trade}")
+            continue
     
     # Calculate percentage of portfolio
     sol_balance = await check_balance(user_id, 'solana')
@@ -4406,11 +4471,13 @@ async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
     if portfolio_value > 0:
         loss_pct = abs(min(daily_pnl, 0)) / portfolio_value
         if loss_pct >= daily_loss_limit:
-            await notify_user(
-                None, user_id,  # We don't have context here, so send directly
-                f"🚫 Daily loss limit reached ({loss_pct*100:.1f}% >= {daily_loss_limit*100}%). Trading paused for today.",
-                "Circuit Breaker Activated"
-            )
+            # Try to notify the user (we don't have context here)
+            try:
+                # You might need to store the bot instance globally or find another way to send messages
+                # For now, just log it
+                logger.warning(f"User {user_id} reached daily loss limit ({loss_pct*100:.1f}%)")
+            except:
+                pass
             return True
     
     return False
@@ -4662,16 +4729,16 @@ async def execute_auto_sell(context, user_id, token, token_data, reason):
             
             # Record trade history
             trade_data = {
-                'token': token['name'],
-                'symbol': token['symbol'],
-                'contract': token['contract_address'],
-                'amount': token_data['amount'] * sell_percentage,
-                'buy_price': token_data['buy_price'],
-                'sell_price': current_price,
-                'reason': sell_reason,
-                'timestamp': datetime.now().isoformat(),
-                'profit_pct': price_change_pct * 100
-            }
+    'token': token['name'],
+    'symbol': token['symbol'],
+    'contract': token['contract_address'],
+    'amount': token_data['amount'] * sell_percentage,
+    'buy_price': token_data['buy_price'],
+    'sell_price': current_price,  # Make sure this is always included
+    'reason': sell_reason,
+    'timestamp': datetime.now().isoformat(),
+    'profit_pct': price_change_pct * 100  # Make sure this is always included
+}
             
             users_collection.update_one(
                 {'user_id': user_id},
