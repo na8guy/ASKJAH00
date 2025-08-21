@@ -78,7 +78,7 @@ import math
 # FastAPI setup
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-import talib
+
 import numpy as np
 from typing import Tuple
 
@@ -4455,27 +4455,29 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
         if token_performance and 'performance_history' in token_performance:
             price_history = [entry['price'] for entry in token_performance['performance_history'][-20:]]  # Last 20 prices
         
-        indicators = await calculate_technical_indicators(token, price_history)
+        indicators = calculate_technical_indicators(price_history)
         
         # Enhanced entry criteria
+        # Enhanced entry criteria
         good_entry = False
+        entry_reason = ""
+
         if indicators:
             # Strategy 1: Oversold bounce
             if indicators['oversold'] and indicators['rsi'] > RSI_OVERSOLD + 5:  # RSI moving up from oversold
                 good_entry = True
                 entry_reason = "Oversold bounce"
             
-            # Strategy 2: Breakout with volume
-            elif (indicators['ma_crossover'] and indicators['strong_trend'] and 
-                  token['volume'] > user.get('min_volume', 1000) * 2):  # Double minimum volume
+            # Strategy 2: Breakout with volume and momentum
+            elif (indicators['ma_crossover'] and indicators['positive_momentum'] and 
+                token['volume'] > user.get('min_volume', 1000) * 2):  # Double minimum volume
                 good_entry = True
-                entry_reason = "Breakout with volume"
+                entry_reason = "Breakout with volume and momentum"
             
-            # Strategy 3: Momentum continuation
-            elif (indicators['adx'] > ADX_THRESHOLD and indicators['sma_5'] > indicators['sma_15'] and
-                  token.get('price_change_5m', 0) > 0.05):  # 5% price increase recently
+            # Strategy 3: Strong momentum continuation
+            elif (indicators['roc_5'] > 10 and indicators['sma_5'] > indicators['sma_15']):
                 good_entry = True
-                entry_reason = "Momentum continuation"
+                entry_reason = "Strong momentum continuation"
         else:
             # Fallback to basic criteria if no indicator data
             if token['liquidity'] > user.get('min_liquidity', 5000) and token['volume'] > user.get('min_volume', 1000):
@@ -4709,45 +4711,64 @@ async def is_legitimate_token(token: Dict[str, Any]) -> bool:
         return False
 
 
-async def calculate_technical_indicators(token_data: Dict[str, Any], price_history: List[float]) -> Dict[str, Any]:
-    """Calculate technical indicators for trading decisions"""
-    if len(price_history) < 14:  # Minimum for most indicators
+def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]:
+    """
+    Calculate technical indicators using pure Python.
+    Returns an empty dict if not enough data is available.
+    """
+    if len(price_history) < 15:  # Need at least 15 periods for meaningful indicators
         return {}
     
-    prices = np.array(price_history)
-    
     try:
-        # RSI
-        rsi = talib.RSI(prices, timeperiod=14)[-1] if len(prices) >= 14 else 50
+        # Simple Moving Averages
+        sma_5 = sum(price_history[-5:]) / 5
+        sma_15 = sum(price_history[-15:]) / 15
         
-        # Moving Averages
-        sma_5 = talib.SMA(prices, timeperiod=5)[-1] if len(prices) >= 5 else prices[-1]
-        sma_15 = talib.SMA(prices, timeperiod=15)[-1] if len(prices) >= 15 else prices[-1]
+        # Calculate RSI
+        gains = []
+        losses = []
         
-        # ADX (requires high, low, close data - we'll use price for all)
-        high = np.array(price_history)
-        low = np.array(price_history)
-        close = np.array(price_history)
-        adx = talib.ADX(high, low, close, timeperiod=14)[-1] if len(prices) >= 14 else 0
+        for i in range(1, len(price_history)):
+            change = price_history[i] - price_history[i-1]
+            if change > 0:
+                gains.append(change)
+                losses.append(0)
+            else:
+                gains.append(0)
+                losses.append(abs(change))
         
-        # ATR for volatility-based stop loss
-        atr = talib.ATR(high, low, close, timeperiod=14)[-1] if len(prices) >= 14 else 0
+        # Average gains and losses for RSI
+        if len(gains) >= 14:
+            avg_gain = sum(gains[-14:]) / 14
+            avg_loss = sum(losses[-14:]) / 14
+        else:
+            avg_gain = sum(gains) / len(gains) if gains else 0
+            avg_loss = sum(losses) / len(losses) if losses else 0
+        
+        # Calculate RSI
+        if avg_loss == 0:
+            rsi = 100  # Avoid division by zero
+        else:
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+        
+        # Calculate Rate of Change (ROC) as a momentum indicator
+        roc = ((price_history[-1] - price_history[-5]) / price_history[-5]) * 100 if len(price_history) >= 5 else 0
         
         return {
             'rsi': rsi,
             'sma_5': sma_5,
             'sma_15': sma_15,
-            'adx': adx,
-            'atr': atr,
+            'roc_5': roc,
             'ma_crossover': sma_5 > sma_15,
             'oversold': rsi < RSI_OVERSOLD,
             'overbought': rsi > RSI_OVERBOUGHT,
-            'strong_trend': adx > ADX_THRESHOLD
+            'positive_momentum': roc > 5,  # 5% price increase in 5 periods
         }
     except Exception as e:
         logger.error(f"Error calculating indicators: {str(e)}")
         return {}
-
+    
 async def check_token_safety(token: Dict[str, Any], user_settings: Dict[str, Any]) -> Tuple[bool, str]:
     """Comprehensive token safety check with virtual liquidity detection."""
     reasons = []

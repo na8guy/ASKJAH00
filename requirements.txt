@@ -17,3 +17,4 @@ bip44
 bip-utils==2.9.3
 bip32utils
 pandas
+numpy
