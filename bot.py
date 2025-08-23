@@ -2900,9 +2900,40 @@ async def set_liquidity_threshold(update: Update, context: ContextTypes.DEFAULT_
     """Set minimum liquidity threshold"""
     user_id = update.effective_user.id
     try:
+        # Check if this is a confirmation response
+        if 'pending_liquidity_threshold' in context.user_data:
+            response = update.message.text.strip().lower()
+            if response not in ['yes', 'no', 'y', 'n']:
+                await update.message.reply_text("❌ Please answer with 'yes' or 'no'.")
+                return SET_LIQUIDITY_THRESHOLD
+                
+            if response in ['yes', 'y']:
+                threshold = context.user_data['pending_liquidity_threshold']
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {'min_liquidity': threshold}}
+                )
+                log_user_action(user_id, "LOW_LIQUIDITY_THRESHOLD_SET", f"${threshold}")
+                
+                await update.message.reply_text(
+                    "📊 Set minimum 24h volume threshold in USD (e.g., 10000 for $10,000):\n\n"
+                    "Tokens with volume below this amount will be ignored.",
+                    parse_mode='Markdown'
+                )
+                return SET_VOLUME_THRESHOLD
+            else:
+                await update.message.reply_text(
+                    "💧 Set minimum liquidity threshold in USD (e.g., 5000 for $5,000):\n\n"
+                    "Tokens with liquidity below this amount will be ignored."
+                )
+                return SET_LIQUIDITY_THRESHOLD
+
+        # This is the initial threshold input
         threshold = float(update.message.text)
+        
         # RECOMMEND much higher minimum to avoid virtual liquidity traps
         if threshold < MIN_SAFE_LIQUIDITY:
+            context.user_data['pending_liquidity_threshold'] = threshold
             await update.message.reply_text(
                 f"⚠️ *Warning*: Values below ${MIN_SAFE_LIQUIDITY:,.0f} are highly likely to be "
                 f"virtual liquidity tokens and are extremely risky.\n\n"
@@ -2910,8 +2941,7 @@ async def set_liquidity_threshold(update: Update, context: ContextTypes.DEFAULT_
                 f"Do you still want to proceed? (yes/no)",
                 parse_mode='Markdown'
             )
-            context.user_data['pending_liquidity_threshold'] = threshold
-            return SET_LIQUIDITY_THRESHOLD  # You'd need a new state to handle the confirmation
+            return SET_LIQUIDITY_THRESHOLD
 
         users_collection.update_one(
             {'user_id': user_id},
@@ -2928,6 +2958,52 @@ async def set_liquidity_threshold(update: Update, context: ContextTypes.DEFAULT_
     except ValueError:
         await update.message.reply_text("❌ Invalid amount. Please enter a number.")
         return SET_LIQUIDITY_THRESHOLD
+
+
+async def review_config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle configuration review buttons"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    if query.data == 'activate_auto_trading':
+        # Activate auto trading
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'auto_trading_active': True}}
+        )
+        log_user_action(user_id, "AUTO_TRADING_ACTIVATED")
+        
+        # Remove any existing auto-trade job for this user
+        for job in context.job_queue.jobs():
+            if job.name == f"auto_trade_{user_id}":
+                job.schedule_removal()
+        
+        # Schedule auto-trade job
+        context.job_queue.run_repeating(
+            auto_trade,
+            interval=30,
+            first=10,
+            user_id=user_id,
+            name=f"auto_trade_{user_id}"
+        )
+        
+        await query.edit_message_text(
+            "✅ Auto-trading activated! The bot will now automatically trade tokens based on your settings."
+        )
+        return ConversationHandler.END
+        
+    else:  # modify_settings
+        # Go back to the beginning of configuration
+        await query.edit_message_text(
+            "⚙️ Let's configure your auto-trading settings again.\n\n"
+            "Choose trading mode (Solana only):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Manual", callback_data='manual')],
+                [InlineKeyboardButton("Automatic", callback_data='automatic')]
+            ])
+        )
+        return SET_TRADING_MODE
 
 async def set_volume_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Set minimum volume threshold"""
@@ -6210,7 +6286,9 @@ def setup_handlers(application: Application):
         SET_MAX_GAS_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
                                          wrap_conversation_state(set_max_gas_price))],
         SET_TOKEN_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                     wrap_conversation_state(set_token_age))]
+                                     wrap_conversation_state(set_token_age))],
+        REVIEW_CONFIG: [CallbackQueryHandler(wrap_conversation_state(review_config_callback), 
+                        pattern='^(activate_auto_trading|modify_settings)$')]
     },
     fallbacks=[CommandHandler("cancel", cancel)],
     per_message=False
