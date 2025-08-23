@@ -159,7 +159,7 @@ TWITTER_ENABLED = False  # disable Twitter until properly configured
  SELECT_TOKEN_ACTION, SELL_AMOUNT, INPUT_CONTRACT,
  # New states for start flow
  START_IMPORT_METHOD, START_INPUT_MNEMONIC, START_INPUT_PRIVATE_KEY,SUBSCRIPTION_CONFIRMATION,INPUT_ANALYSIS_CONTRACT,SET_ANTI_MEV, SET_LIQUIDITY_THRESHOLD, SET_VOLUME_THRESHOLD, SET_RUG_CHECK, 
- SET_MAX_SLIPPAGE, SET_MAX_GAS_PRICE, SET_TOKEN_AGE) = range(31)
+ SET_MAX_SLIPPAGE, SET_MAX_GAS_PRICE, SET_TOKEN_AGE,SET_PROFIT_STRATEGY, SET_CUSTOM_PROFIT_TARGETS, CONFIRM_HIGH_RISK_LOSS,REVIEW_CONFIG) = range(35)
 
 # Create FastAPI app
 app = FastAPI()
@@ -2644,36 +2644,137 @@ async def set_auto_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE
         return SET_AUTO_BUY_AMOUNT
 
 async def set_sell_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """OLD: Set sell percentage for automatic trading"""
-    """NEW: Configure multi-tier profit strategy."""
+    """Set profit-taking strategy with user customization options"""
     user_id = update.effective_user.id
-    try:
-        # This is now a placeholder. We could repurpose this step to set the first profit target.
-        # For now, we'll just explain the new system and move on.
-        await update.message.reply_text(
-            "🔄 *Profit Strategy Updated*\n\n"
-            "The old single take-profit has been replaced with a multi-tier strategy for maximum gains:\n"
-            "• ✅ 40% at +20% profit\n"
-            "• ✅ 30% at +50% profit\n"
-            "• ✅ 30% at +100% profit\n"
-            "• 🛡️ 15% Trailing Stop Loss\n"
-            "• 🔐 10% Hard Stop Loss\n\n"
-            "This is now the default and recommended strategy.",
-            parse_mode='Markdown'
-        )
-        log_user_action(user_id, "PROFIT_STRATEGY_SET", "Multi-tier strategy enabled")
+    
+    # Present profit strategy options
+    keyboard = [
+        [InlineKeyboardButton("✅ Use Recommended Multi-Tier", callback_data='default_strategy')],
+        [InlineKeyboardButton("⚙️ Customize Strategy", callback_data='custom_strategy')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "📊 *Profit-Taking Strategy*\n\n"
+        "We recommend our multi-tier strategy for optimal results:\n"
+        "• ✅ 40% at +20% profit\n"
+        "• ✅ 30% at +50% profit\n"
+        "• ✅ 30% at +100% profit\n"
+        "• 🛡️ 15% Trailing Stop Loss\n"
+        "• 🔐 10% Hard Stop Loss\n\n"
+        "Would you like to use our recommended strategy or customize it?",
+        parse_mode='Markdown',
+        reply_markup=reply_markup
+    )
+    return SET_PROFIT_STRATEGY
 
-        await update.message.reply_text(
+    
+async def set_profit_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle profit strategy selection"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    if query.data == 'default_strategy':
+        # Set default multi-tier strategy
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {
+                'profit_strategy': 'multi_tier',
+                'profit_targets': [
+                    {'percentage': 0.20, 'allocation': 0.4},
+                    {'percentage': 0.50, 'allocation': 0.3},
+                    {'percentage': 1.00, 'allocation': 0.3}
+                ],
+                'trailing_stop': 0.15,
+                'hard_stop': 0.10
+            }}
+        )
+        log_user_action(user_id, "PROFIT_STRATEGY_SET", "Multi-tier default")
+        
+        await query.edit_message_text(
+            "✅ Using recommended multi-tier profit strategy.\n\n"
             "📉 Enter the stop-loss percentage (e.g., 10 for 10% loss):",
             parse_mode='Markdown'
         )
         return SET_LOSS_PERCENTAGE
-
-    except ValueError:
-        await update.message.reply_text("❌ Invalid percentage. Please enter a number.")
-        return SET_SELL_PERCENTAGE
+        
+    else:  # custom_strategy
+        await query.edit_message_text(
+            "⚙️ *Custom Profit Strategy Setup*\n\n"
+            "Enter your profit targets in the format:\n"
+            "`profit_percentage:allocation_percentage` (one per line)\n\n"
+            "Example for two targets:\n"
+            "20:40\n"
+            "50:30\n"
+            "100:30\n\n"
+            "The allocations should add up to 100%.",
+            parse_mode='Markdown'
+        )
+        return SET_CUSTOM_PROFIT_TARGETS
     
-
+async def set_custom_profit_targets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle custom profit target input"""
+    user_id = update.effective_user.id
+    targets_text = update.message.text.strip()
+    
+    try:
+        # Parse custom profit targets
+        targets = []
+        total_allocation = 0
+        
+        for line in targets_text.split('\n'):
+            if ':' not in line:
+                raise ValueError("Invalid format. Use 'profit:allocation' format.")
+            
+            profit, allocation = line.split(':', 1)
+            profit_pct = float(profit.strip()) / 100  # Convert to decimal
+            allocation_pct = float(allocation.strip()) / 100  # Convert to decimal
+            
+            if profit_pct <= 0 or allocation_pct <= 0:
+                raise ValueError("Values must be positive.")
+                
+            targets.append({
+                'percentage': profit_pct,
+                'allocation': allocation_pct
+            })
+            total_allocation += allocation_pct
+        
+        # Validate allocations sum to 100%
+        if abs(total_allocation - 1.0) > 0.01:  # Allow for small rounding errors
+            raise ValueError(f"Allocations must sum to 100% (current sum: {total_allocation*100:.1f}%)")
+        
+        # Check for risky strategy
+        risk_warning = ""
+        high_risk_targets = [t for t in targets if t['percentage'] > 2.0]  # 200%+ profit targets
+        if high_risk_targets:
+            risk_warning = "⚠️ Warning: Profit targets over 200% are very ambitious and rarely hit.\n"
+        
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {
+                'profit_strategy': 'custom',
+                'profit_targets': targets
+            }}
+        )
+        
+        await update.message.reply_text(
+            f"{risk_warning}✅ Custom profit strategy set.\n\n"
+            "📉 Enter the stop-loss percentage (e.g., 10 for 10% loss):",
+            parse_mode='Markdown'
+        )
+        return SET_LOSS_PERCENTAGE
+    
+    except ValueError as e:
+        await update.message.reply_text(
+            f"❌ Error: {str(e)}\n\n"
+            "Please enter profit targets in the correct format:"
+            "`profit_percentage:allocation_percentage` (one per line)\n\n"
+            "Example:\n20:40\n50:30\n100:30",
+            parse_mode='Markdown'
+        )
+        return SET_CUSTOM_PROFIT_TARGETS
+    
 
 async def is_virtual_liquidity_token(token: Dict[str, Any], user_settings: Dict[str, Any]) -> Tuple[bool, str]:
     """
@@ -2710,14 +2811,27 @@ async def is_virtual_liquidity_token(token: Dict[str, Any], user_settings: Dict[
     return False, "Appears to have real liquidity"
 
 async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Set stop-loss percentage for automatic trading"""
+    """Set stop-loss percentage with validation"""
     user_id = update.effective_user.id
+    
     try:
         percentage = float(update.message.text)
-        if percentage <= 0:
-            await update.message.reply_text("❌ Please enter a positive percentage.")
-            return SET_LOSS_PERCENTAGE
         
+        # Validate stop-loss percentage
+        if percentage <= 0:
+            await update.message.reply_text("❌ Stop-loss must be a positive percentage.")
+            return SET_LOSS_PERCENTAGE
+            
+        if percentage > 50:
+            await update.message.reply_text(
+                "⚠️ Warning: A stop-loss over 50% is very risky. "
+                "You could lose most of your investment quickly.\n\n"
+                "Do you want to proceed with this high risk setting? (yes/no)",
+                parse_mode='Markdown'
+            )
+            context.user_data['pending_loss_percentage'] = percentage
+            return CONFIRM_HIGH_RISK_LOSS
+            
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {'loss_percentage': percentage}}
@@ -2729,10 +2843,36 @@ async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Anti-MEV measures help reduce the risk of front-running and sandwich attacks."
         )
         return SET_ANTI_MEV
+        
     except ValueError:
         await update.message.reply_text("❌ Invalid percentage. Please enter a number.")
         return SET_LOSS_PERCENTAGE
 
+async def confirm_high_risk_loss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Confirm high-risk stop-loss setting"""
+    user_id = update.effective_user.id
+    response = update.message.text.strip().lower()
+    
+    if response not in ['yes', 'y']:
+        await update.message.reply_text(
+            "🛑 High-risk stop-loss cancelled.\n\n"
+            "📉 Enter a new stop-loss percentage (e.g., 10 for 10% loss):"
+        )
+        return SET_LOSS_PERCENTAGE
+        
+    percentage = context.user_data['pending_loss_percentage']
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {'loss_percentage': percentage}}
+    )
+    log_user_action(user_id, "HIGH_RISK_LOSS_SET", f"{percentage}%")
+    
+    await update.message.reply_text(
+        "⚠️ High-risk stop-loss enabled. Trade carefully!\n\n"
+        "🔒 Enable anti-MEV protection? (yes/no)\n\n"
+        "Anti-MEV measures help reduce the risk of front-running and sandwich attacks."
+    )
+    return SET_ANTI_MEV
 
 async def set_anti_mev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Set anti-MEV protection preference"""
@@ -2884,12 +3024,13 @@ async def set_max_gas_price(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return SET_MAX_GAS_PRICE
 
 async def set_token_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Set minimum token age"""
+    """Set minimum token age and show final configuration review"""
     user_id = update.effective_user.id
+    
     try:
         min_age = float(update.message.text)
-        if min_age < 5 or min_age > 120:
-            await update.message.reply_text("❌ Token age should be between 5 and 120 minutes.")
+        if min_age < 1 or min_age > 120:
+            await update.message.reply_text("❌ Token age should be between 1 and 120 minutes.")
             return SET_TOKEN_AGE
         
         users_collection.update_one(
@@ -2898,44 +3039,105 @@ async def set_token_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         log_user_action(user_id, "MIN_TOKEN_AGE_SET", f"{min_age} minutes")
         
-        # Get user data to show final configuration
+        # Get the complete configuration for review
         user = users_collection.find_one({'user_id': user_id})
         
-        # Schedule auto-trade job
-        for job in context.job_queue.jobs():
-            if job.name == f"auto_trade_{user_id}":
-                job.schedule_removal()
+        # Generate configuration summary
+        config_summary = generate_config_summary(user)
         
-        context.job_queue.run_repeating(
-            auto_trade, 
-            interval=30,
-            first=5, 
-            user_id=user_id,
-            name=f"auto_trade_{user_id}"
-        )
+        keyboard = [
+            [InlineKeyboardButton("✅ Activate Auto-Trading", callback_data='activate_auto_trading')],
+            [InlineKeyboardButton("⚙️ Modify Settings", callback_data='modify_settings')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            f"✅ *Automatic trading activated with enhanced safety parameters!*\n\n"
-            f"🤖 Settings:\n"
-            f"• Auto-buy amount: {user['auto_buy_amount']} SOL\n"
-            f"• Sell at: {user['sell_percentage']}% profit\n"
-            f"• Stop-loss at: {user['loss_percentage']}% loss\n"
-            f"• Anti-MEV: {'Yes' if user.get('anti_mev', False) else 'No'}\n"
-            f"• Min liquidity: ${user.get('min_liquidity', 1000)}\n"
-            f"• Min volume: ${user.get('min_volume', 500)}\n"
-            f"• Rug check: {'Yes' if user.get('rug_check', False) else 'No'}\n"
-            f"• Max slippage: {user.get('max_slippage', 5)}%\n"
-            f"• Max gas: {user.get('max_gas_price', 0.0005)} SOL\n"
-            f"• Min token age: {user.get('min_token_age', 10)} minutes\n\n"
-            f"🔔 You'll receive notifications for all auto-trades.",
-            parse_mode='Markdown'
+            config_summary,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
         )
-        return ConversationHandler.END
+        return REVIEW_CONFIG
+        
     except ValueError:
         await update.message.reply_text("❌ Invalid number. Please enter a number.")
         return SET_TOKEN_AGE
 
+def generate_config_summary(user):
+    """Generate a comprehensive summary of the auto-trading configuration"""
+    risk_score = calculate_risk_score(user)
+    
+    summary = (
+        f"🤖 *Auto-Trading Configuration Review*\n\n"
+        f"🔧 *Settings Summary:*\n"
+        f"• Auto-buy amount: {user['auto_buy_amount']} SOL\n"
+        f"• Min liquidity: ${user.get('min_liquidity', 1000):,.2f}\n"
+        f"• Min volume: ${user.get('min_volume', 500):,.2f}\n"
+        f"• Min token age: {user.get('min_token_age', 10)} minutes\n"
+        f"• Max slippage: {user.get('max_slippage', 5)}%\n"
+        f"• Max gas: {user.get('max_gas_price', 0.0005)} SOL\n"
+        f"• Rug check: {'Yes' if user.get('rug_check', False) else 'No'}\n"
+        f"• Anti-MEV: {'Yes' if user.get('anti_mev', False) else 'No'}\n\n"
+    )
+    
+    # Add profit strategy details
+    if user.get('profit_strategy') == 'multi_tier':
+        summary += (
+            f"📊 *Profit Strategy:* Multi-tier (Recommended)\n"
+            f"   - 40% at +20% profit\n"
+            f"   - 30% at +50% profit\n"
+            f"   - 30% at +100% profit\n"
+            f"   - 15% trailing stop loss\n"
+            f"   - 10% hard stop loss\n\n"
+        )
+    else:
+        summary += f"📊 *Profit Strategy:* Custom\n"
+        for target in user.get('profit_targets', []):
+            summary += f"   - {target['allocation']*100:.0f}% at +{target['percentage']*100:.0f}% profit\n"
+        summary += f"   - {user.get('loss_percentage', 10)}% stop loss\n\n"
+    
+    # Add risk assessment
+    summary += f"⚠️ *Risk Assessment:* {risk_score}/100\n"
+    
+    if risk_score > 70:
+        summary += "🚨 High risk configuration detected! Consider adjusting your settings.\n\n"
+    elif risk_score > 40:
+        summary += "⚠️ Moderate risk configuration. Trade carefully.\n\n"
+    else:
+        summary += "✅ Conservative configuration. Lower risk profile.\n\n"
+    
+    summary += "Review your settings and confirm to activate auto-trading."
+    
+    return summary
 
+def calculate_risk_score(user):
+    """Calculate a risk score based on configuration"""
+    risk_score = 0
+    
+    # Liquidity risk (lower liquidity = higher risk)
+    if user.get('min_liquidity', 1000) < 5000:
+        risk_score += 30
+    elif user.get('min_liquidity', 1000) < 10000:
+        risk_score += 15
+    
+    # Volume risk
+    if user.get('min_volume', 500) < 2000:
+        risk_score += 20
+    elif user.get('min_volume', 500) < 5000:
+        risk_score += 10
+    
+    # Token age risk
+    if user.get('min_token_age', 10) < 5:
+        risk_score += 15
+    elif user.get('min_token_age', 10) < 10:
+        risk_score += 5
+    
+    # Stop loss risk
+    if user.get('loss_percentage', 10) > 20:
+        risk_score += 25
+    elif user.get('loss_percentage', 10) > 10:
+        risk_score += 10
+    
+    return min(100, risk_score)  # Cap at 100
 
 async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
     """Send daily trading report to users"""
@@ -5982,13 +6184,19 @@ def setup_handlers(application: Application):
     entry_points=[CommandHandler("setmode", wrap_conversation_entry(set_mode))],
     states={
         SET_TRADING_MODE: [CallbackQueryHandler(wrap_conversation_state(mode_callback), 
-                           pattern='^(manual|automatic)$')],
+                       pattern='^(manual|automatic)$')],
         SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
                                            wrap_conversation_state(set_auto_buy_amount))],
+        SET_PROFIT_STRATEGY: [CallbackQueryHandler(wrap_conversation_state(set_profit_strategy), 
+                             pattern='^(default_strategy|custom_strategy)$')],
+        SET_CUSTOM_PROFIT_TARGETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                                 wrap_conversation_state(set_custom_profit_targets))],
         SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
                                            wrap_conversation_state(set_sell_percentage))],
         SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
                                            wrap_conversation_state(set_loss_percentage))],
+        CONFIRM_HIGH_RISK_LOSS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                              wrap_conversation_state(confirm_high_risk_loss))],
         SET_ANTI_MEV: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
                                     wrap_conversation_state(set_anti_mev))],
         SET_LIQUIDITY_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
