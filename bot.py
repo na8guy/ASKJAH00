@@ -4388,7 +4388,6 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all current positions with performance and action buttons"""
     user_id = update.effective_user.id
     log_user_action(user_id, "MY_POSITIONS_COMMAND")
     
@@ -4404,22 +4403,18 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     portfolio = user['portfolio']
     messages = []
     
-    # Calculate total value with proper async handling
-    total_value = 0
+    # Calculate total value asynchronously
+    total_value = 0.0
     for contract, pos in portfolio.items():
         token = await fetch_token_by_contract(contract)
         current_price = token['price_usd'] if token else pos['buy_price']
         token_count = pos['amount'] / pos['buy_price']
         position_value = token_count * current_price
         total_value += position_value
-    
-
-            
-        # Calculate performance metrics
         
+        # Calculate performance metrics
         buy_price = pos['buy_price']
         price_change = ((current_price - buy_price) / buy_price) * 100
-       
         initial_investment = pos['amount']
         pnl = position_value - initial_investment
         
@@ -4472,9 +4467,6 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Add summary message
     total_investment = sum(pos['amount'] for pos in portfolio.values())
-    total_value = sum((pos['amount'] / pos['buy_price']) * 
-                     (await fetch_token_by_contract(contract) or {'price_usd': pos['buy_price']})['price_usd'] 
-                     for contract, pos in portfolio.items())
     total_pnl = total_value - total_investment
     total_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
     
@@ -4777,16 +4769,14 @@ async def generate_pnl_image(trade_details: List[Dict], total_pnl: float, overal
     plt.style.use('dark_background')
     plt.axis('off')
     
-    # Calculate the multiple (X)
     multiple = (overall_pnl_percent / 100) + 1
     
-    # Create the main text content
     text_content = [
-        ("ASKJAH TRADING PERFORMANCE", 24, "#FFFFFF", "bold"),
-        (f"\nTOTAL RETURN: {overall_pnl_percent:+.1f}%", 28, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold"),
-        (f"\n{multiple:.1f}X YOUR CAPITAL", 22, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold"),
-        (f"\n\nTOTAL P&L: ${total_pnl:+.2f}", 20, "#FFFFFF", "normal"),
-        ("\n\nTOP PERFORMERS:", 18, "#FFFFFF", "bold")
+        ("ASKJAH TRADING PERFORMANCE", 24, "#FFFFFF", "bold", "normal"),
+        (f"\nTOTAL RETURN: {overall_pnl_percent:+.1f}%", 28, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold", "normal"),
+        (f"\n{multiple:.1f}X YOUR CAPITAL", 22, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold", "normal"),
+        (f"\n\nTOTAL P&L: ${total_pnl:+.2f}", 20, "#FFFFFF", "normal", "normal"),
+        ("\n\nTOP PERFORMERS:", 18, "#FFFFFF", "bold", "normal")
     ]
     
     # Add top 3 performing trades
@@ -4795,33 +4785,22 @@ async def generate_pnl_image(trade_details: List[Dict], total_pnl: float, overal
         trade_multiple = (trade['pnl_percent'] / 100) + 1
         text_content.append(
             (f"\n{i+1}. {trade['symbol']}: {trade['pnl_percent']:+.1f}% ({trade_multiple:.1f}X)", 
-             16, "#00FF00" if trade['pnl_percent'] >= 0 else "#FF0000", "normal")
+             16, "#00FF00" if trade['pnl_percent'] >= 0 else "#FF0000", "normal", "normal")
         )
     
-    text_content.append(("\n\nTRADING MADE EASIER", 16, "#FFFFFF", "italic"))
-    text_content.append(("\n@AskJahBot", 14, "#CCCCCC", "normal"))
+    text_content.append(("\n\nTRADING MADE EASIER", 16, "#FFFFFF", "normal", "italic"))
+    text_content.append(("\n@AskJahBot", 14, "#CCCCCC", "normal", "normal"))
     
     # Add all text elements
     y_position = 0.95
-    for text, size, color, weight in text_content:
+    for text, size, color, weight, style in text_content:
         plt.text(0.5, y_position, text, 
                 ha='center', va='top', 
                 fontsize=size, color=color, 
                 weight=weight,
+                fontstyle=style,
                 transform=plt.gca().transAxes)
         y_position -= (size * 0.015)  # Adjust vertical spacing
-    
-    # Try to add logo if available
-    try:
-        logo_path = "ASKJAH.png"  # Update this path to your actual logo file
-        if os.path.exists(logo_path):
-            logo_img = plt.imread(logo_path)
-            # Add logo to the top of the image
-            logo_ax = plt.axes([0.4, 0.9, 0.2, 0.1])  # [left, bottom, width, height]
-            logo_ax.imshow(logo_img)
-            logo_ax.axis('off')
-    except Exception as e:
-        logger.warning(f"Could not add logo to image: {str(e)}")
     
     plt.tight_layout()
     
