@@ -4749,7 +4749,7 @@ async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: fl
     
     # Try to add logo if available
     try:
-        logo_path = "askjah_logo.png"  # Update this path to your actual logo file
+        logo_path = "ASKJAH.png"  # Update this path to your actual logo file
         if os.path.exists(logo_path):
             logo_img = plt.imread(logo_path)
             # Add logo to the top of the image
@@ -4813,7 +4813,7 @@ async def generate_pnl_image(trade_details: List[Dict], total_pnl: float, overal
     
     # Try to add logo if available
     try:
-        logo_path = "askjah_logo.png"  # Update this path to your actual logo file
+        logo_path = "ASKJAH.png"  # Update this path to your actual logo file
         if os.path.exists(logo_path):
             logo_img = plt.imread(logo_path)
             # Add logo to the top of the image
