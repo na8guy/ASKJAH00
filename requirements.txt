@@ -19,3 +19,5 @@ bip32utils
 pandas
 numpy
 TextBlob
+seaborn
+matplotlib
