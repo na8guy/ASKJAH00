@@ -4503,9 +4503,22 @@ async def handle_position_actions(update: Update, context: ContextTypes.DEFAULT_
     context.user_data['current_token'] = token
     
     if action == 'sellpos':
+        # Get user portfolio data to calculate available tokens
+        user = users_collection.find_one({'user_id': user_id})
+        if contract_address not in user.get('portfolio', {}):
+            await query.message.reply_text("❌ You don't hold this token.")
+            return
+        
+        token_data = user['portfolio'][contract_address]
+        buy_price = token_data['buy_price']
+        sol_invested = token_data['amount']
+        available_tokens = sol_invested / buy_price
+        
         await query.message.reply_text(
             f"💸 Selling {token['name']}\n\n"
-            f"Enter amount to sell (in SOL worth):"
+            f"Available: {available_tokens:.2f} tokens\n"
+            f"Current Price: ${token['price_usd']:.6f}\n"
+            f"Enter number of tokens to sell:"
         )
         return SELL_AMOUNT
     elif action == 'buypos':
@@ -4685,77 +4698,66 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             "Auto-Trade System Failure"
         )
 
-async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, win_rate: float) -> io.BytesIO:
-    """Generate a marketing-friendly PnL image with bold text and X multiples"""
+async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, win_rate: float, trade_details: List[Dict], username: str) -> io.BytesIO:
+    """Generate a marketing-friendly PnL image with graphs and username"""
     # Create figure with attractive design
-    plt.figure(figsize=(8, 6))
+    plt.figure(figsize=(12, 8))
     plt.style.use('dark_background')
     
-    # Remove axes
+    # Create donut chart for win rate
+    plt.subplot(1, 2, 1)
+    sizes = [win_rate, 100 - win_rate]
+    labels = ['Wins', 'Losses']
+    explode = (0.1, 0)
+    colors = ['#00FF00', '#FF0000']
+    plt.pie(sizes, explode=explode, labels=labels, colors=colors,
+            autopct='%1.1f%%', shadow=True, startangle=90)
+    centre_circle = plt.Circle((0,0),0.70,fc='black')
+    fig = plt.gcf()
+    fig.gca().add_artist(centre_circle)
+    plt.axis('equal')
+    plt.title('Win Rate', fontsize=16, fontweight='bold')
+    
+    # Create summary section
+    plt.subplot(1, 2, 2)
     plt.axis('off')
     
-    # Calculate the multiple (X)
     multiple = (overall_pnl_percent / 100) + 1
     
-    # Determine sentiment emoji and color
-    if overall_pnl_percent >= 100:
-        emoji = "🚀"
-        color = "#00FF00"  # Bright green
-    elif overall_pnl_percent >= 50:
-        emoji = "🔥"
-        color = "#FFA500"  # Orange
-    elif overall_pnl_percent >= 10:
-        emoji = "👍"
-        color = "#FFFF00"  # Yellow
-    elif overall_pnl_percent >= 0:
-        emoji = "📈"
-        color = "#ADD8E6"  # Light blue
-    else:
-        emoji = "📉"
-        color = "#FF0000"  # Red
+    # Determine color based on performance
+    color = "#00FF00" if overall_pnl_percent >= 0 else "#FF0000"
     
-    # Create the text content
-    text_content = [
-        ("ASKJAH", 30, "#FFFFFF", "bold"),
-        ("\nDAILY PERFORMANCE\n", 24, "#FFFFFF", "bold"),
-        (f"\n{emoji} {overall_pnl_percent:+.1f}% {emoji}", 36, color, "bold"),
-        (f"\n\n{multiple:.1f}X RETURN", 28, color, "bold"),
-        (f"\n\nWIN RATE: {win_rate:.1f}%", 20, "#FFFFFF", "normal"),
-        (f"\n\nP&L: ${total_pnl:+.2f}", 20, "#FFFFFF", "normal"),
-        ("\n\nTRADING MADE EASIER", 18, "#FFFFFF", "italic"),
-        ("\n\n@AskJahBot", 16, "#CCCCCC", "normal")
-    ]
+    summary_text = (
+        f"ASKJAH TRADING PERFORMANCE\n\n"
+        f"TOTAL RETURN: {overall_pnl_percent:+.1f}%\n"
+        f"{multiple:.1f}X YOUR CAPITAL\n\n"
+        f"TOTAL P&L: ${total_pnl:+.2f}\n\n"
+        f"TOP PERFORMERS:\n"
+    )
     
-    # Calculate total height needed
-    total_height = sum(size * 0.02 for text, size, color, weight in text_content)
+    # Add top 3 performing trades
+    top_trades = sorted(trade_details, key=lambda x: x['pnl_percent'], reverse=True)[:3]
+    for i, trade in enumerate(top_trades):
+        trade_multiple = (trade['pnl_percent'] / 100) + 1
+        summary_text += (
+            f"{i+1}. {trade['symbol']}: {trade['pnl_percent']:+.1f}% "
+            f"({trade_multiple:.1f}X)\n"
+        )
     
-    # Add text elements
-    y_position = 0.9
-    for text, size, color, weight in text_content:
-        plt.text(0.5, y_position, text, 
-                ha='center', va='center', 
-                fontsize=size, color=color, 
-                weight=weight,
-                transform=plt.gca().transAxes)
-        y_position -= (size * 0.02)  # Adjust vertical spacing based on font size
+    summary_text += (
+        f"\nTRADING MADE EASIER\n"
+        f"@{username}"
+    )
     
-    # Try to add logo if available
-    try:
-        logo_path = "ASKJAH.png"  # Update this path to your actual logo file
-        if os.path.exists(logo_path):
-            logo_img = plt.imread(logo_path)
-            # Add logo to the top of the image
-            logo_ax = plt.axes([0.4, 0.85, 0.2, 0.1])  # [left, bottom, width, height]
-            logo_ax.imshow(logo_img)
-            logo_ax.axis('off')
-    except Exception as e:
-        logger.warning(f"Could not add logo to image: {str(e)}")
+    plt.text(0.05, 0.95, summary_text, ha='left', va='top', 
+             fontsize=14, color="#FFFFFF", 
+             bbox=dict(boxstyle="round,pad=0.5", facecolor="#1E1E1E", alpha=0.8))
     
     plt.tight_layout()
     
     # Save to bytes buffer
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor='#000000')
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#000000')
     buf.seek(0)
     plt.close()
     
@@ -5452,7 +5454,7 @@ async def daily_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pnl_image = await generate_pnl_image(trade_details, total_pnl, overall_pnl_percent)
     
     # Generate shareable image
-    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate)
+    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate, trade_details, update.effective_user.username)
     
     # Send detailed image to user
     await update.message.reply_photo(
