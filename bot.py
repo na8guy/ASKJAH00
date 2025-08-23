@@ -4344,13 +4344,7 @@ async def handle_solana_rpc_rate_limiting():
         RPC_RETRY_DELAY = max(RPC_RETRY_DELAY * 0.8, 3)  # Don't go below 3 seconds
         logger.info(f"Decreased RPC retry delay to {RPC_RETRY_DELAY}s")
 
-# Add this to your job scheduler
-app.job_queue.run_repeating(
-    handle_solana_rpc_rate_limiting,
-    interval=300,  # Check every 5 minutes
-    first=60,
-    name="rpc_rate_limit_monitor"
-)
+
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show debug information"""
@@ -5520,6 +5514,13 @@ async def on_startup():
         # Get the Telegram application instance
         telegram_app = await setup_bot()
         logger.info("✅ Bot setup complete")
+
+        telegram_app.job_queue.run_repeating(
+    handle_solana_rpc_rate_limiting,
+    interval=300,
+    first=60,
+    name="rpc_rate_limit_monitor"
+)
         
         logger.info("⏳ Scheduling jobs for active subscribers...")
         active_users = users_collection.find({
@@ -5551,6 +5552,8 @@ async def on_startup():
                     user_id=user_id,
                     name=f"auto_trade_{user_id}"
                 )
+
+
 
         # Schedule background jobs using the Telegram application
         telegram_app.job_queue.run_repeating(
