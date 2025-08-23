@@ -4037,6 +4037,8 @@ async def check_balance(user_id, chain):
 async def execute_trade(user_id, contract_address, amount, action, chain, token_info):
     logger.info(f"🏁 Starting {action} trade for {amount} of {contract_address}")
     
+    # Add debug logging
+    logger.info(f"Trade details: user_id={user_id}, contract={contract_address}, amount={amount}, action={action}")
     # Check trade feasibility first for sell orders
     if action == 'sell':
         is_feasible, reason = await check_trade_feasibility(token_info, amount)
@@ -4562,16 +4564,16 @@ async def notify_trial_ending(context: ContextTypes.DEFAULT_TYPE):
 
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, token: Dict[str, Any] = None):
     """Handle automatic trading with enhanced decision logging"""
-    if user_id is None:
-        job = context.job
-        user_id = job.user_id
-    
     logger.info(f"🤖 Auto-trading for user {user_id}")
     
     try:
         user = users_collection.find_one({'user_id': user_id})
         if not user or not await check_subscription(user_id):
+            logger.info(f"User {user_id} not subscribed or not found")
             return
+            
+        # Debug log user settings
+        logger.info(f"User {user_id} settings: {user.get('trading_mode')}, {user.get('auto_buy_amount')}")
             
         # Check cooldown
         last_trade_time = user.get('last_trade_time', 0)
@@ -5476,7 +5478,7 @@ async def daily_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pnl_image = await generate_pnl_image(trade_details, total_pnl, overall_pnl_percent)
     
     # Generate shareable image
-    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate, trade_details, update.effective_user.username)
+    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate)
     
     # Send detailed image to user
     await update.message.reply_photo(
