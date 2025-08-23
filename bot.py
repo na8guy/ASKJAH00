@@ -82,6 +82,10 @@ from fastapi.responses import JSONResponse
 import numpy as np
 from typing import Tuple
 from textblob import TextBlob
+import matplotlib.pyplot as plt
+import io
+import seaborn as sns
+from datetime import datetime, date
 
 
 # Custom filter to add user_id to logs
@@ -4408,9 +4412,7 @@ async def notify_trial_ending(context: ContextTypes.DEFAULT_TYPE):
             log_user_action(user_id, "TRIAL_ENDING_NOTIFICATION")
 
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, token: Dict[str, Any] = None):
-    """Handle automatic trading with enhanced safety parameters and position limits"""
-    # If user_id and token are provided, this is an immediate trade from update_token_info
-    # Otherwise, this is a scheduled job run
+    """Handle automatic trading with enhanced decision logging"""
     if user_id is None:
         job = context.job
         user_id = job.user_id
@@ -4438,20 +4440,11 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
         if await check_daily_loss_limit(user_id, user):
             logger.debug(f"Daily loss limit reached for user {user_id}")
             return
-            
+        
         # Get trading settings
         trading_mode = user.get('trading_mode', 'manual')
         buy_amount = user.get('auto_buy_amount', 0.01)
         
-        # 1. First handle sell conditions for existing tokens
-        for contract, token_data in list(portfolio.items()):
-            current_token = await fetch_token_by_contract(contract)
-            if not current_token:
-                continue
-                
-            await execute_auto_sell(context, user_id, current_token, token_data, "Auto-sell check")
-        
-        # 2. Handle buy conditions
         # If a specific token was provided, use it
         if token is not None:
             # Skip if already in portfolio or blacklist
@@ -4459,18 +4452,67 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
                 token['contract_address'] in user.get('auto_trade_blacklist', [])):
                 return
                 
-            # Apply safety checks
+            # Track decision factors
+            decision_data = {}
+            
+            # Apply safety checks with detailed logging
             is_safe, reason = await check_token_safety(token, user)
-            if not is_safe:
-                logger.info(f"Skipping token {token['name']}: {reason}")
-                return
+            decision_data['safety_check'] = {
+                'passed': is_safe,
+                'reason': reason if not is_safe else "Token passed all safety checks"
+            }
+            
+            # Check liquidity sustainability
+            liquidity_ratio = token['liquidity'] / (buy_amount * 150) if buy_amount > 0 else 0
+            liquidity_ok = liquidity_ratio > 0.1  # At least 10% of trade size as liquidity
+            decision_data['liquidity_sustainability'] = {
+                'passed': liquidity_ok,
+                'reason': f"Insufficient liquidity ratio: {liquidity_ratio:.2f}" if not liquidity_ok else "Adequate liquidity"
+            }
+            
+            # Check if already at max positions
+            max_positions_ok = len(portfolio) < MAX_POSITIONS
+            decision_data['position_limit'] = {
+                'passed': max_positions_ok,
+                'reason': f"Max positions reached: {len(portfolio)}/{MAX_POSITIONS}" if not max_positions_ok else "Within position limits"
+            }
+            
+            # Check if token has positive momentum
+            token_performance = token_performance_collection.find_one(
+                {'contract_address': token['contract_address']}
+            )
+            
+            momentum_ok = False
+            momentum_reason = "No performance data available"
+            if token_performance and 'performance_history' in token_performance:
+                price_history = [entry['price'] for entry in token_performance['performance_history'][-10:]]
+                if len(price_history) >= 5:
+                    recent_growth = (price_history[-1] - price_history[-5]) / price_history[-5] * 100
+                    momentum_ok = recent_growth > 5  # At least 5% growth in last 5 periods
+                    momentum_reason = f"Recent growth: {recent_growth:.2f}%"
+            
+            decision_data['momentum'] = {
+                'passed': momentum_ok,
+                'reason': momentum_reason
+            }
+            
+            # Generate and send decision report
+            report = await generate_auto_trade_report(user_id, token, decision_data)
+            await context.bot.send_message(chat_id=user_id, text=report)
+            
+            # Only proceed if all checks passed
+            all_checks_passed = all(check['passed'] for check in decision_data.values())
+            
+            if all_checks_passed:
+                await execute_auto_buy(context, user_id, token, buy_amount)
+            else:
+                logger.info(f"Auto-trade rejected for {token['name']} based on safety checks")
                 
-            await execute_auto_buy(context, user_id, token, buy_amount)
         else:
             # Original logic for scheduled trading
             sol_balance = await check_balance(user_id, 'solana')
             if sol_balance < buy_amount or len(portfolio) >= MAX_POSITIONS:
-                logger.debug(f"Insufficient SOL or max positions for auto-buy: {sol_balance} < {buy_amount} or {len(portfolio)} >= {MAX_POSITIONS}")
+                logger.debug(f"Insufficient SOL or max positions for auto-buy")
                 return
                 
             tokens = await fetch_latest_token()
@@ -4480,17 +4522,12 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             # Filter tokens using enhanced safety parameters
             valid_tokens = []
             for t in tokens:
-                # Skip tokens already in portfolio or blacklist
                 if t['contract_address'] in portfolio or t['contract_address'] in user.get('auto_trade_blacklist', []):
                     continue
                     
-                # Apply safety checks
                 is_safe, reason = await check_token_safety(t, user)
-                if not is_safe:
-                    logger.info(f"Skipping token {t['name']}: {reason}")
-                    continue
-                    
-                valid_tokens.append(t)
+                if is_safe:
+                    valid_tokens.append(t)
             
             if not valid_tokens:
                 return
@@ -4500,11 +4537,9 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             best_score = -99999
             
             for t in valid_tokens:
-                # Simple scoring based on liquidity, volume, and recent performance
                 score = (t['liquidity'] / 10000) + (t['volume'] / 5000)
-                
                 if 'price_change_5m' in t:
-                    score += t['price_change_5m'] * 100  # Add momentum factor
+                    score += t['price_change_5m'] * 100
                     
                 if score > best_score:
                     best_score = score
@@ -4520,6 +4555,108 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             f"❌ AUTOTRADE ERROR: {str(e)}",
             "Auto-Trade System Failure"
         )
+
+
+async def generate_pnl_image(trade_details: List[Dict], total_pnl: float, overall_pnl_percent: float) -> io.BytesIO:
+    """Generate a professional PnL image for sharing"""
+    # Create figure
+    plt.figure(figsize=(10, 8))
+    plt.style.use('dark_background')
+    
+    # Create data for chart
+    symbols = [t['symbol'] for t in trade_details]
+    pnls = [t['pnl'] for t in trade_details]
+    colors = ['green' if pnl >= 0 else 'red' for pnl in pnls]
+    
+    # Create bar chart
+    plt.subplot(2, 1, 1)
+    bars = plt.bar(symbols, pnls, color=colors, alpha=0.7)
+    plt.ylabel('P&L (SOL)')
+    plt.title('Daily Trading Performance')
+    
+    # Add value labels on bars
+    for bar, pnl in zip(bars, pnls):
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'{pnl:+.2f} SOL', ha='center', va='bottom' if pnl >= 0 else 'top')
+    
+    # Create summary section
+    plt.subplot(2, 1, 2)
+    plt.axis('off')
+    
+    summary_text = (
+        f"Total P&L: ${total_pnl:+.2f}\n"
+        f"Return: {overall_pnl_percent:+.2f}%\n"
+        f"Trades: {len(trade_details)}\n"
+        f"Date: {date.today().strftime('%Y-%m-%d')}\n\n"
+        "Powered by Crypto Trading Bot"
+    )
+    
+    plt.text(0.5, 0.5, summary_text, ha='center', va='center', 
+             fontsize=14, bbox=dict(boxstyle="round,pad=1", facecolor="black", alpha=0.7))
+    
+    plt.tight_layout()
+    
+    # Save to bytes buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
+
+# Add this function to generate a shareable PnL image
+async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, win_rate: float) -> io.BytesIO:
+    """Generate a marketing-friendly PnL image for sharing"""
+    # Create figure with attractive design
+    plt.figure(figsize=(8, 6))
+    plt.style.use('dark_background')
+    
+    # Create a simple, attractive design
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#F9C80E']
+    
+    # Create donut chart for win rate
+    plt.subplot(1, 2, 1)
+    sizes = [win_rate, 100 - win_rate]
+    labels = ['Wins', 'Losses']
+    explode = (0.1, 0)
+    plt.pie(sizes, explode=explode, labels=labels, colors=colors[:2],
+            autopct='%1.1f%%', shadow=True, startangle=90)
+    plt.axis('equal')
+    plt.title('Win Rate')
+    
+    # Create summary section
+    plt.subplot(1, 2, 2)
+    plt.axis('off')
+    
+    # Determine sentiment emoji
+    if overall_pnl_percent >= 10:
+        emoji = "🚀"
+    elif overall_pnl_percent >= 0:
+        emoji = "👍"
+    else:
+        emoji = "📉"
+    
+    summary_text = (
+        f"{emoji} Daily Performance {emoji}\n\n"
+        f"Return: {overall_pnl_percent:+.1f}%\n"
+        f"P&L: ${total_pnl:+.2f}\n\n"
+        "Powered by AI Trading Bot\n"
+        "Join: t.me/yourbottoken"
+    )
+    
+    plt.text(0.5, 0.5, summary_text, ha='center', va='center', 
+             fontsize=12, bbox=dict(boxstyle="round,pad=1", facecolor="#2C3E50", alpha=0.9))
+    
+    plt.tight_layout()
+    
+    # Save to bytes buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
 
 async def fix_incomplete_trade_records(user_id: int):
     """Fix trade records that might be missing required fields"""
@@ -4758,6 +4895,42 @@ async def execute_auto_buy(context, user_id, token, buy_amount):
             "Auto-Buy Error"
         )
         return False
+
+
+async def generate_auto_trade_report(user_id: int, token: Dict[str, Any], decision_data: Dict[str, Any]):
+    """Generate a detailed report on why a token was/wasn't auto-traded"""
+    report = f"🤖 AUTO-TRADE DECISION REPORT\n\n"
+    report += f"Token: {token['name']} ({token['symbol']})\n"
+    report += f"Contract: {token['contract_address'][:8]}...\n"
+    report += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    
+    report += "📊 TOKEN METRICS:\n"
+    report += f"• Price: ${token['price_usd']:.8f}\n"
+    report += f"• Liquidity: ${token['liquidity']:,.2f}\n"
+    report += f"• Volume: ${token['volume']:,.2f}\n"
+    report += f"• Market Cap: ${token.get('market_cap', 0):,.2f}\n\n"
+    
+    report += "⚙️ USER SETTINGS:\n"
+    user = users_collection.find_one({'user_id': user_id})
+    if user:
+        report += f"• Min Liquidity: ${user.get('min_liquidity', 1000):,.2f}\n"
+        report += f"• Min Volume: ${user.get('min_volume', 500):,.2f}\n"
+        report += f"• Max Positions: {user.get('max_positions', 5)}\n"
+        report += f"• Position Size: {user.get('position_size_percent', 5)}%\n\n"
+    
+    report += "🔍 DECISION ANALYSIS:\n"
+    for check_name, check_result in decision_data.items():
+        status = "✅ PASS" if check_result['passed'] else "❌ FAIL"
+        report += f"• {check_name}: {status}\n"
+        if not check_result['passed']:
+            report += f"  Reason: {check_result['reason']}\n"
+    
+    # Add overall decision
+    all_passed = all(check['passed'] for check in decision_data.values())
+    final_decision = "APPROVED" if all_passed else "REJECTED"
+    report += f"\n🎯 FINAL DECISION: {final_decision}"
+    
+    return report
     
 async def emergency_sell_protocol(context, user_id, token, token_data):
     """
@@ -4992,7 +5165,7 @@ async def monitor_portfolio_liquidity(context: ContextTypes.DEFAULT_TYPE):
                     )
 
 async def daily_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Calculate and display daily profit/loss"""
+    """Calculate and display daily profit/loss with image"""
     user_id = update.effective_user.id
     log_user_action(user_id, "DAILY_PNL_REQUEST")
     
@@ -5028,64 +5201,146 @@ async def daily_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trade_details = []
     
     for trade in today_trades:
-        # Calculate profit/loss for this trade
         if 'buy_price' in trade and 'sell_price' in trade:
-            # For completed trades (buy and sell)
             investment = trade['amount'] * trade['buy_price']
             returns = trade['amount'] * trade['sell_price']
             pnl = returns - investment
             pnl_percent = (pnl / investment) * 100 if investment > 0 else 0
+            
+            total_pnl += pnl
+            
+            if pnl > 0:
+                winning_trades += 1
+            elif pnl < 0:
+                losing_trades += 1
+                
+            trade_details.append({
+                'symbol': trade.get('symbol', 'UNKNOWN'),
+                'pnl': pnl,
+                'pnl_percent': pnl_percent,
+                'status': 'CLOSED'
+            })
         elif 'buy_price' in trade:
-            # For open positions (only bought)
+            # Handle open positions
             current_price = await get_current_price(trade.get('contract', ''))
             if current_price:
                 investment = trade['amount'] * trade['buy_price']
                 current_value = trade['amount'] * current_price
                 pnl = current_value - investment
                 pnl_percent = (pnl / investment) * 100 if investment > 0 else 0
-                status = "OPEN"
-            else:
-                continue
-        else:
-            continue
-        
-        total_pnl += pnl
-        
-        if pnl > 0:
-            winning_trades += 1
-        elif pnl < 0:
-            losing_trades += 1
-            
-        trade_details.append({
-            'symbol': trade.get('symbol', 'UNKNOWN'),
-            'pnl': pnl,
-            'pnl_percent': pnl_percent,
-            'status': status if 'status' in locals() else 'CLOSED'
-        })
+                
+                trade_details.append({
+                    'symbol': trade.get('symbol', 'UNKNOWN'),
+                    'pnl': pnl,
+                    'pnl_percent': pnl_percent,
+                    'status': 'OPEN'
+                })
     
-    # Generate report
+    # Calculate overall metrics
+    total_investment = sum(trade['amount'] * trade['buy_price'] for trade in today_trades if 'buy_price' in trade)
+    overall_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
+    win_rate = (winning_trades / len(today_trades)) * 100 if today_trades else 0
+    
+    # Generate detailed image
+    pnl_image = await generate_pnl_image(trade_details, total_pnl, overall_pnl_percent)
+    
+    # Generate shareable image
+    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate)
+    
+    # Send detailed image to user
+    await update.message.reply_photo(
+        photo=pnl_image,
+        caption=f"📊 Your Daily P&L Report - {today.strftime('%Y-%m-%d')}"
+    )
+    
+    # Send shareable image with sharing instructions
+    await update.message.reply_photo(
+        photo=shareable_image,
+        caption=(
+            "🎉 Share your success with others!\n\n"
+            "This image is designed for sharing on social media. "
+            "It shows your overall performance without revealing sensitive details.\n\n"
+            "Tip: You can forward this image to friends or post it in groups to show off your trading skills!"
+        )
+    )
+    
+    # Also send text summary
     report = f"📊 *Daily P&L Report - {today.strftime('%Y-%m-%d')}*\n\n"
-    report += f"• Total Trades: {len(today_trades)}\n"
+    report += f"• Total P&L: ${total_pnl:+.2f}\n"
+    report += f"• Return: {overall_pnl_percent:+.2f}%\n"
     report += f"• Winning Trades: {winning_trades}\n"
     report += f"• Losing Trades: {losing_trades}\n"
-    report += f"• Win Rate: {(winning_trades/len(today_trades)*100):.1f}%\n\n"
-    report += f"• Total P&L: ${total_pnl:.2f}\n"
+    report += f"• Win Rate: {win_rate:.1f}%\n\n"
     
-    # Add trade details
-    report += "\n*Trade Details:*\n"
-    for trade in trade_details:
-        emoji = "🟢" if trade['pnl'] > 0 else "🔴" if trade['pnl'] < 0 else "⚪"
-        report += f"{emoji} {trade['symbol']}: ${trade['pnl']:.2f} ({trade['pnl_percent']:+.1f}%) {trade['status']}\n"
-    
-    # Add performance summary
     if total_pnl > 0:
-        report += "\n🎉 Great job! You're in profit today!"
+        report += "🎉 Great job! You're in profit today!"
     elif total_pnl < 0:
-        report += "\n📉 You're down today. Review your strategy."
+        report += "📉 You're down today. Review your strategy."
     else:
-        report += "\n➖ Break-even day. No gains, no losses."
+        report += "➖ Break-even day. No gains, no losses."
     
     await update.message.reply_text(report, parse_mode='Markdown')
+
+
+
+async def share_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Share a marketing-friendly PnL image"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "SHARE_PNL_REQUEST")
+    
+    # Calculate today's P&L (similar to daily_pnl)
+    today = datetime.now().date()
+    today_start = datetime.combine(today, datetime.min.time())
+    today_end = datetime.combine(today, datetime.max.time())
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        await update.message.reply_text("🚫 No user data found.")
+        return
+        
+    trade_history = user.get('trade_history', [])
+    today_trades = [
+        trade for trade in trade_history 
+        if today_start <= datetime.fromisoformat(trade['timestamp']) <= today_end
+    ]
+    
+    if not today_trades:
+        await update.message.reply_text("📊 No trades executed today. Nothing to share!")
+        return
+    
+    # Calculate total P&L and win rate
+    total_pnl = 0
+    winning_trades = 0
+    
+    for trade in today_trades:
+        if 'buy_price' in trade and 'sell_price' in trade:
+            investment = trade['amount'] * trade['buy_price']
+            returns = trade['amount'] * trade['sell_price']
+            pnl = returns - investment
+            total_pnl += pnl
+            
+            if pnl > 0:
+                winning_trades += 1
+    
+    win_rate = (winning_trades / len(today_trades)) * 100 if today_trades else 0
+    total_investment = sum(trade['amount'] * trade['buy_price'] for trade in today_trades if 'buy_price' in trade)
+    overall_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
+    
+    # Generate shareable image
+    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate)
+    
+    # Send image with sharing encouragement
+    await update.message.reply_photo(
+        photo=shareable_image,
+        caption=(
+            "🚀 Share your trading success!\n\n"
+            "Show others what's possible with our AI-powered trading bot. "
+            "This image highlights your performance without revealing sensitive details.\n\n"
+            "Pro Tip: Post this in crypto groups with a caption like:\n"
+            "'Another profitable day with the AI Trading Bot! 🚀'\n\n"
+            "Want to try it yourself? Join: t.me/yourbottoken"
+        )
+    )
 
 
 async def get_current_price(contract_address: str) -> Optional[float]:
@@ -5403,6 +5658,7 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("trade_status", trade_status))
     application.add_handler(CommandHandler("emergency_sell", emergency_sell))
     application.add_handler(CommandHandler("daily_pnl", daily_pnl))
+    application.add_handler(CommandHandler("share_pnl", share_pnl))
     #application.add_handler(CallbackQueryHandler(handle_token_button, pattern='^(buy|sell)_'))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("reset_tokens", reset_tokens))
@@ -5595,6 +5851,7 @@ async def setup_bot():
             BotCommand("subscribe", "Subscribe to use trading features"),
             BotCommand("token_analysis", "Analyze performance of a specific token"),
             BotCommand("daily_pnl", "Check today's profit/loss summary"),
+              BotCommand("share_pnl", "Share a marketing-friendly PnL image"),
             BotCommand("generate_wallet", "Generate a new wallet"),
             BotCommand("set_wallet", "Import an existing wallet"),
             BotCommand("fetch_tokens", "Manually fetch new tokens (requires wallet)"),
