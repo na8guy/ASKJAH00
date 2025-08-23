@@ -3755,7 +3755,7 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     """Handle sell amount input with proper token amount calculation"""
     user_id = update.effective_user.id
     try:
-        # Get the token amount user wants to sell (not SOL value)
+        # Get the token amount user wants to sell
         token_amount = float(update.message.text)
         if token_amount <= 0:
             await update.message.reply_text("❌ Please enter a positive amount.")
@@ -3777,9 +3777,9 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         token_data = portfolio[token['contract_address']]
         
         # Calculate how many tokens the user actually holds
-        # The portfolio stores SOL value, so we need to convert back to token amount
         buy_price = token_data['buy_price']
-        token_amount_held = token_data['amount'] / buy_price
+        sol_invested = token_data['amount']
+        token_amount_held = sol_invested / buy_price
         
         if token_amount > token_amount_held:
             await update.message.reply_text(
@@ -3787,9 +3787,6 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                 f"You requested to sell {token_amount:.2f} tokens."
             )
             return SELL_AMOUNT
-        
-        # Store the token amount in context for execution
-        context.user_data['sell_token_amount'] = token_amount
         
         # Execute trade immediately
         await update.message.reply_text(f"⏳ Executing sell order for {token_amount:.2f} {token['symbol']} tokens...")
@@ -4317,10 +4314,12 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
     
     # Add debug logging
     logger.info(f"Trade details: user_id={user_id}, contract={contract_address}, amount={amount}, action={action}")
+    
     # Check trade feasibility first for sell orders
     if action == 'sell':
         is_feasible, reason = await check_trade_feasibility(token_info, amount)
         if not is_feasible:
+            logger.error(f"Trade not feasible: {reason}")
             return False, f"Cannot execute trade: {reason}"
     
     # Retry configuration
