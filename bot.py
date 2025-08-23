@@ -4240,6 +4240,8 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
     'price': token_info.get('price_usd', 0),
     'tx_hash': str(tx_hash.value),  # Convert Signature to string
     'timestamp': datetime.now().isoformat(),
+    'buy_price': token_info.get('price_usd', 0) if action == 'buy' else None,
+    'sell_price': token_info.get('price_usd', 0) if action == 'sell' else None,
     'status': 'completed'
 }
 
@@ -4989,6 +4991,111 @@ async def monitor_portfolio_liquidity(context: ContextTypes.DEFAULT_TYPE):
                         "Critical Liquidity Alert"
                     )
 
+async def daily_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Calculate and display daily profit/loss"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "DAILY_PNL_REQUEST")
+    
+    if not await check_subscription(user_id):
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        await update.message.reply_text("🚫 No user data found.")
+        return
+        
+    # Get today's date
+    today = datetime.now().date()
+    today_start = datetime.combine(today, datetime.min.time())
+    today_end = datetime.combine(today, datetime.max.time())
+    
+    # Filter trades from today
+    trade_history = user.get('trade_history', [])
+    today_trades = [
+        trade for trade in trade_history 
+        if today_start <= datetime.fromisoformat(trade['timestamp']) <= today_end
+    ]
+    
+    if not today_trades:
+        await update.message.reply_text("📊 No trades executed today.")
+        return
+    
+    # Calculate P&L
+    total_pnl = 0
+    winning_trades = 0
+    losing_trades = 0
+    trade_details = []
+    
+    for trade in today_trades:
+        # Calculate profit/loss for this trade
+        if 'buy_price' in trade and 'sell_price' in trade:
+            # For completed trades (buy and sell)
+            investment = trade['amount'] * trade['buy_price']
+            returns = trade['amount'] * trade['sell_price']
+            pnl = returns - investment
+            pnl_percent = (pnl / investment) * 100 if investment > 0 else 0
+        elif 'buy_price' in trade:
+            # For open positions (only bought)
+            current_price = await get_current_price(trade.get('contract', ''))
+            if current_price:
+                investment = trade['amount'] * trade['buy_price']
+                current_value = trade['amount'] * current_price
+                pnl = current_value - investment
+                pnl_percent = (pnl / investment) * 100 if investment > 0 else 0
+                status = "OPEN"
+            else:
+                continue
+        else:
+            continue
+        
+        total_pnl += pnl
+        
+        if pnl > 0:
+            winning_trades += 1
+        elif pnl < 0:
+            losing_trades += 1
+            
+        trade_details.append({
+            'symbol': trade.get('symbol', 'UNKNOWN'),
+            'pnl': pnl,
+            'pnl_percent': pnl_percent,
+            'status': status if 'status' in locals() else 'CLOSED'
+        })
+    
+    # Generate report
+    report = f"📊 *Daily P&L Report - {today.strftime('%Y-%m-%d')}*\n\n"
+    report += f"• Total Trades: {len(today_trades)}\n"
+    report += f"• Winning Trades: {winning_trades}\n"
+    report += f"• Losing Trades: {losing_trades}\n"
+    report += f"• Win Rate: {(winning_trades/len(today_trades)*100):.1f}%\n\n"
+    report += f"• Total P&L: ${total_pnl:.2f}\n"
+    
+    # Add trade details
+    report += "\n*Trade Details:*\n"
+    for trade in trade_details:
+        emoji = "🟢" if trade['pnl'] > 0 else "🔴" if trade['pnl'] < 0 else "⚪"
+        report += f"{emoji} {trade['symbol']}: ${trade['pnl']:.2f} ({trade['pnl_percent']:+.1f}%) {trade['status']}\n"
+    
+    # Add performance summary
+    if total_pnl > 0:
+        report += "\n🎉 Great job! You're in profit today!"
+    elif total_pnl < 0:
+        report += "\n📉 You're down today. Review your strategy."
+    else:
+        report += "\n➖ Break-even day. No gains, no losses."
+    
+    await update.message.reply_text(report, parse_mode='Markdown')
+
+
+async def get_current_price(contract_address: str) -> Optional[float]:
+    """Get current price for a token"""
+    try:
+        token = await fetch_token_by_contract(contract_address)
+        return token['price_usd'] if token else None
+    except:
+        return None
+
 async def emergency_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual emergency sell command for illiquid tokens"""
     user_id = update.effective_user.id
@@ -5295,6 +5402,7 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("force_fetch", force_token_fetch))
     application.add_handler(CommandHandler("trade_status", trade_status))
     application.add_handler(CommandHandler("emergency_sell", emergency_sell))
+    application.add_handler(CommandHandler("daily_pnl", daily_pnl))
     #application.add_handler(CallbackQueryHandler(handle_token_button, pattern='^(buy|sell)_'))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("reset_tokens", reset_tokens))
@@ -5486,6 +5594,7 @@ async def setup_bot():
             BotCommand("start", "Start the bot and create or view wallet"),
             BotCommand("subscribe", "Subscribe to use trading features"),
             BotCommand("token_analysis", "Analyze performance of a specific token"),
+            BotCommand("daily_pnl", "Check today's profit/loss summary"),
             BotCommand("generate_wallet", "Generate a new wallet"),
             BotCommand("set_wallet", "Import an existing wallet"),
             BotCommand("fetch_tokens", "Manually fetch new tokens (requires wallet)"),
@@ -5495,6 +5604,7 @@ async def setup_bot():
             BotCommand("balance", "Check wallet balance"),
             BotCommand("transfer", "Transfer Solana tokens"),
             BotCommand("cancel", "Cancel current operation"),
+            BotCommand("emergencgy_sell", "Sell an illiquid token immediately"),
             BotCommand("trade_status", "Check trade system status"),
             BotCommand("debug", "Show debug information")
         ]
