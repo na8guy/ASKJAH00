@@ -4404,40 +4404,45 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     portfolio = user['portfolio']
     messages = []
     
-    for contract_address, position in portfolio.items():
-        # Get current token data
-        token = await fetch_token_by_contract(contract_address)
-        if not token:
-            continue
+    # Calculate total value with proper async handling
+    total_value = 0
+    for contract, pos in portfolio.items():
+        token = await fetch_token_by_contract(contract)
+        current_price = token['price_usd'] if token else pos['buy_price']
+        token_count = pos['amount'] / pos['buy_price']
+        position_value = token_count * current_price
+        total_value += position_value
+    
+
             
         # Calculate performance metrics
-        current_price = token['price_usd']
-        buy_price = position['buy_price']
+        
+        buy_price = pos['buy_price']
         price_change = ((current_price - buy_price) / buy_price) * 100
-        position_value = (position['amount'] / buy_price) * current_price
-        initial_investment = position['amount']
+       
+        initial_investment = pos['amount']
         pnl = position_value - initial_investment
         
         # Format position message
         message = (
-            f"📊 *{position['name']} ({position['symbol']})*\n\n"
+            f"📊 *{pos['name']} ({pos['symbol']})*\n\n"
             f"• Current Price: ${current_price:.8f}\n"
             f"• Your Buy Price: ${buy_price:.8f}\n"
             f"• Price Change: {price_change:+.2f}%\n"
             f"• Initial Investment: {initial_investment:.4f} SOL\n"
             f"• Current Value: {position_value:.4f} SOL\n"
             f"• P&L: {pnl:+.4f} SOL ({price_change:+.2f}%)\n\n"
-            f"🔗 Contract: `{contract_address}`"
+            f"🔗 Contract: `{contract}`"
         )
         
         # Create action buttons
         keyboard = [
             [
-                InlineKeyboardButton("💸 Sell", callback_data=f"sellpos_{contract_address}"),
-                InlineKeyboardButton("💰 Buy More", callback_data=f"buypos_{contract_address}")
+                InlineKeyboardButton("💸 Sell", callback_data=f"sellpos_{contract}"),
+                InlineKeyboardButton("💰 Buy More", callback_data=f"buypos_{contract}")
             ],
             [
-                InlineKeyboardButton("📈 View Chart", url=f"https://dexscreener.com/solana/{contract_address}")
+                InlineKeyboardButton("📈 View Chart", url=f"https://dexscreener.com/solana/{contract}")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
