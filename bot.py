@@ -49,7 +49,7 @@ try:
 except ImportError:
     raise ImportError("Missing 'cryptography' package. Install it with: pip install cryptography")
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date 
 import time
 import os
 from dotenv import load_dotenv
@@ -85,7 +85,7 @@ from textblob import TextBlob
 import matplotlib.pyplot as plt
 import io
 import seaborn as sns
-from datetime import datetime, date
+
 
 
 # Custom filter to add user_id to logs
@@ -4386,6 +4386,138 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(message, parse_mode='Markdown')
 
+
+async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all current positions with performance and action buttons"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "MY_POSITIONS_COMMAND")
+    
+    if not await check_subscription(user_id):
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user or 'portfolio' not in user or not user['portfolio']:
+        await update.message.reply_text("📭 You don't have any open positions.")
+        return
+    
+    portfolio = user['portfolio']
+    messages = []
+    
+    for contract_address, position in portfolio.items():
+        # Get current token data
+        token = await fetch_token_by_contract(contract_address)
+        if not token:
+            continue
+            
+        # Calculate performance metrics
+        current_price = token['price_usd']
+        buy_price = position['buy_price']
+        price_change = ((current_price - buy_price) / buy_price) * 100
+        position_value = (position['amount'] / buy_price) * current_price
+        initial_investment = position['amount']
+        pnl = position_value - initial_investment
+        
+        # Format position message
+        message = (
+            f"📊 *{position['name']} ({position['symbol']})*\n\n"
+            f"• Current Price: ${current_price:.8f}\n"
+            f"• Your Buy Price: ${buy_price:.8f}\n"
+            f"• Price Change: {price_change:+.2f}%\n"
+            f"• Initial Investment: {initial_investment:.4f} SOL\n"
+            f"• Current Value: {position_value:.4f} SOL\n"
+            f"• P&L: {pnl:+.4f} SOL ({price_change:+.2f}%)\n\n"
+            f"🔗 Contract: `{contract_address}`"
+        )
+        
+        # Create action buttons
+        keyboard = [
+            [
+                InlineKeyboardButton("💸 Sell", callback_data=f"sellpos_{contract_address}"),
+                InlineKeyboardButton("💰 Buy More", callback_data=f"buypos_{contract_address}")
+            ],
+            [
+                InlineKeyboardButton("📈 View Chart", url=f"https://dexscreener.com/solana/{contract_address}")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Send message with token image if available
+        try:
+            if token.get('image'):
+                messages.append(await update.message.reply_photo(
+                    photo=token['image'],
+                    caption=message,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                ))
+            else:
+                messages.append(await update.message.reply_text(
+                    message,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                ))
+        except Exception as e:
+            logger.error(f"Error sending position info: {str(e)}")
+            messages.append(await update.message.reply_text(
+                message,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            ))
+    
+    # Add summary message
+    total_investment = sum(pos['amount'] for pos in portfolio.values())
+    total_value = sum((pos['amount'] / pos['buy_price']) * 
+                     (await fetch_token_by_contract(contract) or {'price_usd': pos['buy_price']})['price_usd'] 
+                     for contract, pos in portfolio.items())
+    total_pnl = total_value - total_investment
+    total_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
+    
+    summary = (
+        f"📈 *Portfolio Summary*\n\n"
+        f"• Total Positions: {len(portfolio)}\n"
+        f"• Total Investment: {total_investment:.4f} SOL\n"
+        f"• Current Value: {total_value:.4f} SOL\n"
+        f"• Total P&L: {total_pnl:+.4f} SOL ({total_pnl_percent:+.2f}%)"
+    )
+    
+    await update.message.reply_text(summary, parse_mode='Markdown')
+
+
+async def handle_position_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle position action buttons (sell/buy more)"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    action, contract_address = query.data.split('_', 1)
+    
+    # Remove buttons from original message
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as e:
+        logger.warning(f"Couldn't remove buttons: {str(e)}")
+    
+    # Get token info
+    token = await fetch_token_by_contract(contract_address)
+    if not token:
+        await query.message.reply_text("❌ Could not fetch token data.")
+        return
+    
+    context.user_data['current_token'] = token
+    
+    if action == 'sellpos':
+        await query.message.reply_text(
+            f"💸 Selling {token['name']}\n\n"
+            f"Enter amount to sell (in SOL worth):"
+        )
+        return SELL_AMOUNT
+    elif action == 'buypos':
+        await query.message.reply_text(
+            f"💰 Buying More {token['name']}\n\n"
+            f"Enter additional amount to buy (in SOL):"
+        )
+        return BUY_AMOUNT
+
 async def execute_transfer(user_id, recipient, token_contract, amount, chain):
     """Execute a token transfer"""
     if chain != 'solana':
@@ -4556,50 +4688,141 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             "Auto-Trade System Failure"
         )
 
-
-async def generate_pnl_image(trade_details: List[Dict], total_pnl: float, overall_pnl_percent: float) -> io.BytesIO:
-    """Generate a professional PnL image for sharing"""
-    # Create figure
-    plt.figure(figsize=(10, 8))
+async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, win_rate: float) -> io.BytesIO:
+    """Generate a marketing-friendly PnL image with bold text and X multiples"""
+    # Create figure with attractive design
+    plt.figure(figsize=(8, 6))
     plt.style.use('dark_background')
     
-    # Create data for chart
-    symbols = [t['symbol'] for t in trade_details]
-    pnls = [t['pnl'] for t in trade_details]
-    colors = ['green' if pnl >= 0 else 'red' for pnl in pnls]
-    
-    # Create bar chart
-    plt.subplot(2, 1, 1)
-    bars = plt.bar(symbols, pnls, color=colors, alpha=0.7)
-    plt.ylabel('P&L (SOL)')
-    plt.title('Daily Trading Performance')
-    
-    # Add value labels on bars
-    for bar, pnl in zip(bars, pnls):
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2., height,
-                f'{pnl:+.2f} SOL', ha='center', va='bottom' if pnl >= 0 else 'top')
-    
-    # Create summary section
-    plt.subplot(2, 1, 2)
+    # Remove axes
     plt.axis('off')
     
-    summary_text = (
-        f"Total P&L: ${total_pnl:+.2f}\n"
-        f"Return: {overall_pnl_percent:+.2f}%\n"
-        f"Trades: {len(trade_details)}\n"
-        f"Date: {date.today().strftime('%Y-%m-%d')}\n\n"
-        "Powered by Crypto Trading Bot"
-    )
+    # Calculate the multiple (X)
+    multiple = (overall_pnl_percent / 100) + 1
     
-    plt.text(0.5, 0.5, summary_text, ha='center', va='center', 
-             fontsize=14, bbox=dict(boxstyle="round,pad=1", facecolor="black", alpha=0.7))
+    # Determine sentiment emoji and color
+    if overall_pnl_percent >= 100:
+        emoji = "🚀"
+        color = "#00FF00"  # Bright green
+    elif overall_pnl_percent >= 50:
+        emoji = "🔥"
+        color = "#FFA500"  # Orange
+    elif overall_pnl_percent >= 10:
+        emoji = "👍"
+        color = "#FFFF00"  # Yellow
+    elif overall_pnl_percent >= 0:
+        emoji = "📈"
+        color = "#ADD8E6"  # Light blue
+    else:
+        emoji = "📉"
+        color = "#FF0000"  # Red
+    
+    # Create the text content
+    text_content = [
+        ("ASKJAH", 30, "#FFFFFF", "bold"),
+        ("\nDAILY PERFORMANCE\n", 24, "#FFFFFF", "bold"),
+        (f"\n{emoji} {overall_pnl_percent:+.1f}% {emoji}", 36, color, "bold"),
+        (f"\n\n{multiple:.1f}X RETURN", 28, color, "bold"),
+        (f"\n\nWIN RATE: {win_rate:.1f}%", 20, "#FFFFFF", "normal"),
+        (f"\n\nP&L: ${total_pnl:+.2f}", 20, "#FFFFFF", "normal"),
+        ("\n\nTRADING MADE EASIER", 18, "#FFFFFF", "italic"),
+        ("\n\n@AskJahBot", 16, "#CCCCCC", "normal")
+    ]
+    
+    # Calculate total height needed
+    total_height = sum(size * 0.02 for text, size, color, weight in text_content)
+    
+    # Add text elements
+    y_position = 0.9
+    for text, size, color, weight in text_content:
+        plt.text(0.5, y_position, text, 
+                ha='center', va='center', 
+                fontsize=size, color=color, 
+                weight=weight,
+                transform=plt.gca().transAxes)
+        y_position -= (size * 0.02)  # Adjust vertical spacing based on font size
+    
+    # Try to add logo if available
+    try:
+        logo_path = "askjah_logo.png"  # Update this path to your actual logo file
+        if os.path.exists(logo_path):
+            logo_img = plt.imread(logo_path)
+            # Add logo to the top of the image
+            logo_ax = plt.axes([0.4, 0.85, 0.2, 0.1])  # [left, bottom, width, height]
+            logo_ax.imshow(logo_img)
+            logo_ax.axis('off')
+    except Exception as e:
+        logger.warning(f"Could not add logo to image: {str(e)}")
     
     plt.tight_layout()
     
     # Save to bytes buffer
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor='#000000')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
+
+
+async def generate_pnl_image(trade_details: List[Dict], total_pnl: float, overall_pnl_percent: float) -> io.BytesIO:
+    """Generate a simple text-based performance image without graphs"""
+    # Create figure
+    plt.figure(figsize=(10, 8))
+    plt.style.use('dark_background')
+    plt.axis('off')
+    
+    # Calculate the multiple (X)
+    multiple = (overall_pnl_percent / 100) + 1
+    
+    # Create the main text content
+    text_content = [
+        ("ASKJAH TRADING PERFORMANCE", 24, "#FFFFFF", "bold"),
+        (f"\nTOTAL RETURN: {overall_pnl_percent:+.1f}%", 28, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold"),
+        (f"\n{multiple:.1f}X YOUR CAPITAL", 22, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold"),
+        (f"\n\nTOTAL P&L: ${total_pnl:+.2f}", 20, "#FFFFFF", "normal"),
+        ("\n\nTOP PERFORMERS:", 18, "#FFFFFF", "bold")
+    ]
+    
+    # Add top 3 performing trades
+    top_trades = sorted(trade_details, key=lambda x: x['pnl_percent'], reverse=True)[:3]
+    for i, trade in enumerate(top_trades):
+        trade_multiple = (trade['pnl_percent'] / 100) + 1
+        text_content.append(
+            (f"\n{i+1}. {trade['symbol']}: {trade['pnl_percent']:+.1f}% ({trade_multiple:.1f}X)", 
+             16, "#00FF00" if trade['pnl_percent'] >= 0 else "#FF0000", "normal")
+        )
+    
+    text_content.append(("\n\nTRADING MADE EASIER", 16, "#FFFFFF", "italic"))
+    text_content.append(("\n@AskJahBot", 14, "#CCCCCC", "normal"))
+    
+    # Add all text elements
+    y_position = 0.95
+    for text, size, color, weight in text_content:
+        plt.text(0.5, y_position, text, 
+                ha='center', va='top', 
+                fontsize=size, color=color, 
+                weight=weight,
+                transform=plt.gca().transAxes)
+        y_position -= (size * 0.015)  # Adjust vertical spacing
+    
+    # Try to add logo if available
+    try:
+        logo_path = "askjah_logo.png"  # Update this path to your actual logo file
+        if os.path.exists(logo_path):
+            logo_img = plt.imread(logo_path)
+            # Add logo to the top of the image
+            logo_ax = plt.axes([0.4, 0.9, 0.2, 0.1])  # [left, bottom, width, height]
+            logo_ax.imshow(logo_img)
+            logo_ax.axis('off')
+    except Exception as e:
+        logger.warning(f"Could not add logo to image: {str(e)}")
+    
+    plt.tight_layout()
+    
+    # Save to bytes buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor='#000000')
     buf.seek(0)
     plt.close()
     
@@ -5659,6 +5882,10 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("emergency_sell", emergency_sell))
     application.add_handler(CommandHandler("daily_pnl", daily_pnl))
     application.add_handler(CommandHandler("share_pnl", share_pnl))
+    application.add_handler(CommandHandler("mypositions", mypositions))
+    
+    # Add position actions handler
+    application.add_handler(CallbackQueryHandler(handle_position_actions, pattern='^(sellpos|buypos)_'))
     #application.add_handler(CallbackQueryHandler(handle_token_button, pattern='^(buy|sell)_'))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("reset_tokens", reset_tokens))
@@ -5851,7 +6078,8 @@ async def setup_bot():
             BotCommand("subscribe", "Subscribe to use trading features"),
             BotCommand("token_analysis", "Analyze performance of a specific token"),
             BotCommand("daily_pnl", "Check today's profit/loss summary"),
-              BotCommand("share_pnl", "Share a marketing-friendly PnL image"),
+            BotCommand("mypositions", "View your current positions and performance"),
+            BotCommand("share_pnl", "Share your trading performance in a simple format"),
             BotCommand("generate_wallet", "Generate a new wallet"),
             BotCommand("set_wallet", "Import an existing wallet"),
             BotCommand("fetch_tokens", "Manually fetch new tokens (requires wallet)"),
