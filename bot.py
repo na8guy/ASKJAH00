@@ -3231,11 +3231,20 @@ async def force_token_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Token fetch triggered. You should receive tokens shortly.")
 
 async def handle_token_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle buy/sell button clicks on token messages"""
+    """Handle buy/sell button clicks on token messages and positions"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    action, contract_address = query.data.split('_', 1)
+    data_parts = query.data.split('_', 1)
+    action = data_parts[0]
+    contract_address = data_parts[1] if len(data_parts) > 1 else ''
+    
+    # Map position actions to standard actions
+    if action == 'buypos':
+        action = 'buy'
+    elif action == 'sellpos':
+        action = 'sell'
+    
     log_user_action(user_id, "TOKEN_BUTTON_CLICKED", f"{action} {contract_address}")
     
     try:
@@ -3259,19 +3268,17 @@ async def handle_token_button(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode='Markdown'
         )
         return BUY_AMOUNT
-    else:
+    else:  # sell
         user = users_collection.find_one({'user_id': user_id})
         portfolio = user.get('portfolio', {})
         if contract_address not in portfolio:
             await query.message.reply_text(f"❌ You don't hold any {token['name']} tokens to sell.")
             return ConversationHandler.END
             
-        # Calculate available token count from SOL investment and buy price
         token_data = portfolio[contract_address]
         buy_price = token_data['buy_price']
         sol_invested = token_data['amount']
         
-        # Calculate token count: token_count = SOL_invested / buy_price
         available_tokens = sol_invested / buy_price
         
         await query.message.reply_text(
@@ -4698,77 +4705,85 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             "Auto-Trade System Failure"
         )
 
-async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, win_rate: float, trade_details: List[Dict], username: str) -> io.BytesIO:
-    """Generate a marketing-friendly PnL image with graphs and username"""
-    # Create figure with attractive design
-    plt.figure(figsize=(12, 8))
-    plt.style.use('dark_background')
+async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, trade_details: List[Dict], username: str) -> io.BytesIO:
+    """Generate a marketing-friendly PnL image with custom background"""
+    # Create figure with custom background
+    plt.figure(figsize=(10, 8))
     
-    # Create donut chart for win rate
-    plt.subplot(1, 2, 1)
-    sizes = [win_rate, 100 - win_rate]
-    labels = ['Wins', 'Losses']
-    explode = (0.1, 0)
-    colors = ['#00FF00', '#FF0000']
-    plt.pie(sizes, explode=explode, labels=labels, colors=colors,
-            autopct='%1.1f%%', shadow=True, startangle=90)
-    centre_circle = plt.Circle((0,0),0.70,fc='black')
-    fig = plt.gcf()
-    fig.gca().add_artist(centre_circle)
-    plt.axis('equal')
-    plt.title('Win Rate', fontsize=16, fontweight='bold')
+    # Load custom background image (replace with your image path)
+    try:
+        bg_image = plt.imread('askjahback.png')
+        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
+    except:
+        # Fallback to dark background if custom image not found
+        plt.style.use('dark_background')
     
-    # Create summary section
-    plt.subplot(1, 2, 2)
     plt.axis('off')
     
+    # Calculate profit multiple
     multiple = (overall_pnl_percent / 100) + 1
     
-    # Determine color based on performance
-    color = "#00FF00" if overall_pnl_percent >= 0 else "#FF0000"
+    # Get current date
+    current_date = datetime.now().strftime('%Y-%m-%d')
     
-    summary_text = (
-        f"ASKJAH TRADING PERFORMANCE\n\n"
-        f"TOTAL RETURN: {overall_pnl_percent:+.1f}%\n"
-        f"{multiple:.1f}X YOUR CAPITAL\n\n"
-        f"TOTAL P&L: ${total_pnl:+.2f}\n\n"
-        f"TOP PERFORMERS:\n"
-    )
+    # Prepare text content
+    text_elements = [
+        ("TRADING PERFORMANCE SUMMARY", 20, "#FFFFFF", "bold"),
+        (f"Total Return: {overall_pnl_percent:+.1f}%", 18, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold"),
+        (f"Profit Multiple: {multiple:.2f}x", 16, "#FFFFFF", "normal"),
+        ("", 12, "#FFFFFF", "normal"),  # Spacer
+        ("TOP PERFORMING TRADES:", 16, "#FFFFFF", "bold")
+    ]
     
-    # Add top 3 performing trades
+    # Add top 3 trades
     top_trades = sorted(trade_details, key=lambda x: x['pnl_percent'], reverse=True)[:3]
     for i, trade in enumerate(top_trades):
-        trade_multiple = (trade['pnl_percent'] / 100) + 1
-        summary_text += (
-            f"{i+1}. {trade['symbol']}: {trade['pnl_percent']:+.1f}% "
-            f"({trade_multiple:.1f}X)\n"
+        trade_color = "#00FF00" if trade['pnl_percent'] >= 0 else "#FF0000"
+        text_elements.append(
+            (f"{i+1}. {trade['symbol']}: {trade['pnl_percent']:+.1f}%", 
+             14, trade_color, "normal")
         )
     
-    summary_text += (
-        f"\nTRADING MADE EASIER\n"
-        f"@{username}"
-    )
+    # Add attribution
+    text_elements.extend([
+        ("", 12, "#FFFFFF", "normal"),  # Spacer
+        (f"Generated for @{username}", 12, "#CCCCCC", "italic"),
+        (f"Date: {current_date}", 12, "#CCCCCC", "italic")
+    ])
     
-    plt.text(0.05, 0.95, summary_text, ha='left', va='top', 
-             fontsize=14, color="#FFFFFF", 
-             bbox=dict(boxstyle="round,pad=0.5", facecolor="#1E1E1E", alpha=0.8))
+    # Add all text elements
+    y_position = 0.9
+    for text, size, color, weight in text_elements:
+        plt.text(0.5, y_position, text, 
+                ha='center', va='center', 
+                fontsize=size, color=color, 
+                weight=weight,
+                transform=plt.gca().transAxes)
+        y_position -= 0.07
     
     plt.tight_layout()
     
     # Save to bytes buffer
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#000000')
+    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
     buf.seek(0)
     plt.close()
     
     return buf
 
 
+
 async def generate_pnl_image(trade_details: List[Dict], total_pnl: float, overall_pnl_percent: float) -> io.BytesIO:
     """Generate a simple text-based performance image without graphs"""
     # Create figure
     plt.figure(figsize=(10, 8))
-    plt.style.use('dark_background')
+    try:
+        bg_image = plt.imread('askjahback.png')
+        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
+    except:
+        # Fallback to dark background if custom image not found
+        plt.style.use('dark_background')
+    
     plt.axis('off')
     
     multiple = (overall_pnl_percent / 100) + 1
@@ -4791,7 +4806,7 @@ async def generate_pnl_image(trade_details: List[Dict], total_pnl: float, overal
         )
     
     text_content.append(("\n\nTRADING MADE EASIER", 16, "#FFFFFF", "normal", "italic"))
-    text_content.append(("\n@AskJahBot", 14, "#CCCCCC", "normal", "normal"))
+    text_content.append(("\n@ASKJAH_BOT", 14, "#CCCCCC", "normal", "normal"))
     
     # Add all text elements
     y_position = 0.95
@@ -4819,7 +4834,14 @@ async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: fl
     """Generate a marketing-friendly PnL image for sharing"""
     # Create figure with attractive design
     plt.figure(figsize=(8, 6))
-    plt.style.use('dark_background')
+    try:
+        bg_image = plt.imread('askjahback.png')
+        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
+    except:
+        # Fallback to dark background if custom image not found
+        plt.style.use('dark_background')
+    
+    plt.axis('off')
     
     # Create a simple, attractive design
     colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#F9C80E']
@@ -4850,8 +4872,8 @@ async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: fl
         f"{emoji} Daily Performance {emoji}\n\n"
         f"Return: {overall_pnl_percent:+.1f}%\n"
         f"P&L: ${total_pnl:+.2f}\n\n"
-        "Powered by AI Trading Bot\n"
-        "Join: t.me/yourbottoken"
+        "Powered by @ASKJAH_BOT\n"
+        "Join: t.me/ASKJAH_BOT"
     )
     
     plt.text(0.5, 0.5, summary_text, ha='center', va='center', 
