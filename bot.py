@@ -103,7 +103,7 @@ file_handler.addFilter(UserFilter())
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - User:%(user_id)s - %(message)s',
     handlers=[stream_handler, file_handler]
 )
@@ -150,6 +150,7 @@ MAX_TOP_HOLDER_PERCENT = 25  # Maximum % a single wallet can hold
 RPC_RETRY_DELAY = 3  # seconds between RPC retries
 MAX_RPC_RETRIES = 5  # maximum RPC retry attempts
 TWITTER_ENABLED = False  # disable Twitter until properly configured
+MIN_ACTIVE_LIQUIDITY = 500
 
 
 # Bot states for conversation
@@ -159,7 +160,7 @@ TWITTER_ENABLED = False  # disable Twitter until properly configured
  SELECT_TOKEN_ACTION, SELL_AMOUNT, INPUT_CONTRACT,
  # New states for start flow
  START_IMPORT_METHOD, START_INPUT_MNEMONIC, START_INPUT_PRIVATE_KEY,SUBSCRIPTION_CONFIRMATION,INPUT_ANALYSIS_CONTRACT,SET_ANTI_MEV, SET_LIQUIDITY_THRESHOLD, SET_VOLUME_THRESHOLD, SET_RUG_CHECK, 
- SET_MAX_SLIPPAGE, SET_MAX_GAS_PRICE, SET_TOKEN_AGE,SET_PROFIT_STRATEGY, SET_CUSTOM_PROFIT_TARGETS, CONFIRM_HIGH_RISK_LOSS,REVIEW_CONFIG) = range(35)
+ SET_MAX_SLIPPAGE, SET_MAX_GAS_PRICE, SET_TOKEN_AGE,SET_PROFIT_STRATEGY, SET_CUSTOM_PROFIT_TARGETS, CONFIRM_HIGH_RISK_LOSS,REVIEW_CONFIG,SET_MAX_POSITIONS) = range(36)
 
 # Create FastAPI app
 app = FastAPI()
@@ -1723,6 +1724,14 @@ async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
                 text="❌ Wallet setup incomplete. Please use /set_wallet to complete wallet setup."
             )
             return
+
+        context.job_queue.run_repeating(
+        cleanup_illiquid_positions,
+        interval=3600,
+        first=60,
+        user_id=user_id,
+        name=f"cleanup_illiquid_{user_id}"
+    )
         
         # Remove any existing jobs for this user
         for job in context.job_queue.jobs():
@@ -1743,6 +1752,15 @@ async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
             
     except Exception as e:
         logger.error(f"🔥 [start_token_updates] Error: {str(e)}", exc_info=True)
+
+
+async def is_position_active(contract_address: str) -> bool:
+    """Check if a position has sufficient liquidity to be considered active"""
+    token = await fetch_token_by_contract(contract_address)
+    if token and token.get('liquidity', 0) >= MIN_ACTIVE_LIQUIDITY:
+        return True
+    return False
+
 
 async def check_conversation_timeout(context: ContextTypes.DEFAULT_TYPE):
     """Check if conversation has timed out and resume token updates"""
@@ -1831,6 +1849,8 @@ async def check_trade_feasibility(token: Dict[str, Any], trade_amount_sol: float
     Check if a trade is feasible based on liquidity and market conditions.
     Returns (is_feasible, reason)
     """
+
+    
     # Calculate approximate trade size in USD
     trade_size_usd = trade_amount_sol * 150  # Approximate SOL price
     
@@ -1851,6 +1871,7 @@ async def check_trade_feasibility(token: Dict[str, Any], trade_amount_sol: float
         return False, f"Low volume (${token['volume']} < $1000)"
     
     return True, "Trade is feasible"
+   
 
 async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle subscription confirmation and execute SOL payment"""
@@ -3100,7 +3121,7 @@ async def set_max_gas_price(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return SET_MAX_GAS_PRICE
 
 async def set_token_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Set minimum token age and show final configuration review"""
+    """Set minimum token age and then ask for max positions"""
     user_id = update.effective_user.id
     
     try:
@@ -3115,10 +3136,35 @@ async def set_token_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         log_user_action(user_id, "MIN_TOKEN_AGE_SET", f"{min_age} minutes")
         
-        # Get the complete configuration for review
-        user = users_collection.find_one({'user_id': user_id})
+        # Now ask for maximum positions
+        await update.message.reply_text(
+            "🔢 Set the maximum number of open positions (e.g., 5):\n\n"
+            "This limits how many different tokens you'll hold at once."
+        )
+        return SET_MAX_POSITIONS
         
-        # Generate configuration summary
+    except ValueError:
+        await update.message.reply_text("❌ Invalid number. Please enter a number.")
+        return SET_TOKEN_AGE
+
+async def set_max_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set the maximum number of open positions"""
+    user_id = update.effective_user.id
+    
+    try:
+        max_positions = int(update.message.text)
+        if max_positions < 1 or max_positions > 20:
+            await update.message.reply_text("❌ Maximum positions should be between 1 and 20.")
+            return SET_MAX_POSITIONS
+        
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'max_positions': max_positions}}
+        )
+        log_user_action(user_id, "MAX_POSITIONS_SET", f"{max_positions}")
+        
+        # Continue to the configuration review
+        user = users_collection.find_one({'user_id': user_id})
         config_summary = generate_config_summary(user)
         
         keyboard = [
@@ -3135,8 +3181,8 @@ async def set_token_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return REVIEW_CONFIG
         
     except ValueError:
-        await update.message.reply_text("❌ Invalid number. Please enter a number.")
-        return SET_TOKEN_AGE
+        await update.message.reply_text("❌ Invalid number. Please enter a whole number.")
+        return SET_MAX_POSITIONS
 
 def generate_config_summary(user):
     """Generate a comprehensive summary of the auto-trading configuration"""
@@ -3150,6 +3196,7 @@ def generate_config_summary(user):
         f"• Min volume: ${user.get('min_volume', 500):,.2f}\n"
         f"• Min token age: {user.get('min_token_age', 10)} minutes\n"
         f"• Max slippage: {user.get('max_slippage', 5)}%\n"
+        f"• Max positions: {user.get('max_positions', MAX_POSITIONS)}\n"
         f"• Max gas: {user.get('max_gas_price', 0.0005)} SOL\n"
         f"• Rug check: {'Yes' if user.get('rug_check', False) else 'No'}\n"
         f"• Anti-MEV: {'Yes' if user.get('anti_mev', False) else 'No'}\n\n"
@@ -4691,6 +4738,9 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Calculate total value asynchronously
     total_value = 0.0
+    liquid_positions = 0
+    illiquid_positions = 0
+    
     for contract, pos in portfolio.items():
         token = await fetch_token_by_contract(contract)
         current_price = token['price_usd'] if token else pos['buy_price']
@@ -4698,15 +4748,24 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         position_value = token_count * current_price
         total_value += position_value
         
+        # Check if position is active (has sufficient liquidity)
+        is_active = await is_position_active(contract)
+        status = "✅" if is_active else "❌ (Illiquid)"
+        
+        if is_active:
+            liquid_positions += 1
+        else:
+            illiquid_positions += 1
+        
         # Calculate performance metrics
         buy_price = pos['buy_price']
         price_change = ((current_price - buy_price) / buy_price) * 100
         initial_investment = pos['amount']
         pnl = position_value - initial_investment
         
-        # Format position message
+        # Format position message with liquidity status
         message = (
-            f"📊 *{pos['name']} ({pos['symbol']})*\n\n"
+            f"{status} *{pos['name']} ({pos['symbol']})*\n\n"
             f"• Current Price: ${current_price:.8f}\n"
             f"• Your Buy Price: ${buy_price:.8f}\n"
             f"• Price Change: {price_change:+.2f}%\n"
@@ -4716,21 +4775,31 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔗 Contract: `{contract}`"
         )
         
-        # Create action buttons
-        keyboard = [
-            [
-                InlineKeyboardButton("💸 Sell", callback_data=f"sellpos_{contract}"),
-                InlineKeyboardButton("💰 Buy More", callback_data=f"buypos_{contract}")
-            ],
-            [
-                InlineKeyboardButton("📈 View Chart", url=f"https://dexscreener.com/solana/{contract}")
+        # Only show action buttons for liquid positions
+        keyboard = []
+        if is_active:
+            keyboard = [
+                [
+                    InlineKeyboardButton("💸 Sell", callback_data=f"sellpos_{contract}"),
+                    InlineKeyboardButton("💰 Buy More", callback_data=f"buypos_{contract}")
+                ],
+                [
+                    InlineKeyboardButton("📈 View Chart", url=f"https://dexscreener.com/solana/{contract}")
+                ]
             ]
-        ]
+        else:
+            keyboard = [
+                [
+                    InlineKeyboardButton("🗑️ Remove", callback_data=f"remove_{contract}"),
+                    InlineKeyboardButton("📈 View Chart", url=f"https://dexscreener.com/solana/{contract}")
+                ]
+            ]
+            
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         # Send message with token image if available
         try:
-            if token.get('image'):
+            if token and token.get('image'):
                 messages.append(await update.message.reply_photo(
                     photo=token['image'],
                     caption=message,
@@ -4751,7 +4820,7 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=reply_markup
             ))
     
-    # Add summary message
+    # Add summary message with liquidity breakdown
     total_investment = sum(pos['amount'] for pos in portfolio.values())
     total_pnl = total_value - total_investment
     total_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
@@ -4759,13 +4828,36 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = (
         f"📈 *Portfolio Summary*\n\n"
         f"• Total Positions: {len(portfolio)}\n"
+        f"• Liquid Positions: {liquid_positions}\n"
+        f"• Illiquid Positions: {illiquid_positions}\n"
         f"• Total Investment: {total_investment:.4f} SOL\n"
         f"• Current Value: {total_value:.4f} SOL\n"
-        f"• Total P&L: {total_pnl:+.4f} SOL ({total_pnl_percent:+.2f}%)"
+        f"• Total P&L: {total_pnl:+.4f} SOL ({total_pnl_percent:+.2f}%)\n\n"
+        f"ℹ️ Illiquid positions (❌) have less than ${MIN_ACTIVE_LIQUIDITY} in liquidity."
     )
     
     await update.message.reply_text(summary, parse_mode='Markdown')
 
+async def handle_remove_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle removal of illiquid positions"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    contract_address = query.data.split('_', 1)[1]
+    
+    # Remove the position from the portfolio
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$unset': {f'portfolio.{contract_address}': ""}}
+    )
+    
+    # Update the message to show it was removed
+    await query.edit_message_text(
+        f"🗑️ Removed illiquid position from your portfolio.",
+        parse_mode='Markdown'
+    )
+    
+    log_user_action(user_id, "POSITION_REMOVED", contract_address)
 
 async def handle_position_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle position action buttons (sell/buy more)"""
@@ -4839,6 +4931,35 @@ async def notify_trial_ending(context: ContextTypes.DEFAULT_TYPE):
             )
             log_user_action(user_id, "TRIAL_ENDING_NOTIFICATION")
 
+async def cleanup_illiquid_positions(context: ContextTypes.DEFAULT_TYPE):
+    """Remove illiquid positions from the portfolio"""
+    user_id = context.job.user_id
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        return
+    
+    portfolio = user.get('portfolio', {})
+    illiquid_tokens = []
+    for contract, position in portfolio.items():
+        if not await is_position_active(contract):
+            illiquid_tokens.append(contract)
+    
+    for contract in illiquid_tokens:
+        # Remove from portfolio
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$unset': {f'portfolio.{contract}': ""}}
+        )
+        logger.info(f"Removed illiquid position {contract} for user {user_id}")
+        # Notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🧹 Removed illiquid position: {position.get('name', 'Unknown')} (${position.get('liquidity', 0):.2f} liquidity)"
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user {user_id} about cleanup: {str(e)}")
+
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, token: Dict[str, Any] = None):
     """Handle automatic trading with enhanced decision logging"""
     logger.info(f"🤖 Auto-trading for user {user_id}")
@@ -4858,10 +4979,22 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             logger.debug(f"Auto-trade cooldown active for user {user_id}")
             return
         
+        if token['contract_address'] in user.get('auto_trade_blacklist', []):
+         logger.info(f"Token {token['name']} is blacklisted")
+        
+        user_max_positions = user.get('max_positions', MAX_POSITIONS)
         # Check maximum open positions
         portfolio = user.get('portfolio', {})
-        if len(portfolio) >= MAX_POSITIONS:
-            logger.debug(f"Max positions ({MAX_POSITIONS}) reached for user {user_id}")
+        liquid_positions = 0
+    
+        for contract, position in portfolio.items():
+        # Check if the position has sufficient liquidity
+            token_data = await fetch_token_by_contract(contract)
+            if token_data and token_data.get('liquidity', 0) >= MIN_SAFE_LIQUIDITY:
+              liquid_positions += 1
+    
+        if liquid_positions >= user_max_positions:
+            logger.debug(f"Max liquid positions ({user_max_positions}) reached for user {user_id}")
             return
             
         # Check circuit breaker (daily loss limit)
@@ -4975,6 +5108,8 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             
             if best_token:
                 await execute_auto_buy(context, user_id, best_token, buy_amount)
+
+        logger.info(f"Token {token['name']} safety check: {is_safe}, reason: {reason}")
         
     except Exception as e:
         logger.error(f"Auto-trade error for user {user_id}: {str(e)}")
@@ -5953,7 +6088,7 @@ def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]
         
         # Calculate Rate of Change (ROC) as a momentum indicator
         roc = ((price_history[-1] - price_history[-5]) / price_history[-5]) * 100 if len(price_history) >= 5 else 0
-        
+        logger.info(f"RSI: {rsi}, SMA5: {sma_5}, SMA15: {sma_15}")
         return {
             'rsi': rsi,
             'sma_5': sma_5,
@@ -5964,6 +6099,8 @@ def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]
             'overbought': rsi > 70,  # RSI_OVERBOUGHT
             'positive_momentum': roc > 5,  # 5% price increase in 5 periods
         }
+
+         
     except Exception as e:
         logger.error(f"Error calculating indicators: {str(e)}")
         return {}
@@ -6027,6 +6164,39 @@ async def fetch_holder_info(contract_address: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Failed to fetch holder info from Moralis: {str(e)}")
     return None
+
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View and update auto-trading settings"""
+    user_id = update.effective_user.id
+    user = users_collection.find_one({'user_id': user_id})
+    
+    if not user:
+        await update.message.reply_text("❌ No user data found.")
+        return
+    
+    if context.args:
+        # Update settings if arguments provided
+        try:
+            new_max_positions = int(context.args[0])
+            if new_max_positions < 1 or new_max_positions > 20:
+                await update.message.reply_text("❌ Maximum positions should be between 1 and 20.")
+                return
+                
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {'max_positions': new_max_positions}}
+            )
+            await update.message.reply_text(f"✅ Maximum positions updated to {new_max_positions}.")
+        except ValueError:
+            await update.message.reply_text("❌ Please provide a valid number.")
+    else:
+        # Show current settings
+        current_max = user.get('max_positions', MAX_POSITIONS)
+        await update.message.reply_text(
+            f"Current maximum positions: {current_max}\n\n"
+            f"To change, use: /settings <number>\n"
+            f"Example: /settings 7"
+        )
 
 async def jupiter_api_call(url, params=None, json_data=None, method="GET"):
     """Helper function for Jupiter API calls with retry logic"""
@@ -6170,6 +6340,8 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("daily_pnl", daily_pnl))
     application.add_handler(CommandHandler("share_pnl", share_pnl))
     application.add_handler(CommandHandler("mypositions", mypositions))
+    application.add_handler(CommandHandler("settings", settings))
+    application.add_handler(CallbackQueryHandler(handle_remove_position, pattern='^remove_'))
     
     # Add position actions handler
     application.add_handler(CallbackQueryHandler(handle_position_actions, pattern='^(sellpos|buypos)_'))
@@ -6276,6 +6448,8 @@ def setup_handlers(application: Application):
                                     wrap_conversation_state(set_anti_mev))],
         SET_LIQUIDITY_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
                                                wrap_conversation_state(set_liquidity_threshold))],
+        SET_MAX_POSITIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                 wrap_conversation_state(set_max_positions))],
         SET_VOLUME_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
                                             wrap_conversation_state(set_volume_threshold))],
         SET_RUG_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
@@ -6452,6 +6626,7 @@ async def on_startup():
             first=10,
             name="sol_payment_verification"
         )
+        
         telegram_app.job_queue.run_repeating(
             update_token_performance,
             interval=3600,
