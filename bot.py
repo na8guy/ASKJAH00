@@ -1163,10 +1163,16 @@ async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error updating performance for {contract_address}: {str(e)}")
 
 def calculate_price_change(token, current_data):
-    """Calculate price change percentage with precision"""
-    initial_price = token['initial_metrics']['price']
-    current_price = current_data['price_usd']
-    return ((current_price - initial_price) / initial_price) * 100 
+    """Calculate price change percentage with None value handling"""
+    initial_price = token['initial_metrics'].get('price')
+    current_price = current_data.get('price_usd')
+    
+    # Handle None values
+    if initial_price is None or current_price is None:
+        logger.warning(f"Missing price data for token {token.get('contract_address')}")
+        return 0  # Return 0% change if data is missing
+    
+    return ((current_price - initial_price) / initial_price) * 100
 
 
 def calculate_liquidity_health(token, current_data):
@@ -1191,12 +1197,20 @@ def calculate_liquidity_health(token, current_data):
 
 
 def calculate_volatility(token, current_data):
-    """Calculate volatility based on price history"""
-    if len(token['performance_history']) < 2:
+    """Calculate volatility with None value handling"""
+    if len(token.get('performance_history', [])) < 2:
         return 0
     
-    prices = [p['price'] for p in token['performance_history']]
-    prices.append(current_data['price_usd'])
+    prices = [p.get('price', 0) for p in token['performance_history']]
+    current_price = current_data.get('price_usd', 0)
+    
+    # Filter out None values
+    prices = [p for p in prices if p is not None]
+    if current_price is not None:
+        prices.append(current_price)
+    
+    if not prices or len(prices) < 2:
+        return 0
     
     # Calculate standard deviation of logarithmic returns
     returns = []
@@ -3527,10 +3541,10 @@ async def fetch_token_by_contract(contract_address: str, include_history: bool =
                 'name': token_info.get('name', 'Unknown'),
                 'symbol': token_info.get('symbol', 'UNKNOWN'),
                 'contract_address': contract_address,
-                'price_usd': float(pair.get('priceUsd', 0)),
+                'price_usd': float(pair.get('priceUsd', 0)) or 0,
                 'market_cap': float(pair.get('marketCap', pair.get('fdv', 0))),
-                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
-                'volume': float(pair.get('volume', {}).get('h24', 0)),
+                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)) or 0,
+                'volume': float(pair.get('volume', {}).get('h24', 0)) or 0,
                 'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{contract_address}"),
                 'image': pair.get('info', {}).get('imageUrl', ''),
                 'socials': {link.get('type', link.get('label', 'website').lower()): link['url'] 
