@@ -3,7 +3,9 @@ from eth_account import Account
 Account.enable_unaudited_hdwallet_features()
 import asyncio
 import logging
+from functools import lru_cache
 import json
+import aiohttp
 import httpx
 import base64
 import base58
@@ -116,6 +118,33 @@ def log_user_action(user_id: int, action: str, details: str = "", level: str = "
     extra = {'user_id': user_id}
     log_method = getattr(logger, level.lower(), logger.info)
     log_method(f"👤 USER ACTION: {action} - {details}", extra=extra)
+
+
+class TokenCache:
+    def __init__(self, max_size=1000, ttl_seconds=300):
+        self.cache = {}
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+    
+    def get(self, key):
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return data
+            else:
+                del self.cache[key]  # Expired
+        return None
+    
+    def set(self, key, value):
+        if len(self.cache) >= self.max_size:
+            # Remove oldest item
+            oldest_key = next(iter(self.cache))
+            del self.cache[oldest_key]
+        self.cache[key] = (value, time.time())
+
+# Global cache instance
+token_cache = TokenCache(max_size=500, ttl_seconds=180)  # Smaller TTL for faster data
+
 
 # Load environment variables
 load_dotenv()
@@ -3469,6 +3498,7 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     return SELECT_TOKEN_ACTION
 
+
 async def fetch_token_by_contract(contract_address: str, include_history: bool = False) -> Optional[Dict[str, Any]]:
     """Fetch token details by contract address with historical data option"""
     # Check cache first
@@ -5752,15 +5782,14 @@ async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
     ]
     
 
-    sell_price = trade.get('sell_price', 0) or 0
-    buy_price = trade.get('buy_price', 0) or 0
-   
     # Calculate today's P&L with proper error handling
     daily_pnl = 0
     for trade in today_trades:
         try:
+            sell_price = trade.get('sell_price', 0) or 0
+            buy_price = trade.get('buy_price', 0) or 0
             if 'profit_pct' in trade:
-                # Convert percentage to SOL amount
+                # RSI recovering from oversold
                 trade_value = trade['amount'] * trade['buy_price']
                 daily_pnl += trade_value * (trade['profit_pct'] / 100)
             elif 'sell_price' in trade and 'buy_price' in trade:
@@ -5784,12 +5813,7 @@ async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
         loss_pct = abs(min(daily_pnl, 0)) / portfolio_value
         if loss_pct >= daily_loss_limit:
             # Try to notify the user (we don't have context here)
-            try:
-                # You might need to store the bot instance globally or find another way to send messages
-                # For now, just log it
-                logger.warning(f"User {user_id} reached daily loss limit ({loss_pct*100:.1f}%)")
-            except:
-                pass
+            logger.warning(f"User {user_id} reached daily loss limit ({loss_pct*100:.1f}%)")
             return True
     
     return False
