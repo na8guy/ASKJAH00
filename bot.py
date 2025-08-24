@@ -5751,6 +5751,10 @@ async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
         if datetime.fromisoformat(t['timestamp']).date() == today
     ]
     
+
+    sell_price = trade.get('sell_price', 0) or 0
+    buy_price = trade.get('buy_price', 0) or 0
+   
     # Calculate today's P&L with proper error handling
     daily_pnl = 0
     for trade in today_trades:
@@ -5761,7 +5765,7 @@ async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
                 daily_pnl += trade_value * (trade['profit_pct'] / 100)
             elif 'sell_price' in trade and 'buy_price' in trade:
                 # Fallback calculation
-                trade_profit = (trade['sell_price'] - trade['buy_price']) * trade['amount']
+                trade_profit = (sell_price - buy_price) * trade['amount']
                 daily_pnl += trade_profit
             else:
                 logger.warning(f"Incomplete trade record for P&L calculation: {trade}")
@@ -6035,8 +6039,17 @@ async def emergency_sell_protocol(context, user_id, token, token_data):
 async def execute_auto_sell(context, user_id, token, token_data, reason):
     """Execute automatic sell with emergency fallback"""
     try:
-        current_price = token['price_usd']
-        buy_price = token_data['buy_price']
+        current_price = token.get('price_usd')
+        if current_price is None:
+            logger.error(f"Current price is None for token {token['name']}")
+            return False
+
+        buy_price = token_data.get('buy_price')
+        if buy_price is None:
+            logger.error(f"Buy price is None for token {token['name']}")
+            return False
+        
+       
         price_change_pct = (current_price - buy_price) / buy_price
         
         # Check if we should take partial profits
@@ -6455,10 +6468,18 @@ def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]
     Calculate technical indicators using pure Python.
     Returns an empty dict if not enough data is available.
     """
+
+    
     if len(price_history) < 15:  # Need at least 15 periods for meaningful indicators
         return {}
+
+        
     
     try:
+
+        if not all(isinstance(price, (int, float)) for price in price_history):
+         logger.error("Invalid price values in history")
+         return {}
         # Simple Moving Averages
         sma_5 = sum(price_history[-5:]) / 5
         sma_15 = sum(price_history[-15:]) / 15
@@ -6466,6 +6487,8 @@ def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]
         # Calculate RSI
         gains = []
         losses = []
+
+       
         
         for i in range(1, len(price_history)):
             change = price_history[i] - price_history[i-1]
