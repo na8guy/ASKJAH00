@@ -3537,14 +3537,19 @@ async def fetch_token_by_contract(contract_address: str, include_history: bool =
                            for link in pair.get('info', {}).get('socials', [])}
             }
             
+            # Ensure all numeric fields have values, not None
+            for field in ['price_usd', 'liquidity', 'volume', 'market_cap']:
+                if token_data[field] is None:
+                    token_data[field] = 0.0
+            
             # Cache the result
             token_cache[contract_address] = (token_data, time.time())
-            if token_data and include_history:
-        # Immediately fetch historical data for new tokens
-             await fetch_and_store_historical_data(contract_address, token_data)
-    
-
-        return token_data
+            
+            if include_history:
+                # Immediately fetch historical data for new tokens
+                await fetch_and_store_historical_data(contract_address, token_data)
+            
+            return token_data
             
     except Exception as e:
         logger.error(f"Error fetching token by contract {contract_address}: {str(e)}")
@@ -4125,11 +4130,13 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 No wallet found. Please use /start to create a wallet or /set_wallet to import one.")
         return
     
+    # Get balances for all chains
     sol_balance = await check_balance(user_id, 'solana')
     eth_balance = await check_balance(user_id, 'eth') if user.get('eth') else 0.0
     bsc_balance = await check_balance(user_id, 'bsc') if user.get('bsc') else 0.0
     portfolio = user.get('portfolio', {})
     
+    # Build message
     message = (
         f"💰 *Wallet Balance*\n\n"
         f"🔹 Solana (SOL): {sol_balance:.4f}\n"
@@ -4144,34 +4151,31 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_portfolio_value = 0
         
         for contract, details in portfolio.items():
-            # Get current token price
             token = await fetch_token_by_contract(contract)
-            if not token:
-                # Use buy price if current price not available
+            
+            # Handle missing token data
+            if not token or token.get('price_usd') is None:
                 current_price = details['buy_price']
-                current_value = details['amount']
+                token_count = details['amount'] / details['buy_price']
+                current_value = token_count * current_price
                 price_note = " (price unavailable, using buy price)"
             else:
                 current_price = token['price_usd']
-                # Calculate token count and current value
                 token_count = details['amount'] / details['buy_price']
                 current_value = token_count * current_price
                 price_note = ""
-                
-            total_portfolio_value += current_value
             
             # Calculate profit/loss
             profit_loss = current_value - details['amount']
-            profit_loss_percent = (profit_loss / details['amount']) * 100
+            profit_loss_percent = (profit_loss / details['amount']) * 100 if details['amount'] > 0 else 0
             profit_loss_emoji = "📈" if profit_loss >= 0 else "📉"
             
-            # Calculate token count
-            token_count = details['amount'] / details['buy_price']
+            total_portfolio_value += current_value
             
             message += (
                 f"🔸 {details['name']} ({details['symbol']}):\n"
                 f"   - Token Amount: {token_count:.2f}\n"
-                f"   - Current Price: ${current_price:.8f}\n"
+                f"   - Current Price: ${current_price:.8f}{price_note}\n"
                 f"   - Buy Price: ${details['buy_price']:.8f}\n"
                 f"   - P&L: {profit_loss_emoji} {profit_loss:+.4f} SOL ({profit_loss_percent:+.2f}%)\n"
             )
@@ -4179,6 +4183,8 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += f"\n💼 *Total Portfolio Value*: {total_portfolio_value:.4f} SOL"
     
     await update.message.reply_text(message, parse_mode='Markdown')
+
+
 
 async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Initiate token transfer"""
@@ -5371,16 +5377,16 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             
         # Debug log user settings
         logger.info(f"User {user_id} settings: {user.get('trading_mode')}, {user.get('auto_buy_amount')}")
-
+        
         # Check cooldown
         last_trade_time = user.get('last_trade_time', 0)
         if time.time() - last_trade_time < AUTO_TRADE_COOLDOWN:
             logger.debug(f"Auto-trade cooldown active for user {user_id}")
             return
         
-        # Check if token is blacklisted
-        if token and token['contract_address'] in user.get('auto_trade_blacklist', []):
-            logger.info(f"Token {token['name']} is blacklisted")
+        # Check if token is blacklisted (if token provided)
+        if token and token.get('contract_address') in user.get('auto_trade_blacklist', []):
+            logger.info(f"Token {token.get('name', 'Unknown')} is blacklisted")
             return
         
         user_max_positions = user.get('max_positions', MAX_POSITIONS)
@@ -5410,9 +5416,21 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
         # If a specific token was provided, use it
         if token is not None:
             # Skip if already in portfolio or blacklist
-            if (token['contract_address'] in portfolio or 
-                token['contract_address'] in user.get('auto_trade_blacklist', [])):
+            if (token.get('contract_address') in portfolio or 
+                token.get('contract_address') in user.get('auto_trade_blacklist', [])):
                 return
+                
+            # Validate token data
+            if token.get('price_usd') is None:
+                logger.warning(f"Skipping {token.get('name', 'Unknown')} - price is None")
+                return
+                
+            # Also validate other essential fields
+            required_fields = ['liquidity', 'volume', 'contract_address']
+            for field in required_fields:
+                if token.get(field) is None:
+                    logger.warning(f"Skipping {token.get('name', 'Unknown')} - {field} is None")
+                    return
                 
             # Fetch fresh token data with historical data
             fresh_token = await fetch_token_by_contract(token['contract_address'], include_history=True)
@@ -5458,7 +5476,7 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             # Filter tokens using enhanced safety parameters
             valid_tokens = []
             for t in tokens:
-                if t['contract_address'] in portfolio or t['contract_address'] in user.get('auto_trade_blacklist', []):
+                if t.get('contract_address') in portfolio or t.get('contract_address') in user.get('auto_trade_blacklist', []):
                     continue
                     
                 is_safe, reason = await check_token_safety(t, user)
@@ -5473,7 +5491,7 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             best_score = -99999
             
             for t in valid_tokens:
-                score = (t['liquidity'] / 10000) + (t['volume'] / 5000)
+                score = (t.get('liquidity', 0) / 10000) + (t.get('volume', 0) / 5000)
                 if 'price_change_5m' in t:
                     score += t['price_change_5m'] * 100
                     
