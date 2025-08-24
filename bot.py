@@ -3455,8 +3455,8 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     return SELECT_TOKEN_ACTION
 
-async def fetch_token_by_contract(contract_address: str) -> Optional[Dict[str, Any]]:
-    """Fetch token details by contract address with improved error handling"""
+async def fetch_token_by_contract(contract_address: str, include_history: bool = False) -> Optional[Dict[str, Any]]:
+    """Fetch token details by contract address with historical data option"""
     # Check cache first
     if contract_address in token_cache:
         cached_data, timestamp = token_cache[contract_address]
@@ -3539,11 +3539,147 @@ async def fetch_token_by_contract(contract_address: str) -> Optional[Dict[str, A
             
             # Cache the result
             token_cache[contract_address] = (token_data, time.time())
-            return token_data
+            if token_data and include_history:
+        # Immediately fetch historical data for new tokens
+             await fetch_and_store_historical_data(contract_address, token_data)
+    
+
+        return token_data
             
     except Exception as e:
         logger.error(f"Error fetching token by contract {contract_address}: {str(e)}")
         return await fetch_token_fallback(contract_address)
+
+
+async def fetch_and_store_historical_data(contract_address: str, token_data: Dict[str, Any]):
+    """Fetch historical price data for a token and store it"""
+    try:
+        # Use Birdeye API for historical data
+        historical_data = await fetch_birdeye_historical(contract_address)
+        
+        if historical_data:
+            # Create initial performance record with historical data
+            performance_record = {
+                'contract_address': contract_address,
+                'name': token_data.get('name', ''),
+                'symbol': token_data.get('symbol', ''),
+                'first_tracked': datetime.now(),
+                'first_posted_at': datetime.now(),
+                'initial_metrics': {
+                    'price': token_data['price_usd'],
+                    'liquidity': token_data['liquidity'],
+                    'volume': token_data['volume'],
+                    'market_cap': token_data.get('market_cap', 0)
+                },
+                'current_metrics': {
+                    'price': token_data['price_usd'],
+                    'liquidity': token_data['liquidity'],
+                    'volume': token_data['volume'],
+                    'market_cap': token_data.get('market_cap', 0)
+                },
+                'performance_history': historical_data,
+                'ath': token_data['price_usd'],
+                'ath_time': datetime.now(),
+                'atl': token_data['price_usd'],
+                'atl_time': datetime.now(),
+                'data_quality': 'historical_initialized'
+            }
+            
+            # Store in database
+            token_performance_collection.update_one(
+                {'contract_address': contract_address},
+                {'$set': performance_record},
+                upsert=True
+            )
+            
+            logger.info(f"Stored historical data for {contract_address} with {len(historical_data)} data points")
+            
+    except Exception as e:
+        logger.error(f"Failed to fetch historical data for {contract_address}: {str(e)}")
+
+async def fetch_birdeye_historical(contract_address: str, hours: int = 24) -> List[Dict]:
+    """Fetch historical price data from Birdeye API"""
+    try:
+        birdeye_api_key = os.getenv('BIRDEYE_API_KEY')
+        if not birdeye_api_key:
+            return []
+        
+        url = f"https://public-api.birdeye.so/defi/history_price?address={contract_address}&type=1H&time_range=24"
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, headers={"X-API-KEY": birdeye_api_key})
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('success') and 'data' in data.get('data', {}):
+                    history_items = []
+                    for item in data['data']['data']:
+                        history_items.append({
+                            'timestamp': datetime.fromtimestamp(item['unixTime']),
+                            'price': float(item['value']),
+                            'liquidity': 0,
+                            'volume': 0
+                        })
+                    return history_items
+                    
+    except Exception as e:
+        logger.error(f"Birdeye historical data fetch failed: {str(e)}")
+    
+    return []
+
+async def fetch_dexscreener_historical(contract_address: str):
+    """Fallback to DexScreener for historical data if Birdeye fails"""
+    try:
+        url = f"https://api.dexscreener.com/tokens/v1/solana/{contract_address}/historical?interval=1h&limit=24"
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                history_items = []
+                
+                for item in data.get('candles', []):
+                    history_items.append({
+                        'timestamp': datetime.fromisoformat(item['time'].replace('Z', '+00:00')),
+                        'price': float(item['open']),
+                        'liquidity': 0,
+                        'volume': float(item.get('volume', 0))
+                    })
+                
+                return history_items
+                
+    except Exception as e:
+        logger.error(f"DexScreener historical data fetch failed: {str(e)}")
+    
+    return []
+
+async def fetch_geckoterminal_historical(contract_address: str):
+    """Another fallback for historical data"""
+    try:
+        url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{contract_address}/ohlcv/day"
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                history_items = []
+                
+                for item in data.get('data', {}).get('attributes', {}).get('ohlcv_list', []):
+                    history_items.append({
+                        'timestamp': datetime.fromtimestamp(item[0]),
+                        'price': float(item[1]),
+                        'liquidity': 0,
+                        'volume': float(item[5])
+                    })
+                
+                return history_items
+                
+    except Exception as e:
+        logger.error(f"GeckoTerminal historical data fetch failed: {str(e)}")
+    
+    return []
 
 async def job_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show status of background jobs"""
@@ -5127,11 +5263,107 @@ async def cleanup_illiquid_positions(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Failed to notify user {user_id} about cleanup: {str(e)}")
 
+
+async def evaluate_token_entry(token: Dict[str, Any], indicators: Dict[str, Any], user_settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate whether to enter a trade based on technical analysis"""
+    decision = {
+        'should_buy': False,
+        'reason': '',
+        'confidence': 0
+    }
+    
+    # Strategy 1: Strong momentum with volume confirmation
+    if (indicators['roc_5'] > 15 and  # 15%+ price increase in last 5 periods
+        indicators['positive_momentum'] and
+        token['volume'] > user_settings.get('min_volume', 1000) * 3):  # 3x minimum volume
+        
+        decision.update({
+            'should_buy': True,
+            'reason': "Strong momentum with volume confirmation",
+            'confidence': 80
+        })
+    
+    # Strategy 2: Oversold bounce with RSI recovery
+    elif (indicators['oversold'] and 
+          indicators['rsi'] > 35 and  # RSI recovering from oversold
+          indicators['roc_5'] > 5):   # Some positive momentum
+        
+        decision.update({
+            'should_buy': True,
+            'reason': "Oversold bounce with RSI recovery",
+            'confidence': 70
+        })
+    
+    # Strategy 3: Breakout above moving averages
+    elif (indicators['ma_crossover'] and 
+          indicators['sma_5'] > indicators['sma_15'] * 1.05 and  # 5% above 15-period SMA
+          token['volume'] > user_settings.get('min_volume', 1000) * 2):
+        
+        decision.update({
+            'should_buy': True,
+            'reason': "Breakout above moving averages with volume",
+            'confidence': 75
+        })
+    
+    else:
+        decision['reason'] = "Does not meet any entry criteria"
+    
+    return decision
+
+async def fetch_historical_data_multi_source(contract_address: str):
+    """Try multiple sources for historical data"""
+    sources = [
+        fetch_birdeye_historical,
+        fetch_dexscreener_historical,
+        fetch_geckoterminal_historical
+    ]
+    
+    for source in sources:
+        try:
+            data = await source(contract_address)
+            if data:
+                return data
+        except Exception as e:
+            logger.warning(f"Historical data source {source.__name__} failed: {str(e)}")
+            continue
+    
+    return []
+
+def assess_data_quality(historical_data: List[Dict]) -> Dict[str, Any]:
+    """Assess the quality and reliability of historical data"""
+    if not historical_data:
+        return {'quality': 'poor', 'data_points': 0}
+    
+    # Check data density (how many data points per hour)
+    time_range = (historical_data[-1]['timestamp'] - historical_data[0]['timestamp']).total_seconds() / 3600
+    data_density = len(historical_data) / max(1, time_range)
+    
+    # Check price volatility (reasonable ranges)
+    prices = [item['price'] for item in historical_data]
+    price_volatility = (max(prices) - min(prices)) / np.mean(prices) if prices else 0
+    
+    quality_score = min(100, data_density * 10 + (1 - min(price_volatility, 1)) * 50)
+    
+    return {
+        'quality': 'excellent' if quality_score > 80 else 'good' if quality_score > 60 else 'fair' if quality_score > 40 else 'poor',
+        'score': quality_score,
+        'data_points': len(historical_data),
+        'time_range_hours': time_range
+    }
+
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, token: Dict[str, Any] = None):
-    """Handle automatic trading with enhanced decision logging"""
+    """Handle automatic trading with enhanced decision logging and historical data integration"""
     logger.info(f"🤖 Auto-trading for user {user_id}")
     
     try:
+        # Get user_id from context if not provided
+        if user_id is None and context.job is not None:
+            user_id = context.job.user_id
+        
+        if user_id is None:
+            logger.error("No user_id provided for auto_trade")
+            return
+            
         user = users_collection.find_one({'user_id': user_id})
         if not user or not await check_subscription(user_id):
             logger.info(f"User {user_id} not subscribed or not found")
@@ -5139,15 +5371,17 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             
         # Debug log user settings
         logger.info(f"User {user_id} settings: {user.get('trading_mode')}, {user.get('auto_buy_amount')}")
-            
+
         # Check cooldown
         last_trade_time = user.get('last_trade_time', 0)
         if time.time() - last_trade_time < AUTO_TRADE_COOLDOWN:
             logger.debug(f"Auto-trade cooldown active for user {user_id}")
             return
         
-        if token['contract_address'] in user.get('auto_trade_blacklist', []):
-         logger.info(f"Token {token['name']} is blacklisted")
+        # Check if token is blacklisted
+        if token and token['contract_address'] in user.get('auto_trade_blacklist', []):
+            logger.info(f"Token {token['name']} is blacklisted")
+            return
         
         user_max_positions = user.get('max_positions', MAX_POSITIONS)
         # Check maximum open positions
@@ -5155,10 +5389,10 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
         liquid_positions = 0
     
         for contract, position in portfolio.items():
-        # Check if the position has sufficient liquidity
+            # Check if the position has sufficient liquidity
             token_data = await fetch_token_by_contract(contract)
             if token_data and token_data.get('liquidity', 0) >= MIN_SAFE_LIQUIDITY:
-              liquid_positions += 1
+                liquid_positions += 1
     
         if liquid_positions >= user_max_positions:
             logger.debug(f"Max liquid positions ({user_max_positions}) reached for user {user_id}")
@@ -5180,61 +5414,35 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
                 token['contract_address'] in user.get('auto_trade_blacklist', [])):
                 return
                 
-            # Track decision factors
-            decision_data = {}
-            
-            # Apply safety checks with detailed logging
-            is_safe, reason = await check_token_safety(token, user)
-            decision_data['safety_check'] = {
-                'passed': is_safe,
-                'reason': reason if not is_safe else "Token passed all safety checks"
-            }
-            
-            # Check liquidity sustainability
-            liquidity_ratio = token['liquidity'] / (buy_amount * 150) if buy_amount > 0 else 0
-            liquidity_ok = liquidity_ratio > 0.1  # At least 10% of trade size as liquidity
-            decision_data['liquidity_sustainability'] = {
-                'passed': liquidity_ok,
-                'reason': f"Insufficient liquidity ratio: {liquidity_ratio:.2f}" if not liquidity_ok else "Adequate liquidity"
-            }
-            
-            # Check if already at max positions
-            max_positions_ok = len(portfolio) < MAX_POSITIONS
-            decision_data['position_limit'] = {
-                'passed': max_positions_ok,
-                'reason': f"Max positions reached: {len(portfolio)}/{MAX_POSITIONS}" if not max_positions_ok else "Within position limits"
-            }
-            
-            # Check if token has positive momentum
+            # Fetch fresh token data with historical data
+            fresh_token = await fetch_token_by_contract(token['contract_address'], include_history=True)
+            if not fresh_token:
+                return
+                
+            # Get performance data (should now include historical data)
             token_performance = token_performance_collection.find_one(
-                {'contract_address': token['contract_address']}
+                {'contract_address': fresh_token['contract_address']}
             )
             
-            momentum_ok = False
-            momentum_reason = "No performance data available"
-            if token_performance and 'performance_history' in token_performance:
-                price_history = [entry['price'] for entry in token_performance['performance_history'][-10:]]
-                if len(price_history) >= 5:
-                    recent_growth = (price_history[-1] - price_history[-5]) / price_history[-5] * 100
-                    momentum_ok = recent_growth > 5  # At least 5% growth in last 5 periods
-                    momentum_reason = f"Recent growth: {recent_growth:.2f}%"
+            if not token_performance or 'performance_history' not in token_performance:
+                logger.info(f"Insufficient data for {fresh_token['name']} - skipping auto-trade")
+                return
+                
+            # Calculate technical indicators using the historical data
+            price_history = [entry['price'] for entry in token_performance['performance_history']]
+            indicators = calculate_technical_indicators(price_history)
             
-            decision_data['momentum'] = {
-                'passed': momentum_ok,
-                'reason': momentum_reason
-            }
+            if not indicators:
+                logger.info(f"Not enough historical data for {fresh_token['name']} - skipping")
+                return
+                
+            # Enhanced entry criteria using immediate historical analysis
+            entry_decision = await evaluate_token_entry(fresh_token, indicators, user)
             
-            # Generate and send decision report
-            report = await generate_auto_trade_report(user_id, token, decision_data)
-            await context.bot.send_message(chat_id=user_id, text=report)
-            
-            # Only proceed if all checks passed
-            all_checks_passed = all(check['passed'] for check in decision_data.values())
-            
-            if all_checks_passed:
-                await execute_auto_buy(context, user_id, token, buy_amount)
+            if entry_decision['should_buy']:
+                await execute_auto_buy(context, user_id, fresh_token, buy_amount, entry_decision['reason'])
             else:
-                logger.info(f"Auto-trade rejected for {token['name']} based on safety checks")
+                logger.info(f"Auto-trade rejected: {entry_decision['reason']}")
                 
         else:
             # Original logic for scheduled trading
@@ -5276,8 +5484,6 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             if best_token:
                 await execute_auto_buy(context, user_id, best_token, buy_amount)
 
-        logger.info(f"Token {token['name']} safety check: {is_safe}, reason: {reason}")
-        
     except Exception as e:
         logger.error(f"Auto-trade error for user {user_id}: {str(e)}")
         await notify_user(
@@ -6803,7 +7009,7 @@ async def on_startup():
         
         telegram_app.job_queue.run_repeating(
             update_token_performance,
-            interval=3600,
+            interval=300,
             first=15,
             name="token_performance_updates"
         )
