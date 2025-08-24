@@ -1732,7 +1732,13 @@ async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
         user_id=user_id,
         name=f"cleanup_illiquid_{user_id}"
     )
-        
+        context.job_queue.run_repeating(
+    auto_cleanup_zero_balance,
+    interval=3600,  # Run every hour
+    first=60,
+    user_id=user_id,
+    name=f"auto_cleanup_{user_id}"
+)
         # Remove any existing jobs for this user
         for job in context.job_queue.jobs():
             if job.name.startswith(f"user_{user_id}_"):
@@ -1756,11 +1762,42 @@ async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
 
 async def is_position_active(contract_address: str) -> bool:
     """Check if a position has sufficient liquidity to be considered active"""
+    # Define your minimum liquidity threshold
+    MIN_ACTIVE_LIQUIDITY = 2000  # $500 USD
+    
     token = await fetch_token_by_contract(contract_address)
     if token and token.get('liquidity', 0) >= MIN_ACTIVE_LIQUIDITY:
         return True
     return False
 
+async def remove_illiquid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove all illiquid positions from portfolio"""
+    user_id = update.effective_user.id
+    user = users_collection.find_one({'user_id': user_id})
+    
+    if not user or 'portfolio' not in user:
+        await update.message.reply_text("📭 You don't have any positions.")
+        return
+    
+    portfolio = user['portfolio']
+    removed_count = 0
+    
+    for contract in list(portfolio.keys()):  # Create a copy of keys for safe iteration
+        if not await is_position_active(contract):
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$unset': {f'portfolio.{contract}': ""}}
+            )
+            removed_count += 1
+    
+    if removed_count > 0:
+        await update.message.reply_text(
+            f"🧹 Removed {removed_count} illiquid positions from your portfolio."
+        )
+    else:
+        await update.message.reply_text(
+            "✅ All your positions have sufficient liquidity."
+        )
 
 async def check_conversation_timeout(context: ContextTypes.DEFAULT_TYPE):
     """Check if conversation has timed out and resume token updates"""
@@ -4476,15 +4513,15 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                 
                 # Prepare swap transaction with aggressive settings
                 swap_payload = {
-    "quoteResponse": quote_data,
-    "userPublicKey": from_address,
-    "wrapAndUnwrapSol": True,
-    "dynamicComputeUnitLimit": True,
-    "prioritizationFeeLamports": 200000 + (attempt * 100000),
-    "useSharedAccounts": False,  # Change to False
-    "asLegacyTransaction": False,
-    "useTokenLedger": False
-}
+                    "quoteResponse": quote_data,
+                    "userPublicKey": from_address,
+                    "wrapAndUnwrapSol": True,
+                    "dynamicComputeUnitLimit": True,
+                    "prioritizationFeeLamports": 200000 + (attempt * 100000),
+                    "useSharedAccounts": False,
+                    "asLegacyTransaction": False,
+                    "useTokenLedger": False
+                }
                 
                 # Get swap transaction
                 swap_response = await client.post(swap_url, json=swap_payload)
@@ -4522,10 +4559,9 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                     raw_transaction = bytes(signed_transaction)
 
                     recent_blockhash = await solana_rpc_call_with_retry(
-                solana_client.get_latest_blockhash
-            )
+                        solana_client.get_latest_blockhash
+                    )
             
-                    
                 except Exception as e:
                     logger.warning(f"VersionedTransaction failed: {str(e)}, trying legacy transaction")
                     try:
@@ -4569,26 +4605,23 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
                         
                         # Record the transaction in user's history
                         trade_record = {
-    'type': action,
-    'token_address': contract_address,
-    'token_name': token_info.get('name', 'Unknown'),
-    'token_symbol': token_info.get('symbol', 'UNKNOWN'),
-    'amount': amount,
-    'price': token_info.get('price_usd', 0),
-    'tx_hash': str(tx_hash.value),  # Convert Signature to string
-    'timestamp': datetime.now().isoformat(),
-    'buy_price': token_info.get('price_usd', 0) if action == 'buy' else None,
-    'sell_price': token_info.get('price_usd', 0) if action == 'sell' else None,
-    'status': 'completed'
-}
-
+                            'type': action,
+                            'token_address': contract_address,
+                            'token_name': token_info.get('name', 'Unknown'),
+                            'token_symbol': token_info.get('symbol', 'UNKNOWN'),
+                            'amount': amount,
+                            'price': token_info.get('price_usd', 0),
+                            'tx_hash': str(tx_hash.value),  # Convert Signature to string
+                            'timestamp': datetime.now().isoformat(),
+                            'buy_price': token_info.get('price_usd', 0) if action == 'buy' else None,
+                            'sell_price': token_info.get('price_usd', 0) if action == 'sell' else None,
+                            'status': 'completed'
+                        }
                         
                         users_collection.update_one(
-    {'user_id': user_id},
-    {'$push': {'trade_history': trade_record}}
-)
-
-
+                            {'user_id': user_id},
+                            {'$push': {'trade_history': trade_record}}
+                        )
                         
                         return True, f"Trade successful! TX: {tx_hash.value}"
                     else:
@@ -4627,6 +4660,40 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
             return False, f"Trade execution failed: {str(e)}"
 
     return False, "Max retries exceeded. The token may be too volatile or have insufficient liquidity for trading at this time."
+
+
+async def auto_cleanup_zero_balance(context: ContextTypes.DEFAULT_TYPE):
+    """Automatically remove zero-balance positions"""
+    user_id = context.job.user_id
+    user = users_collection.find_one({'user_id': user_id})
+    
+    if not user or 'portfolio' not in user:
+        return
+    
+    portfolio = user['portfolio']
+    removed_count = 0
+    
+    for contract, pos in list(portfolio.items()):
+        if pos['amount'] <= 0.001:  # Consider very small amounts as zero
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$unset': {f'portfolio.{contract}': ""}}
+            )
+            removed_count += 1
+    
+    if removed_count > 0:
+        logger.info(f"Auto-removed {removed_count} zero-balance positions for user {user_id}")
+        # Optionally notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🧹 Auto-removed {removed_count} zero-balance positions from your portfolio."
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user {user_id} about auto-cleanup: {str(e)}")
+
+# Schedule this job for each user (add this where you schedule other jobs)
+
 
 async def get_token_decimals(token_address: str) -> int:
     """Get token decimals from Solana blockchain with retry logic"""
@@ -4738,10 +4805,35 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Calculate total value asynchronously
     total_value = 0.0
-    liquid_positions = 0
-    illiquid_positions = 0
+    zero_balance_positions = 0
     
     for contract, pos in portfolio.items():
+        # Check if this is a zero-balance position
+        if pos['amount'] <= 0.001:  # Consider very small amounts as zero
+            zero_balance_positions += 1
+            # Create a special message for zero-balance positions
+            message = (
+                f"🧹 *Zero Balance: {pos['name']} ({pos['symbol']})*\n\n"
+                f"• Initial Investment: {pos['amount']:.4f} SOL\n"
+                f"• Current Value: 0.0000 SOL\n"
+                f"• Status: ❌ No longer holding any tokens\n\n"
+                f"🔗 Contract: `{contract}`"
+            )
+            
+            # Create action buttons - only remove for zero balance
+            keyboard = [
+                [InlineKeyboardButton("🗑️ Remove", callback_data=f"remove_{contract}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            messages.append(await update.message.reply_text(
+                message,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            ))
+            continue
+        
+        # Handle normal positions (your existing code)
         token = await fetch_token_by_contract(contract)
         current_price = token['price_usd'] if token else pos['buy_price']
         token_count = pos['amount'] / pos['buy_price']
@@ -4752,20 +4844,15 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_active = await is_position_active(contract)
         status = "✅" if is_active else "❌ (Illiquid)"
         
-        if is_active:
-            liquid_positions += 1
-        else:
-            illiquid_positions += 1
-        
         # Calculate performance metrics
         buy_price = pos['buy_price']
         price_change = ((current_price - buy_price) / buy_price) * 100
         initial_investment = pos['amount']
         pnl = position_value - initial_investment
         
-        # Format position message with liquidity status
+        # Format position message
         message = (
-            f"{status} *{pos['name']} ({pos['symbol']})*\n\n"
+            f"📊 *{pos['name']} ({pos['symbol']})* {status}\n\n"
             f"• Current Price: ${current_price:.8f}\n"
             f"• Your Buy Price: ${buy_price:.8f}\n"
             f"• Price Change: {price_change:+.2f}%\n"
@@ -4775,26 +4862,17 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔗 Contract: `{contract}`"
         )
         
-        # Only show action buttons for liquid positions
-        keyboard = []
-        if is_active:
-            keyboard = [
-                [
-                    InlineKeyboardButton("💸 Sell", callback_data=f"sellpos_{contract}"),
-                    InlineKeyboardButton("💰 Buy More", callback_data=f"buypos_{contract}")
-                ],
-                [
-                    InlineKeyboardButton("📈 View Chart", url=f"https://dexscreener.com/solana/{contract}")
-                ]
+        # Create action buttons
+        keyboard = [
+            [
+                InlineKeyboardButton("💸 Sell", callback_data=f"sellpos_{contract}"),
+                InlineKeyboardButton("💰 Buy More", callback_data=f"buypos_{contract}")
+            ],
+            [
+                InlineKeyboardButton("🗑️ Remove", callback_data=f"remove_{contract}"),
+                InlineKeyboardButton("📈 View Chart", url=f"https://dexscreener.com/solana/{contract}")
             ]
-        else:
-            keyboard = [
-                [
-                    InlineKeyboardButton("🗑️ Remove", callback_data=f"remove_{contract}"),
-                    InlineKeyboardButton("📈 View Chart", url=f"https://dexscreener.com/solana/{contract}")
-                ]
-            ]
-            
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         # Send message with token image if available
@@ -4820,7 +4898,7 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=reply_markup
             ))
     
-    # Add summary message with liquidity breakdown
+    # Add summary message
     total_investment = sum(pos['amount'] for pos in portfolio.values())
     total_pnl = total_value - total_investment
     total_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
@@ -4828,36 +4906,125 @@ async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = (
         f"📈 *Portfolio Summary*\n\n"
         f"• Total Positions: {len(portfolio)}\n"
-        f"• Liquid Positions: {liquid_positions}\n"
-        f"• Illiquid Positions: {illiquid_positions}\n"
+        f"• Active Positions: {len(portfolio) - zero_balance_positions}\n"
+        f"• Zero Balance Positions: {zero_balance_positions}\n"
         f"• Total Investment: {total_investment:.4f} SOL\n"
         f"• Current Value: {total_value:.4f} SOL\n"
-        f"• Total P&L: {total_pnl:+.4f} SOL ({total_pnl_percent:+.2f}%)\n\n"
-        f"ℹ️ Illiquid positions (❌) have less than ${MIN_ACTIVE_LIQUIDITY} in liquidity."
+        f"• Total P&L: {total_pnl:+.4f} SOL ({total_pnl_percent:+.2f}%)"
     )
     
     await update.message.reply_text(summary, parse_mode='Markdown')
 
+async def cleanup_zero_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove all zero-balance positions from portfolio"""
+    user_id = update.effective_user.id
+    user = users_collection.find_one({'user_id': user_id})
+    
+    if not user or 'portfolio' not in user:
+        await update.message.reply_text("📭 You don't have any positions.")
+        return
+    
+    portfolio = user['portfolio']
+    removed_count = 0
+    removed_names = []
+    
+    for contract, pos in list(portfolio.items()):
+        if pos['amount'] <= 0.001:  # Consider very small amounts as zero
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$unset': {f'portfolio.{contract}': ""}}
+            )
+            removed_count += 1
+            removed_names.append(pos['name'])
+    
+    if removed_count > 0:
+        await update.message.reply_text(
+            f"🧹 Removed {removed_count} zero-balance positions: {', '.join(removed_names)}"
+        )
+        log_user_action(user_id, "ZERO_BALANCE_CLEANUP", f"Removed {removed_count} positions")
+    else:
+        await update.message.reply_text(
+            "✅ No zero-balance positions found."
+        )
+
 async def handle_remove_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle removal of illiquid positions"""
+    """Handle removal of positions from portfolio"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     contract_address = query.data.split('_', 1)[1]
     
-    # Remove the position from the portfolio
-    users_collection.update_one(
-        {'user_id': user_id},
-        {'$unset': {f'portfolio.{contract_address}': ""}}
-    )
+    # Get the position details
+    user = users_collection.find_one({'user_id': user_id})
+    portfolio = user.get('portfolio', {})
+    position = portfolio.get(contract_address, {})
+    token_name = position.get('name', 'Unknown Token')
+    token_balance = position.get('amount', 0)
     
-    # Update the message to show it was removed
+    # Create confirmation message based on whether it's a zero-balance position
+    if token_balance <= 0.001:
+        message = (
+            f"🗑️ Remove zero-balance position: {token_name}\n\n"
+            f"This position has a balance of {token_balance:.4f} SOL.\n"
+            f"Removing it will clean up your portfolio."
+        )
+    else:
+        message = (
+            f"🗑️ Remove position: {token_name}\n\n"
+            f"Current balance: {token_balance:.4f} SOL\n"
+            f"Are you sure you want to remove this position?\n\n"
+            f"⚠️ This will delete all records of this position from your portfolio."
+        )
+    
+    # Create confirmation keyboard
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Confirm Remove", callback_data=f"confirm_remove_{contract_address}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_remove_{contract_address}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Ask for confirmation
     await query.edit_message_text(
-        f"🗑️ Removed illiquid position from your portfolio.",
+        message,
+        reply_markup=reply_markup,
         parse_mode='Markdown'
     )
+
+async def handle_remove_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle confirmation of position removal"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data_parts = query.data.split('_', 2)
+    action = data_parts[1]
+    contract_address = data_parts[2]
     
-    log_user_action(user_id, "POSITION_REMOVED", contract_address)
+    if action == 'confirm':
+        # Remove the position from the portfolio
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$unset': {f'portfolio.{contract_address}': ""}}
+        )
+        
+        # Get the token name for the success message
+        user = users_collection.find_one({'user_id': user_id})
+        portfolio = user.get('portfolio', {})
+        token_name = portfolio.get(contract_address, {}).get('name', 'the token')
+        
+        await query.edit_message_text(
+            f"🗑️ Successfully removed {token_name} from your portfolio.",
+            parse_mode='Markdown'
+        )
+        
+        log_user_action(user_id, "POSITION_REMOVED", contract_address)
+    else:
+        # Cancel removal
+        await query.edit_message_text(
+            "🛑 Removal cancelled. The token remains in your portfolio.",
+            parse_mode='Markdown'
+        )
 
 async def handle_position_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle position action buttons (sell/buy more)"""
@@ -6342,7 +6509,10 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("mypositions", mypositions))
     application.add_handler(CommandHandler("settings", settings))
     application.add_handler(CallbackQueryHandler(handle_remove_position, pattern='^remove_'))
-    
+    application.add_handler(CallbackQueryHandler(handle_remove_position, pattern='^remove_'))
+    application.add_handler(CallbackQueryHandler(handle_remove_confirmation, pattern='^(confirm_remove|cancel_remove)_'))
+    application.add_handler(CommandHandler("remove_illiquid", remove_illiquid))
+    application.add_handler(CommandHandler("cleanup", cleanup_zero_balance))
     # Add position actions handler
     application.add_handler(CallbackQueryHandler(handle_position_actions, pattern='^(sellpos|buypos)_'))
     #application.add_handler(CallbackQueryHandler(handle_token_button, pattern='^(buy|sell)_'))
@@ -6552,6 +6722,10 @@ async def setup_bot():
             BotCommand("generate_wallet", "Generate a new wallet"),
             BotCommand("set_wallet", "Import an existing wallet"),
             BotCommand("fetch_tokens", "Manually fetch new tokens (requires wallet)"),
+            BotCommand("cleanup", "cleanup zero-balance tokens from portfolio"),
+            BotCommand("remove_illiquid", "Remove illiquid tokens from portfolio"),
+            BotCommand("force_fetch", "Force fetch tokens, ignoring cooldown (admin only)"),
+            BotCommand("settings", "View or change auto-trading settings"),
             BotCommand("reset_tokens", "Reset posted tokens list"),
             BotCommand("setmode", "Set trading mode (manual/automatic)"),
             BotCommand("trade", "Trade Solana tokens manually (requires wallet)"),
