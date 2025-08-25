@@ -21,3 +21,4 @@ numpy
 TextBlob
 seaborn
 matplotlib
+cachetools
