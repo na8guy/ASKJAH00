@@ -3,9 +3,11 @@ from eth_account import Account
 Account.enable_unaudited_hdwallet_features()
 import asyncio
 import logging
+<<<<<<< HEAD
+=======
 from functools import lru_cache, wraps
+>>>>>>> 3e41d125b4c6ebc4496fe271a92149d77a6dcb7d
 import json
-import aiohttp
 import httpx
 import base64
 import base58
@@ -778,16 +780,10 @@ async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error updating performance for {contract_address}: {str(e)}")
 
 def calculate_price_change(token, current_data):
-    """Calculate price change percentage with None value handling"""
-    initial_price = token['initial_metrics'].get('price')
-    current_price = current_data.get('price_usd')
-    
-    # Handle None values
-    if initial_price is None or current_price is None:
-        logger.warning(f"Missing price data for token {token.get('contract_address')}")
-        return 0  # Return 0% change if data is missing
-    
-    return ((current_price - initial_price) / initial_price) * 100
+    """Calculate price change percentage with precision"""
+    initial_price = token['initial_metrics']['price']
+    current_price = current_data['price_usd']
+    return ((current_price - initial_price) / initial_price) * 100 
 
 def calculate_liquidity_health(token, current_data):
     """Calculate liquidity health score (0-100)"""
@@ -810,20 +806,12 @@ def calculate_liquidity_health(token, current_data):
     return round(score, 1)
 
 def calculate_volatility(token, current_data):
-    """Calculate volatility with None value handling"""
-    if len(token.get('performance_history', [])) < 2:
+    """Calculate volatility based on price history"""
+    if len(token['performance_history']) < 2:
         return 0
     
-    prices = [p.get('price', 0) for p in token['performance_history']]
-    current_price = current_data.get('price_usd', 0)
-    
-    # Filter out None values
-    prices = [p for p in prices if p is not None]
-    if current_price is not None:
-        prices.append(current_price)
-    
-    if not prices or len(prices) < 2:
-        return 0
+    prices = [p['price'] for p in token['performance_history']]
+    prices.append(current_data['price_usd'])
     
     # Calculate standard deviation of logarithmic returns
     returns = []
@@ -3108,7 +3096,10 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     return SELECT_TOKEN_ACTION
 
+<<<<<<< HEAD
+=======
 @with_retry(max_retries=3, delay=2)
+>>>>>>> 3e41d125b4c6ebc4496fe271a92149d77a6dcb7d
 async def fetch_token_by_contract(contract_address: str, include_history: bool = False) -> Optional[Dict[str, Any]]:
     """Fetch token details by contract address with historical data option"""
     # Check cache first
@@ -3181,10 +3172,10 @@ async def fetch_token_by_contract(contract_address: str, include_history: bool =
                 'name': token_info.get('name', 'Unknown'),
                 'symbol': token_info.get('symbol', 'UNKNOWN'),
                 'contract_address': contract_address,
-                'price_usd': float(pair.get('priceUsd', 0)) or 0,
+                'price_usd': float(pair.get('priceUsd', 0)),
                 'market_cap': float(pair.get('marketCap', pair.get('fdv', 0))),
-                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)) or 0,
-                'volume': float(pair.get('volume', {}).get('h24', 0)) or 0,
+                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
+                'volume': float(pair.get('volume', {}).get('h24', 0)),
                 'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{contract_address}"),
                 'image': pair.get('info', {}).get('imageUrl', ''),
                 'socials': {link.get('type', link.get('label', 'website').lower()): link['url'] 
@@ -4655,23 +4646,1182 @@ async def cleanup_illiquid_positions(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Failed to notify user {user_id} about cleanup: {str(e)}")
 
+<<<<<<< HEAD
+
+async def evaluate_token_entry(token: Dict[str, Any], indicators: Dict[str, Any], user_settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate whether to enter a trade based on technical analysis"""
+    decision = {
+        'should_buy': False,
+        'reason': '',
+        'confidence': 0
+    }
+    
+    # Strategy 1: Strong momentum with volume confirmation
+    if (indicators['roc_5'] > 15 and  # 15%+ price increase in last 5 periods
+        indicators['positive_momentum'] and
+        token['volume'] > user_settings.get('min_volume', 1000) * 3):  # 3x minimum volume
+        
+        decision.update({
+            'should_buy': True,
+            'reason': "Strong momentum with volume confirmation",
+            'confidence': 80
+        })
+    
+    # Strategy 2: Oversold bounce with RSI recovery
+    elif (indicators['oversold'] and 
+          indicators['rsi'] > 35 and  # RSI recovering from oversold
+          indicators['roc_5'] > 5):   # Some positive momentum
+        
+        decision.update({
+            'should_buy': True,
+            'reason': "Oversold bounce with RSI recovery",
+            'confidence': 70
+        })
+    
+    # Strategy 3: Breakout above moving averages
+    elif (indicators['ma_crossover'] and 
+          indicators['sma_5'] > indicators['sma_15'] * 1.05 and  # 5% above 15-period SMA
+          token['volume'] > user_settings.get('min_volume', 1000) * 2):
+        
+        decision.update({
+            'should_buy': True,
+            'reason': "Breakout above moving averages with volume",
+            'confidence': 75
+        })
+    
+    else:
+        decision['reason'] = "Does not meet any entry criteria"
+    
+    return decision
+
+async def fetch_historical_data_multi_source(contract_address: str):
+    """Try multiple sources for historical data"""
+    sources = [
+        fetch_birdeye_historical,
+        fetch_dexscreener_historical,
+        fetch_geckoterminal_historical
+    ]
+    
+    for source in sources:
+        try:
+            data = await source(contract_address)
+            if data:
+                return data
+        except Exception as e:
+            logger.warning(f"Historical data source {source.__name__} failed: {str(e)}")
+            continue
+    
+    return []
+
+def assess_data_quality(historical_data: List[Dict]) -> Dict[str, Any]:
+    """Assess the quality and reliability of historical data"""
+    if not historical_data:
+        return {'quality': 'poor', 'data_points': 0}
+    
+    # Check data density (how many data points per hour)
+    time_range = (historical_data[-1]['timestamp'] - historical_data[0]['timestamp']).total_seconds() / 3600
+    data_density = len(historical_data) / max(1, time_range)
+    
+    # Check price volatility (reasonable ranges)
+    prices = [item['price'] for item in historical_data]
+    price_volatility = (max(prices) - min(prices)) / np.mean(prices) if prices else 0
+    
+    quality_score = min(100, data_density * 10 + (1 - min(price_volatility, 1)) * 50)
+    
+    return {
+        'quality': 'excellent' if quality_score > 80 else 'good' if quality_score > 60 else 'fair' if quality_score > 40 else 'poor',
+        'score': quality_score,
+        'data_points': len(historical_data),
+        'time_range_hours': time_range
+    }
+
+async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, token: Dict[str, Any] = None):
+    """Handle automatic trading with enhanced decision logging and historical data integration"""
+    logger.info(f"🤖 Auto-trading for user {user_id}")
+    
+    try:
+        # Get user_id from context if not provided
+        if user_id is None and context.job is not None:
+            user_id = context.job.user_id
+        
+        if user_id is None:
+            logger.error("No user_id provided for auto_trade")
+            return
+            
+        user = users_collection.find_one({'user_id': user_id})
+        if not user or not await check_subscription(user_id):
+            logger.info(f"User {user_id} not subscribed or not found")
+            return
+            
+        # Debug log user settings
+        logger.info(f"User {user_id} settings: {user.get('trading_mode')}, {user.get('auto_buy_amount')}")
+        if token and token.get('price_usd') is None:
+            logger.warning(f"Skipping {token.get('name', 'Unknown')} - price is None")
+            return
+            
+        # Also validate other essential fields
+        required_fields = ['liquidity', 'volume', 'contract_address']
+        for field in required_fields:
+            if token and token.get(field) is None:
+                logger.warning(f"Skipping {token.get('name', 'Unknown')} - {field} is None")
+                return
+        # Check cooldown
+        last_trade_time = user.get('last_trade_time', 0)
+        if time.time() - last_trade_time < AUTO_TRADE_COOLDOWN:
+            logger.debug(f"Auto-trade cooldown active for user {user_id}")
+            return
+        
+        # Check if token is blacklisted
+        if token and token['contract_address'] in user.get('auto_trade_blacklist', []):
+            logger.info(f"Token {token['name']} is blacklisted")
+            return
+        
+        user_max_positions = user.get('max_positions', MAX_POSITIONS)
+        # Check maximum open positions
+        portfolio = user.get('portfolio', {})
+        liquid_positions = 0
+    
+        for contract, position in portfolio.items():
+            # Check if the position has sufficient liquidity
+            token_data = await fetch_token_by_contract(contract)
+            if token_data and token_data.get('liquidity', 0) >= MIN_SAFE_LIQUIDITY:
+                liquid_positions += 1
+    
+        if liquid_positions >= user_max_positions:
+            logger.debug(f"Max liquid positions ({user_max_positions}) reached for user {user_id}")
+            return
+            
+        # Check circuit breaker (daily loss limit)
+        if await check_daily_loss_limit(user_id, user):
+            logger.debug(f"Daily loss limit reached for user {user_id}")
+            return
+        
+        # Get trading settings
+        trading_mode = user.get('trading_mode', 'manual')
+        buy_amount = user.get('auto_buy_amount', 0.01)
+        
+        # If a specific token was provided, use it
+        if token is not None:
+            # Skip if already in portfolio or blacklist
+            if (token['contract_address'] in portfolio or 
+                token['contract_address'] in user.get('auto_trade_blacklist', [])):
+                return
+                
+            # Fetch fresh token data with historical data
+            fresh_token = await fetch_token_by_contract(token['contract_address'], include_history=True)
+            if not fresh_token:
+                return
+                
+            # Get performance data (should now include historical data)
+            token_performance = token_performance_collection.find_one(
+                {'contract_address': fresh_token['contract_address']}
+            )
+            
+            if not token_performance or 'performance_history' not in token_performance:
+                logger.info(f"Insufficient data for {fresh_token['name']} - skipping auto-trade")
+                return
+                
+            # Calculate technical indicators using the historical data
+            price_history = [entry['price'] for entry in token_performance['performance_history']]
+            indicators = calculate_technical_indicators(price_history)
+            
+            if not indicators:
+                logger.info(f"Not enough historical data for {fresh_token['name']} - skipping")
+                return
+                
+            # Enhanced entry criteria using immediate historical analysis
+            entry_decision = await evaluate_token_entry(fresh_token, indicators, user)
+            
+            if entry_decision['should_buy']:
+                await execute_auto_buy(context, user_id, fresh_token, buy_amount, entry_decision['reason'])
+            else:
+                logger.info(f"Auto-trade rejected: {entry_decision['reason']}")
+                
+        else:
+            # Original logic for scheduled trading
+            sol_balance = await check_balance(user_id, 'solana')
+            if sol_balance < buy_amount or len(portfolio) >= MAX_POSITIONS:
+                logger.debug(f"Insufficient SOL or max positions for auto-buy")
+                return
+                
+            tokens = await fetch_latest_token()
+            if not tokens:
+                return
+                
+            # Filter tokens using enhanced safety parameters
+            valid_tokens = []
+            for t in tokens:
+                if t['contract_address'] in portfolio or t['contract_address'] in user.get('auto_trade_blacklist', []):
+                    continue
+                    
+                is_safe, reason = await check_token_safety(t, user)
+                if is_safe:
+                    valid_tokens.append(t)
+            
+            if not valid_tokens:
+                return
+                
+            # Select the token with best risk/reward ratio
+            best_token = None
+            best_score = -99999
+            
+            for t in valid_tokens:
+                score = (t['liquidity'] / 10000) + (t['volume'] / 5000)
+                if 'price_change_5m' in t:
+                    score += t['price_change_5m'] * 100
+                    
+                if score > best_score:
+                    best_score = score
+                    best_token = t
+            
+            if best_token:
+                await execute_auto_buy(context, user_id, best_token, buy_amount)
+
+    except Exception as e:
+        logger.error(f"Auto-trade error for user {user_id}: {str(e)}")
+        await notify_user(
+            context, user_id,
+            f"❌ AUTOTRADE ERROR: {str(e)}",
+            "Auto-Trade System Failure"
+        )
+
+async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, trade_details: List[Dict], username: str) -> io.BytesIO:
+    """Generate a marketing-friendly PnL image with custom background"""
+    # Create figure with custom background
+    plt.figure(figsize=(10, 8))
+    
+    # Load custom background image (replace with your image path)
+    try:
+        bg_image = plt.imread('askjahback.png')
+        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
+    except:
+        # Fallback to dark background if custom image not found
+        plt.style.use('dark_background')
+    
+    plt.axis('off')
+    
+    # Calculate profit multiple
+    multiple = (overall_pnl_percent / 100) + 1
+    
+    # Get current date
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    
+    # Prepare text content
+    text_elements = [
+        ("TRADING PERFORMANCE SUMMARY", 20, "#FFFFFF", "bold"),
+        (f"Total Return: {overall_pnl_percent:+.1f}%", 18, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold"),
+        (f"Profit Multiple: {multiple:.2f}x", 16, "#FFFFFF", "normal"),
+        ("", 12, "#FFFFFF", "normal"),  # Spacer
+        ("TOP PERFORMING TRADES:", 16, "#FFFFFF", "bold")
+    ]
+    
+    # Add top 3 trades
+    top_trades = sorted(trade_details, key=lambda x: x['pnl_percent'], reverse=True)[:3]
+    for i, trade in enumerate(top_trades):
+        trade_color = "#00FF00" if trade['pnl_percent'] >= 0 else "#FF0000"
+        text_elements.append(
+            (f"{i+1}. {trade['symbol']}: {trade['pnl_percent']:+.1f}%", 
+             14, trade_color, "normal")
+        )
+    
+    # Add attribution
+    text_elements.extend([
+        ("", 12, "#FFFFFF", "normal"),  # Spacer
+        (f"Generated for @{username}", 12, "#CCCCCC", "italic"),
+        (f"Date: {current_date}", 12, "#CCCCCC", "italic")
+    ])
+    
+    # Add all text elements
+    y_position = 0.9
+    for text, size, color, weight in text_elements:
+        plt.text(0.5, y_position, text, 
+                ha='center', va='center', 
+                fontsize=size, color=color, 
+                weight=weight,
+                transform=plt.gca().transAxes)
+        y_position -= 0.07
+    
+    plt.tight_layout()
+    
+    # Save to bytes buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
+
+
+
+async def generate_pnl_image(trade_details: List[Dict], total_pnl: float, overall_pnl_percent: float) -> io.BytesIO:
+    """Generate a simple text-based performance image without graphs"""
+    # Create figure
+    plt.figure(figsize=(10, 8))
+    try:
+        bg_image = plt.imread('askjahback.png')
+        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
+    except:
+        # Fallback to dark background if custom image not found
+        plt.style.use('dark_background')
+    
+    plt.axis('off')
+    
+    multiple = (overall_pnl_percent / 100) + 1
+    
+    text_content = [
+        ("ASKJAH TRADING PERFORMANCE", 24, "#FFFFFF", "bold", "normal"),
+        (f"\nTOTAL RETURN: {overall_pnl_percent:+.1f}%", 28, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold", "normal"),
+        (f"\n{multiple:.1f}X YOUR CAPITAL", 22, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold", "normal"),
+        (f"\n\nTOTAL P&L: ${total_pnl:+.2f}", 20, "#FFFFFF", "normal", "normal"),
+        ("\n\nTOP PERFORMERS:", 18, "#FFFFFF", "bold", "normal")
+    ]
+    
+    # Add top 3 performing trades
+    top_trades = sorted(trade_details, key=lambda x: x['pnl_percent'], reverse=True)[:3]
+    for i, trade in enumerate(top_trades):
+        trade_multiple = (trade['pnl_percent'] / 100) + 1
+        text_content.append(
+            (f"\n{i+1}. {trade['symbol']}: {trade['pnl_percent']:+.1f}% ({trade_multiple:.1f}X)", 
+             16, "#00FF00" if trade['pnl_percent'] >= 0 else "#FF0000", "normal", "normal")
+        )
+    
+    text_content.append(("\n\nTRADING MADE EASIER", 16, "#FFFFFF", "normal", "italic"))
+    text_content.append(("\n@ASKJAH_BOT", 14, "#CCCCCC", "normal", "normal"))
+    
+    # Add all text elements
+    y_position = 0.95
+    for text, size, color, weight, style in text_content:
+        plt.text(0.5, y_position, text, 
+                ha='center', va='top', 
+                fontsize=size, color=color, 
+                weight=weight,
+                fontstyle=style,
+                transform=plt.gca().transAxes)
+        y_position -= (size * 0.015)  # Adjust vertical spacing
+    
+    plt.tight_layout()
+    
+    # Save to bytes buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor='#000000')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
+
+# Add this function to generate a shareable PnL image
+async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, win_rate: float) -> io.BytesIO:
+    """Generate a marketing-friendly PnL image for sharing"""
+    # Create figure with attractive design
+    plt.figure(figsize=(8, 6))
+    try:
+        bg_image = plt.imread('askjahback.png')
+        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
+    except:
+        # Fallback to dark background if custom image not found
+        plt.style.use('dark_background')
+    
+    plt.axis('off')
+    
+    # Create a simple, attractive design
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#F9C80E']
+    
+    # Create donut chart for win rate
+    plt.subplot(1, 2, 1)
+    sizes = [win_rate, 100 - win_rate]
+    labels = ['Wins', 'Losses']
+    explode = (0.1, 0)
+    plt.pie(sizes, explode=explode, labels=labels, colors=colors[:2],
+            autopct='%1.1f%%', shadow=True, startangle=90)
+    plt.axis('equal')
+    plt.title('Win Rate')
+    
+    # Create summary section
+    plt.subplot(1, 2, 2)
+    plt.axis('off')
+    
+    # Determine sentiment emoji
+    if overall_pnl_percent >= 10:
+        emoji = "🚀"
+    elif overall_pnl_percent >= 0:
+        emoji = "👍"
+    else:
+        emoji = "📉"
+    
+    summary_text = (
+        f"{emoji} Daily Performance {emoji}\n\n"
+        f"Return: {overall_pnl_percent:+.1f}%\n"
+        f"P&L: ${total_pnl:+.2f}\n\n"
+        "Powered by @ASKJAH_BOT\n"
+        "Join: t.me/ASKJAH_BOT"
+    )
+    
+    plt.text(0.5, 0.5, summary_text, ha='center', va='center', 
+             fontsize=12, bbox=dict(boxstyle="round,pad=1", facecolor="#2C3E50", alpha=0.9))
+    
+    plt.tight_layout()
+    
+    # Save to bytes buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
+
+async def fix_incomplete_trade_records(user_id: int):
+    """Fix trade records that might be missing required fields"""
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        return
+    
+    updated = False
+    trade_history = user.get('trade_history', [])
+    
+    for i, trade in enumerate(trade_history):
+        # Ensure all trade records have both sell_price and profit_pct
+        if 'sell_price' not in trade and 'buy_price' in trade and 'amount' in trade:
+            # Try to get current price for the token
+            try:
+                token = await fetch_token_by_contract(trade.get('contract', ''))
+                if token:
+                    trade_history[i]['sell_price'] = token['price_usd']
+                    # Calculate profit percentage
+                    buy_price = trade['buy_price']
+                    profit_pct = ((token['price_usd'] - buy_price) / buy_price) * 100
+                    trade_history[i]['profit_pct'] = profit_pct
+                    updated = True
+            except Exception as e:
+                logger.error(f"Could not fix trade record for user {user_id}: {e}")
+    
+    if updated:
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'trade_history': trade_history}}
+        )
+        logger.info(f"Fixed incomplete trade records for user {user_id}")
+
+async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
+    """Check if daily loss limit has been exceeded with proper error handling"""
+    daily_loss_limit = user.get('daily_loss_limit', 0.05)  # Default 5%
+    
+    # Get today's trades
+    today = datetime.now().date()
+    today_trades = [
+        t for t in user.get('trade_history', []) 
+        if datetime.fromisoformat(t['timestamp']).date() == today
+    ]
+    
+    # Calculate today's P&L with proper error handling
+    daily_pnl = 0
+    for trade in today_trades:
+        try:
+            if 'profit_pct' in trade:
+                # Convert percentage to SOL amount
+                trade_value = trade['amount'] * trade['buy_price']
+                daily_pnl += trade_value * (trade['profit_pct'] / 100)
+            elif 'sell_price' in trade and 'buy_price' in trade:
+                # Fallback calculation
+                trade_profit = (trade['sell_price'] - trade['buy_price']) * trade['amount']
+                daily_pnl += trade_profit
+            else:
+                logger.warning(f"Incomplete trade record for P&L calculation: {trade}")
+                continue
+        except KeyError as e:
+            logger.error(f"Missing field in trade record: {e}. Trade: {trade}")
+            continue
+    
+    # Calculate percentage of portfolio
+    sol_balance = await check_balance(user_id, 'solana')
+    portfolio_value = sol_balance
+    for contract, holding in user.get('portfolio', {}).items():
+        portfolio_value += holding['amount']
+    
+    if portfolio_value > 0:
+        loss_pct = abs(min(daily_pnl, 0)) / portfolio_value
+        if loss_pct >= daily_loss_limit:
+            # Try to notify the user (we don't have context here)
+            try:
+                # You might need to store the bot instance globally or find another way to send messages
+                # For now, just log it
+                logger.warning(f"User {user_id} reached daily loss limit ({loss_pct*100:.1f}%)")
+            except:
+                pass
+            return True
+    
+    return False
+
+
+async def execute_auto_buy(context, user_id, token, buy_amount):
+    """Execute automatic buy with liquidity-aware position sizing"""
+    try:
+        # Get total capital for position sizing
+        sol_balance = await check_balance(user_id, 'solana')
+        user = users_collection.find_one({'user_id': user_id})
+        portfolio = user.get('portfolio', {})
+        
+        # Calculate total portfolio value
+        total_portfolio_value = sol_balance
+        for contract, holding in portfolio.items():
+            # Get current price for each holding
+            holding_token = await fetch_token_by_contract(contract)
+            if holding_token:
+                token_count = holding['amount'] / holding['buy_price']
+                current_value = token_count * holding_token['price_usd']
+                total_portfolio_value += current_value
+        
+        # Calculate maximum position size based on liquidity
+        liquidity_max = token['liquidity'] * 0.05 / 150  # 5% of liquidity converted to SOL
+        portfolio_max = total_portfolio_value * POSITION_SIZE_PERCENT
+        
+        # Use the smaller of the two limits
+        actual_buy_amount = min(buy_amount, liquidity_max, portfolio_max)
+        
+        if actual_buy_amount < 0.001:  # Minimum trade size
+            await notify_user(
+                context, user_id,
+                f"⏭️ Skipping {token['name']} - liquidity too low for any position",
+                "Auto-Buy Skipped"
+            )
+            return False
+        
+        # Check if we can actually execute this trade
+        is_feasible, reason = await check_trade_feasibility(token, actual_buy_amount)
+        if not is_feasible:
+            await notify_user(
+                context, user_id,
+                f"⏭️ Skipping {token['name']} - {reason}",
+                "Auto-Buy Skipped"
+            )
+            return False
+        
+        # Get technical indicators for better entry timing
+        token_performance = token_performance_collection.find_one(
+            {'contract_address': token['contract_address']}
+        )
+        
+        price_history = []
+        if token_performance and 'performance_history' in token_performance:
+            price_history = [entry['price'] for entry in token_performance['performance_history'][-20:]]  # Last 20 prices
+        
+        indicators = calculate_technical_indicators(price_history)
+        
+        # Enhanced entry criteria
+        good_entry = False
+        entry_reason = ""
+        
+        if indicators:
+            # Strategy 1: Oversold bounce
+            if indicators['oversold'] and indicators['rsi'] > 30 + 5:  # RSI moving up from oversold
+                good_entry = True
+                entry_reason = "Oversold bounce"
+            
+            # Strategy 2: Breakout with volume and momentum
+            elif (indicators['ma_crossover'] and indicators['positive_momentum'] and 
+                  token['volume'] > user.get('min_volume', 1000) * 2):  # Double minimum volume
+                good_entry = True
+                entry_reason = "Breakout with volume and momentum"
+            
+            # Strategy 3: Strong momentum continuation
+            elif (indicators['roc_5'] > 10 and indicators['sma_5'] > indicators['sma_15']):
+                good_entry = True
+                entry_reason = "Strong momentum continuation"
+        else:
+            # Fallback to basic criteria if no indicator data
+            if token['liquidity'] > user.get('min_liquidity', 5000) and token['volume'] > user.get('min_volume', 1000):
+                good_entry = True
+                entry_reason = "Basic criteria"
+        
+        if not good_entry:
+            await notify_user(
+                context, user_id,
+                f"⏭️ Skipping {token['name']} - does not meet entry criteria",
+                "Auto-Buy Skipped"
+            )
+            return False
+        
+        # Execute trade
+        success, message = await execute_trade(
+            user_id, 
+            token['contract_address'], 
+            actual_buy_amount, 
+            'buy', 
+            'solana',
+            token
+        )
+        
+        if success:
+            # Store additional trade metadata
+            trade_metadata = {
+                'name': token['name'],
+                'symbol': token['symbol'],
+                'amount': actual_buy_amount,
+                'buy_price': token['price_usd'],
+                'buy_time': datetime.now().isoformat(),
+                'entry_reason': entry_reason,
+                'indicators': indicators,
+                'stop_loss': token['price_usd'] * (1 - HARD_STOP_LOSS),  # Hard stop loss
+                'profit_targets': [
+                    {'percentage': 0.20, 'target_price': token['price_usd'] * 1.20, 'allocation': 0.4},
+                    {'percentage': 0.50, 'target_price': token['price_usd'] * 1.50, 'allocation': 0.3},
+                    {'percentage': 1.00, 'target_price': token['price_usd'] * 2.00, 'allocation': 0.3}
+                ],
+                'trailing_stop': TRAILING_STOP_PERCENT,
+                'time_entry': time.time(),
+                'buy_time_liquidity': token['liquidity']  # Store liquidity at time of purchase
+            }
+            
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    f'portfolio.{token["contract_address"]}': trade_metadata,
+                    'last_trade_time': time.time()
+                }}
+            )
+            
+            await notify_user(
+                context, user_id,
+                f"🤖 AUTOBUY: {message}\nEntry: {entry_reason}\nSize: {actual_buy_amount:.4f} SOL ({POSITION_SIZE_PERCENT*100}% of portfolio)",
+                "Auto-Buy Executed"
+            )
+            return True
+        else:
+            # Add to blacklist if trade fails
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'auto_trade_blacklist': token['contract_address']}}
+            )
+            await notify_user(
+                context, user_id,
+                f"❌ AUTOBUY FAILED: {message}",
+                "Auto-Buy Failed"
+            )
+            return False
+            
+    except Exception as e:
+        logger.error(f"Auto-buy execution error: {str(e)}")
+        await notify_user(
+            context, user_id,
+            f"❌ AUTOBUY ERROR: {str(e)}",
+            "Auto-Buy Error"
+        )
+        return False
+
+
+async def generate_auto_trade_report(user_id: int, token: Dict[str, Any], decision_data: Dict[str, Any]):
+    """Generate a detailed report on why a token was/wasn't auto-traded"""
+    report = f"🤖 AUTO-TRADE DECISION REPORT\n\n"
+    report += f"Token: {token['name']} ({token['symbol']})\n"
+    report += f"Contract: {token['contract_address'][:8]}...\n"
+    report += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    
+    report += "📊 TOKEN METRICS:\n"
+    report += f"• Price: ${token['price_usd']:.8f}\n"
+    report += f"• Liquidity: ${token['liquidity']:,.2f}\n"
+    report += f"• Volume: ${token['volume']:,.2f}\n"
+    report += f"• Market Cap: ${token.get('market_cap', 0):,.2f}\n\n"
+    
+    report += "⚙️ USER SETTINGS:\n"
+    user = users_collection.find_one({'user_id': user_id})
+    if user:
+        report += f"• Min Liquidity: ${user.get('min_liquidity', 1000):,.2f}\n"
+        report += f"• Min Volume: ${user.get('min_volume', 500):,.2f}\n"
+        report += f"• Max Positions: {user.get('max_positions', 5)}\n"
+        report += f"• Position Size: {user.get('position_size_percent', 5)}%\n\n"
+    
+    report += "🔍 DECISION ANALYSIS:\n"
+    for check_name, check_result in decision_data.items():
+        status = "✅ PASS" if check_result['passed'] else "❌ FAIL"
+        report += f"• {check_name}: {status}\n"
+        if not check_result['passed']:
+            report += f"  Reason: {check_result['reason']}\n"
+    
+    # Add overall decision
+    all_passed = all(check['passed'] for check in decision_data.values())
+    final_decision = "APPROVED" if all_passed else "REJECTED"
+    report += f"\n🎯 FINAL DECISION: {final_decision}"
+    
+    return report
+    
+async def emergency_sell_protocol(context, user_id, token, token_data):
+    """
+    Try to sell tokens that have become illiquid using aggressive parameters
+    """
+    contract_address = token['contract_address']
+    
+    # Try with extremely high slippage
+    user = users_collection.find_one({'user_id': user_id})
+    original_slippage = user.get('max_slippage', 5)
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {'emergency_sell_mode': True, 'max_slippage': 50}}  # 50% slippage!
+    )
+    
+    try:
+        # Calculate token amount
+        token_amount = token_data['amount'] / token_data['buy_price']
+        
+        # Try to sell with aggressive settings
+        success, message = await execute_trade(
+            user_id, contract_address, token_amount, 'sell', 'solana', token
+        )
+        
+        if success:
+            await notify_user(
+                context, user_id,
+                f"🚨 EMERGENCY SELL: {message}",
+                "Emergency Sell Executed"
+            )
+            return True
+        else:
+            # Mark token as unsellable
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'unsellable_tokens': contract_address}}
+            )
+            await notify_user(
+                context, user_id,
+                f"💀 Token {token['name']} appears completely illiquid and cannot be sold.",
+                "Token Possibly Rugged"
+            )
+            return False
+            
+    finally:
+        # Restore original settings
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'max_slippage': original_slippage}, '$unset': {'emergency_sell_mode': True}}
+        )
+
+async def execute_auto_sell(context, user_id, token, token_data, reason):
+    """Execute automatic sell with emergency fallback"""
+    try:
+        current_price = token['price_usd']
+        buy_price = token_data['buy_price']
+        price_change_pct = (current_price - buy_price) / buy_price
+        
+        # Check if we should take partial profits
+        take_profit = False
+        sell_reason = reason
+        sell_percentage = 1.0  # Default to 100%
+        
+        # Check profit targets
+        if 'profit_targets' in token_data:
+            for target in token_data['profit_targets']:
+                if current_price >= target['target_price'] and not token_data.get(f'target_{target["percentage"]}_hit', False):
+                    take_profit = True
+                    sell_percentage = target['allocation']
+                    sell_reason = f"{target['percentage']*100}% profit target hit"
+                    # Mark this target as hit
+                    users_collection.update_one(
+                        {'user_id': user_id},
+                        {'$set': {f'portfolio.{token["contract_address"]}.target_{target["percentage"]}_hit': True}}
+                    )
+                    break
+        
+        # Implement trailing stop loss
+        if not take_profit and 'trailing_stop' in token_data:
+            highest_price = token_data.get('highest_price', buy_price)
+            if current_price > highest_price:
+                # Update highest price
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {f'portfolio.{token["contract_address"]}.highest_price': current_price}}
+                )
+            else:
+                # Check if current price has dropped by trailing stop percentage from highest
+                trailing_stop_price = highest_price * (1 - token_data['trailing_stop'])
+                if current_price <= trailing_stop_price:
+                    take_profit = True
+                    sell_reason = f"Trailing stop loss triggered ({token_data['trailing_stop']*100}%)"
+        
+        # Check time-based exit (60 minutes)
+        if not take_profit and 'time_entry' in token_data:
+            time_held = time.time() - token_data['time_entry']
+            if time_held > 3600:  # 60 minutes
+                take_profit = True
+                sell_percentage = 1.0
+                sell_reason = "Time-based exit (60 minutes)"
+        
+        # If not taking profit, check regular stop loss
+        if not take_profit and current_price <= token_data.get('stop_loss', buy_price * (1 - HARD_STOP_LOSS)):
+            take_profit = True
+            sell_reason = f"Stop loss triggered ({((buy_price - current_price)/buy_price)*100:.1f}% loss)"
+        
+        # If none of the conditions are met, don't sell
+        if not take_profit:
+            return False
+        
+        # Calculate token amount to sell
+        token_amount = (token_data['amount'] / token_data['buy_price']) * sell_percentage
+        
+        # Execute trade
+        success, message = await execute_trade(
+            user_id, 
+            token['contract_address'], 
+            token_amount, 
+            'sell', 
+            'solana',
+            token
+        )
+        
+        if success:
+            # Update portfolio
+            remaining_amount = token_data['amount'] * (1 - sell_percentage)
+            
+            if remaining_amount <= 0.001:  # Dust amount, close position
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
+                )
+            else:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {f'portfolio.{token["contract_address"]}.amount': remaining_amount}}
+                )
+            
+            # Record trade history
+            trade_data = {
+                'token': token['name'],
+                'symbol': token['symbol'],
+                'contract': token['contract_address'],
+                'amount': token_data['amount'] * sell_percentage,
+                'buy_price': token_data['buy_price'],
+                'sell_price': current_price,
+                'reason': sell_reason,
+                'timestamp': datetime.now().isoformat(),
+                'profit_pct': price_change_pct * 100
+            }
+            
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$push': {'trade_history': trade_data}}
+            )
+            
+            # Update last trade time
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {'last_trade_time': time.time()}}
+            )
+            
+            await notify_user(
+                context, user_id,
+                f"🤖 AUTOSELL: {message}\nReason: {sell_reason}\nProfit: {price_change_pct*100:.2f}%",
+                "Auto-Sell Executed"
+            )
+            return True
+        else:
+            # Check if this might be a liquidity issue and try emergency protocol
+            if "6025" in message or "liquidity" in message.lower() or "slippage" in message.lower():
+                return await emergency_sell_protocol(context, user_id, token, token_data)
+            else:
+                await notify_user(
+                    context, user_id,
+                    f"❌ AUTOSELL FAILED: {message}",
+                    "Auto-Sell Failed"
+                )
+                return False
+            
+    except Exception as e:
+        logger.error(f"Auto-sell execution error: {str(e)}")
+        
+        # Check if this might be a liquidity issue
+        if "6025" in str(e) or "liquidity" in str(e).lower():
+            return await emergency_sell_protocol(context, user_id, token, token_data)
+        else:
+            await notify_user(
+                context, user_id,
+                f"❌ AUTOSELL ERROR: {str(e)}",
+                "Auto-Sell Error"
+            )
+            return False
+
+async def monitor_portfolio_liquidity(context: ContextTypes.DEFAULT_TYPE):
+    """Monitor liquidity of tokens in portfolio and alert if deteriorating"""
+    logger.info("🔍 Monitoring portfolio liquidity...")
+    
+    active_users = users_collection.find({
+        "subscription_status": "active",
+        "subscription_expiry": {"$gt": datetime.now().isoformat()}
+    })
+    
+    for user in active_users:
+        user_id = user['user_id']
+        portfolio = user.get('portfolio', {})
+        
+        for contract, token_data in portfolio.items():
+            token = await fetch_token_by_contract(contract)
+            if not token:
+                continue
+                
+            # Check if liquidity has dropped significantly
+            if (token_data.get('buy_time_liquidity', 0) > 0 and 
+                token['liquidity'] < token_data['buy_time_liquidity'] * 0.5):
+                
+                await notify_user(
+                    context, user_id,
+                    f"⚠️ Liquidity Alert: {token_data['name']}\n"
+                    f"Liquidity dropped from ${token_data['buy_time_liquidity']:,.2f} "
+                    f"to ${token['liquidity']:,.2f} (-{((1 - token['liquidity']/token_data['buy_time_liquidity'])*100):.1f}%)",
+                    "Liquidity Warning"
+                )
+                
+                # Suggest selling if liquidity is critically low
+                if token['liquidity'] < 1000:
+                    await notify_user(
+                        context, user_id,
+                        f"🚨 CRITICAL: {token_data['name']} liquidity is now only ${token['liquidity']:,.2f}. "
+                        f"Consider emergency sell with /emergency_sell {contract}",
+                        "Critical Liquidity Alert"
+                    )
+
+async def daily_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Calculate and display daily profit/loss with image"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "DAILY_PNL_REQUEST")
+    
+    if not await check_subscription(user_id):
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        await update.message.reply_text("🚫 No user data found.")
+        return
+        
+    # Get today's date
+    today = datetime.now().date()
+    today_start = datetime.combine(today, datetime.min.time())
+    today_end = datetime.combine(today, datetime.max.time())
+    
+    # Filter trades from today
+    trade_history = user.get('trade_history', [])
+    today_trades = [
+        trade for trade in trade_history 
+        if today_start <= datetime.fromisoformat(trade['timestamp']) <= today_end
+    ]
+    
+    if not today_trades:
+        await update.message.reply_text("📊 No trades executed today.")
+        return
+    
+    # Calculate P&L
+    total_pnl = 0
+    winning_trades = 0
+    losing_trades = 0
+    trade_details = []
+    
+    for trade in today_trades:
+        if 'buy_price' in trade and 'sell_price' in trade:
+            investment = trade['amount'] * trade['buy_price']
+            returns = trade['amount'] * trade['sell_price']
+            pnl = returns - investment
+            pnl_percent = (pnl / investment) * 100 if investment > 0 else 0
+            
+            total_pnl += pnl
+            
+            if pnl > 0:
+                winning_trades += 1
+            elif pnl < 0:
+                losing_trades += 1
+                
+            trade_details.append({
+                'symbol': trade.get('symbol', 'UNKNOWN'),
+                'pnl': pnl,
+                'pnl_percent': pnl_percent,
+                'status': 'CLOSED'
+            })
+        elif 'buy_price' in trade:
+            # Handle open positions
+            current_price = await get_current_price(trade.get('contract', ''))
+            if current_price:
+                investment = trade['amount'] * trade['buy_price']
+                current_value = trade['amount'] * current_price
+                pnl = current_value - investment
+                pnl_percent = (pnl / investment) * 100 if investment > 0 else 0
+                
+                trade_details.append({
+                    'symbol': trade.get('symbol', 'UNKNOWN'),
+                    'pnl': pnl,
+                    'pnl_percent': pnl_percent,
+                    'status': 'OPEN'
+                })
+    
+    # Calculate overall metrics
+    total_investment = sum(trade['amount'] * trade['buy_price'] for trade in today_trades if 'buy_price' in trade)
+    overall_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
+    win_rate = (winning_trades / len(today_trades)) * 100 if today_trades else 0
+    
+    # Generate detailed image
+    pnl_image = await generate_pnl_image(trade_details, total_pnl, overall_pnl_percent)
+    
+    # Generate shareable image
+    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate)
+    
+    # Send detailed image to user
+    await update.message.reply_photo(
+        photo=pnl_image,
+        caption=f"📊 Your Daily P&L Report - {today.strftime('%Y-%m-%d')}"
+    )
+    
+    # Send shareable image with sharing instructions
+    await update.message.reply_photo(
+        photo=shareable_image,
+        caption=(
+            "🎉 Share your success with others!\n\n"
+            "This image is designed for sharing on social media. "
+            "It shows your overall performance without revealing sensitive details.\n\n"
+            "Tip: You can forward this image to friends or post it in groups to show off your trading skills!"
+        )
+    )
+    
+    # Also send text summary
+    report = f"📊 *Daily P&L Report - {today.strftime('%Y-%m-%d')}*\n\n"
+    report += f"• Total P&L: ${total_pnl:+.2f}\n"
+    report += f"• Return: {overall_pnl_percent:+.2f}%\n"
+    report += f"• Winning Trades: {winning_trades}\n"
+    report += f"• Losing Trades: {losing_trades}\n"
+    report += f"• Win Rate: {win_rate:.1f}%\n\n"
+    
+    if total_pnl > 0:
+        report += "🎉 Great job! You're in profit today!"
+    elif total_pnl < 0:
+        report += "📉 You're down today. Review your strategy."
+    else:
+        report += "➖ Break-even day. No gains, no losses."
+    
+    await update.message.reply_text(report, parse_mode='Markdown')
+
+
+
+async def share_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Share a marketing-friendly PnL image"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "SHARE_PNL_REQUEST")
+    
+    # Calculate today's P&L (similar to daily_pnl)
+    today = datetime.now().date()
+    today_start = datetime.combine(today, datetime.min.time())
+    today_end = datetime.combine(today, datetime.max.time())
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        await update.message.reply_text("🚫 No user data found.")
+        return
+        
+    trade_history = user.get('trade_history', [])
+    today_trades = [
+        trade for trade in trade_history 
+        if today_start <= datetime.fromisoformat(trade['timestamp']) <= today_end
+    ]
+    
+    if not today_trades:
+        await update.message.reply_text("📊 No trades executed today. Nothing to share!")
+        return
+    
+    # Calculate total P&L and win rate
+    total_pnl = 0
+    winning_trades = 0
+    
+    for trade in today_trades:
+        if 'buy_price' in trade and 'sell_price' in trade:
+            investment = trade['amount'] * trade['buy_price']
+            returns = trade['amount'] * trade['sell_price']
+            pnl = returns - investment
+            total_pnl += pnl
+            
+            if pnl > 0:
+                winning_trades += 1
+    
+    win_rate = (winning_trades / len(today_trades)) * 100 if today_trades else 0
+    total_investment = sum(trade['amount'] * trade['buy_price'] for trade in today_trades if 'buy_price' in trade)
+    overall_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
+    
+    # Generate shareable image
+    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate)
+    
+    # Send image with sharing encouragement
+    await update.message.reply_photo(
+        photo=shareable_image,
+        caption=(
+            "🚀 Share your trading success!\n\n"
+            "Show others what's possible with our AI-powered trading bot. "
+            "This image highlights your performance without revealing sensitive details.\n\n"
+            "Pro Tip: Post this in crypto groups with a caption like:\n"
+            "'Another profitable day with the AI Trading Bot! 🚀'\n\n"
+            "Want to try it yourself? Join: t.me/yourbottoken"
+        )
+    )
+
+
+async def get_current_price(contract_address: str) -> Optional[float]:
+    """Get current price for a token"""
+    try:
+        token = await fetch_token_by_contract(contract_address)
+        return token['price_usd'] if token else None
+    except:
+        return None
+
+async def emergency_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual emergency sell command for illiquid tokens"""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text("Please specify a token contract address: /emergency_sell <contract>")
+        return
+        
+    contract_address = context.args[0]
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user or contract_address not in user.get('portfolio', {}):
+        await update.message.reply_text("You don't hold this token in your portfolio.")
+        return
+        
+    token_data = user['portfolio'][contract_address]
+    token = await fetch_token_by_contract(contract_address)
+    
+    if not token:
+        await update.message.reply_text("Could not fetch token data.")
+        return
+        
+    await update.message.reply_text(f"🚨 Attempting emergency sell of {token_data['name']}...")
+    
+    success = await emergency_sell_protocol(context, user_id, token, token_data)
+    
+    if success:
+        await update.message.reply_text("Emergency sell completed!")
+    else:
+        await update.message.reply_text("Emergency sell failed. Token may be completely illiquid.")                    
+    
+async def is_legitimate_token(token: Dict[str, Any]) -> bool:
+    """Check if a token appears to be legitimate"""
+    try:
+        # Check for common scam patterns
+        if token['liquidity'] < 1000:  # Very low liquidity
+            return False
+            
+        if token.get('holders', 0) < 50:  # Very few holders
+            return False
+            
+        # Check if creator burned LP tokens (not a perfect check but helpful)
+        # This would require additional on-chain analysis
+        
+        return True
+    except:
+        return False
+
+
+=======
+>>>>>>> 3e41d125b4c6ebc4496fe271a92149d77a6dcb7d
 def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]:
     """
     Calculate technical indicators using pure Python.
     Returns an empty dict if not enough data is available.
     """
-
-    
     if len(price_history) < 15:  # Need at least 15 periods for meaningful indicators
         return {}
-
-        
     
     try:
-
-        if not all(isinstance(price, (int, float)) for price in price_history):
-         logger.error("Invalid price values in history")
-         return {}
         # Simple Moving Averages
         sma_5 = sum(price_history[-5:]) / 5
         sma_15 = sum(price_history[-15:]) / 15
@@ -4679,8 +5829,6 @@ def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]
         # Calculate RSI
         gains = []
         losses = []
-
-       
         
         for i in range(1, len(price_history)):
             change = price_history[i] - price_history[i-1]
