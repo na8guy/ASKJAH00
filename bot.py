@@ -3,7 +3,6 @@ from eth_account import Account
 Account.enable_unaudited_hdwallet_features()
 import asyncio
 import logging
-from functools import lru_cache
 import json
 import aiohttp
 import httpx
