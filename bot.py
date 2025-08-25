@@ -397,6 +397,31 @@ async def check_subscription(user_id: int) -> bool:
         log_user_action(user_id, "NEW_USER_TRIAL_STARTED")
         return True
         
+    # Check for pending payments
+    if user.get('subscription_payment_sent') and user.get('last_payment_tx'):
+        # Check if payment has been confirmed
+        try:
+            tx_status = await solana_client.get_transaction(
+                user['last_payment_tx'],
+                commitment="confirmed"
+            )
+            
+            if tx_status.value and not tx_status.value.transaction.meta.err:
+                # Payment confirmed!
+                expiry = datetime.now() + timedelta(days=7)
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {
+                        'subscription_status': 'active',
+                        'subscription_expiry': expiry.isoformat(),
+                        'subscription_payment_sent': False
+                    }}
+                )
+                log_user_action(user_id, "SUBSCRIPTION_AUTO_ACTIVATED", f"TX: {user['last_payment_tx']}")
+                return True
+        except Exception as e:
+            logger.error(f"Error checking payment status for user {user_id}: {str(e)}")
+    
     # Existing user check
     status = user.get('subscription_status')
     expiry = user.get('subscription_expiry')
@@ -1939,8 +1964,15 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         to_pubkey = Pubkey.from_string(BOT_SOL_ADDRESS)
         amount_lamports = int(SUBSCRIPTION_SOL_AMOUNT * 10**9)  # Convert SOL to lamports
         
-        # Get recent blockhash
-        recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
+        # Get recent blockhash with retry logic
+        for attempt in range(MAX_RPC_RETRIES):
+            try:
+                recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
+                break
+            except Exception as e:
+                if attempt == MAX_RPC_RETRIES - 1:
+                    raise e
+                await asyncio.sleep(RPC_RETRY_DELAY * (attempt + 1))
         
         # Create message
         message = Message.new_with_blockhash(
@@ -1955,44 +1987,77 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             recent_blockhash
         )
         
-        # Create transaction
-        txn = Transaction([keypair], message, recent_blockhash)
-        
-        # Sign transaction with all required parameters
+        # Create and sign transaction
+        txn = Transaction.new_unsigned(message)
         txn.sign([keypair], recent_blockhash)
         
-        # Send transaction
-        tx_hash = await solana_client.send_transaction(txn)
-        logger.info(f"Subscription payment sent: {tx_hash.value}")
+        # Send transaction with retry logic
+        for attempt in range(MAX_RPC_RETRIES):
+            try:
+                tx_hash = await solana_client.send_transaction(txn)
+                logger.info(f"Subscription payment sent: {tx_hash.value}")
+                break
+            except Exception as e:
+                if attempt == MAX_RPC_RETRIES - 1:
+                    raise e
+                await asyncio.sleep(RPC_RETRY_DELAY * (attempt + 1))
         
-        # Confirm transaction
-        await solana_client.confirm_transaction(tx_hash.value, commitment="confirmed")
-        log_user_action(user_id, "SUBSCRIPTION_PAYMENT_SENT", f"TX: {tx_hash.value}")
+        # Confirm transaction with timeout
+        try:
+            confirmation = await asyncio.wait_for(
+                solana_client.confirm_transaction(tx_hash.value, commitment="confirmed"),
+                timeout=30.0
+            )
+            
+            if confirmation.value and not confirmation.value[0].err:
+                # Update subscription status
+                expiry = datetime.now() + timedelta(days=7)
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {
+                        'subscription_status': 'active',
+                        'subscription_expiry': expiry.isoformat(),
+                        'last_payment_tx': str(tx_hash.value)
+                    }}
+                )
+                log_user_action(user_id, "SUBSCRIPTION_ACTIVATED", f"Expiry: {expiry}")
+                
+                await query.edit_message_text(
+                    f"✅ Subscription activated! You now have full access until {expiry.strftime('%Y-%m-%d')}.\n\n"
+                    f"Transaction: https://solscan.io/tx/{tx_hash.value}"
+                )
+            else:
+                error_msg = confirmation.value[0].err if confirmation.value else 'Unknown error'
+                raise Exception(f"Transaction failed: {error_msg}")
+                
+        except asyncio.TimeoutError:
+            # Transaction might still succeed, so we'll mark it as pending verification
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    'subscription_payment_sent': True,
+                    'last_payment_tx': str(tx_hash.value)
+                }}
+            )
+            await query.edit_message_text(
+                f"⏳ Payment sent but confirmation is taking longer than expected.\n\n"
+                f"Transaction: https://solscan.io/tx/{tx_hash.value}\n\n"
+                f"We'll verify your payment automatically. You'll receive a confirmation message soon."
+            )
         
-        # Update subscription status
-        expiry = datetime.now() + timedelta(days=7)
-        users_collection.update_one(
-            {'user_id': user_id},
-            {'$set': {
-                'subscription_status': 'active',
-                'subscription_expiry': expiry.isoformat()
-            }}
-        )
-        log_user_action(user_id, "SUBSCRIPTION_ACTIVATED", f"Expiry: {expiry}")
-        
-        await query.edit_message_text(
-            f"✅ Subscription activated! You now have full access until {expiry.strftime('%Y-%m-%d')}.\n\n"
-            f"Transaction: https://solscan.io/tx/{tx_hash.value}"
-        )
         return ConversationHandler.END
     
     except Exception as e:
         logger.error(f"Subscription payment error: {str(e)}", exc_info=True)
         log_user_action(user_id, "SUBSCRIPTION_ERROR", str(e), "error")
-        await query.edit_message_text(
-            f"❌ Payment failed: {str(e)}\n\n"
-            "Please ensure you have enough SOL for the transaction fee."
-        )
+        
+        error_message = f"❌ Payment failed: {str(e)}"
+        if "429" in str(e) or "rate limit" in str(e).lower():
+            error_message += "\n\nPlease try again in a few moments."
+        elif "insufficient funds" in str(e).lower():
+            error_message += "\n\nPlease ensure you have enough SOL for both the payment and transaction fee."
+        
+        await query.edit_message_text(error_message)
         return ConversationHandler.END
 
 async def verify_sol_payments(context: ContextTypes.DEFAULT_TYPE):
