@@ -120,30 +120,6 @@ def log_user_action(user_id: int, action: str, details: str = "", level: str = "
     log_method(f"👤 USER ACTION: {action} - {details}", extra=extra)
 
 
-class TokenCache:
-    def __init__(self, max_size=1000, ttl_seconds=300):
-        self.cache = {}
-        self.max_size = max_size
-        self.ttl = ttl_seconds
-    
-    def get(self, key):
-        if key in self.cache:
-            data, timestamp = self.cache[key]
-            if time.time() - timestamp < self.ttl:
-                return data
-            else:
-                del self.cache[key]  # Expired
-        return None
-    
-    def set(self, key, value):
-        if len(self.cache) >= self.max_size:
-            # Remove oldest item
-            oldest_key = next(iter(self.cache))
-            del self.cache[oldest_key]
-        self.cache[key] = (value, time.time())
-
-# Global cache instance
-token_cache = TokenCache(max_size=500, ttl_seconds=180)  # Smaller TTL for faster data
 
 
 # Load environment variables
