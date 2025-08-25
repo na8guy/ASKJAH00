@@ -657,7 +657,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Ensure user exists with trial
     if not users_collection.find_one({'user_id': user_id}):
-        expiry = datetime.now() + timedelta(days=1)
+        expiry = datetime.now() + timedelta(hours=1)
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
