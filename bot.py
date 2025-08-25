@@ -3,11 +3,12 @@ from eth_account import Account
 Account.enable_unaudited_hdwallet_features()
 import asyncio
 import logging
+#from functools import lru_cache
 import json
+import aiohttp
 import httpx
 import base64
 import base58
-from functools import lru_cache
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, 
@@ -21,8 +22,8 @@ from telegram.ext import (
 )
 from typing import Optional, List, Dict, Any
 import re
-import hashlib
-import hmac
+#import hashlib
+#import hmac
 from typing import Optional
 from typing import Tuple
 from solana.rpc.async_api import AsyncClient
@@ -50,18 +51,17 @@ try:
 except ImportError:
     raise ImportError("Missing 'cryptography' package. Install it with: pip install cryptography")
 
-
-from datetime import datetime, timedelta, date, time
-
+from datetime import datetime, timedelta, date 
+import time
 import os
 from dotenv import load_dotenv
 from web3 import Web3
 from eth_account.hdaccount import ETHEREUM_DEFAULT_PATH
 from eth_account.hdaccount import generate_mnemonic
 from eth_account.hdaccount import key_from_seed
-from pymongo import UpdateOne, ReplaceOne
-from bip44 import Wallet
-from bip32utils import BIP32Key, BIP32_HARDEN
+#from pymongo import UpdateOne, ReplaceOne
+#from bip44 import Wallet
+#from bip32utils import BIP32Key, BIP32_HARDEN
 from bip_utils import Bip32Slip10Ed25519
 from solders.keypair import Keypair
 from bip_utils import Bip39MnemonicValidator, Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
@@ -86,7 +86,7 @@ from typing import Tuple
 from textblob import TextBlob
 import matplotlib.pyplot as plt
 import io
-import seaborn as sns
+#import seaborn as sns
 
 
 
@@ -105,7 +105,7 @@ file_handler.addFilter(UserFilter())
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - User:%(user_id)s - %(message)s',
     handlers=[stream_handler, file_handler]
 )
@@ -119,9 +119,32 @@ def log_user_action(user_id: int, action: str, details: str = "", level: str = "
     log_method = getattr(logger, level.lower(), logger.info)
     log_method(f"👤 USER ACTION: {action} - {details}", extra=extra)
 
-@lru_cache(maxsize=1000)
-async def check_subscription_cached(user_id: int) -> bool:
-    return await check_subscription(user_id)
+
+class TokenCache:
+    def __init__(self, max_size=1000, ttl_seconds=300):
+        self.cache = {}
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+    
+    def get(self, key):
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return data
+            else:
+                del self.cache[key]  # Expired
+        return None
+    
+    def set(self, key, value):
+        if len(self.cache) >= self.max_size:
+            # Remove oldest item
+            oldest_key = next(iter(self.cache))
+            del self.cache[oldest_key]
+        self.cache[key] = (value, time.time())
+
+# Global cache instance
+token_cache = TokenCache(max_size=500, ttl_seconds=180)  # Smaller TTL for faster data
+
 
 # Load environment variables
 load_dotenv()
@@ -231,6 +254,14 @@ for attempt in range(max_retries):
         mongo_client.admin.command('ping')
         logger.info("✅ MongoDB connection successful")
         db = mongo_client.get_database('trading_bot')
+
+        db.users.create_index([("user_id", 1)])
+        db.users.create_index([("subscription_status", 1), ("subscription_expiry", 1)])
+        db.users.create_index([("solana.public_key", 1)])
+        db.token_performance.create_index([("contract_address", 1)])
+        db.token_performance.create_index([("first_tracked", 1)])
+        db.global_posted_tokens.create_index([("contract_address", 1)])
+        db.global_posted_tokens.create_index([("timestamp", 1)], expireAfterSeconds=86400)
         
         # Create collections using the database object
         if 'users' not in db.list_collection_names():
@@ -316,41 +347,7 @@ w3_bsc = Web3(Web3.HTTPProvider(BSC_RPC))
 BOT_SOL_ADDRESS = os.getenv("BOT_SOL_ADDRESS")
 
 # USDT contract setup
-BOT_USDT_ADDRESS = os.getenv("BOT_USDT_ADDRESS")
-if not BOT_USDT_ADDRESS:
-    logger.error("BOT_USDT_ADDRESS not found in .env file")
-    raise ValueError("BOT_USDT_ADDRESS not found in .env file")
 
-try:
-    if not Web3.is_address(BOT_USDT_ADDRESS):
-        logger.error("Invalid BOT_USDT_ADDRESS: Not a valid Ethereum address")
-        raise ValueError("Invalid BOT_USDT_ADDRESS: Not a valid Ethereum address")
-    BOT_USDT_ADDRESS = Web3.to_checksum_address(BOT_USDT_ADDRESS)
-except Exception as e:
-    logger.error(f"Error validating BOT_USDT_ADDRESS: {str(e)}")
-    raise ValueError(f"Error validating BOT_USDT_ADDRESS: {str(e)}")
-
-USDT_CONTRACT_ADDRESS = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
-USDT_ABI = [
-    {
-        "constant": True,
-        "inputs": [{"name": "_owner", "type": "address"}],
-        "name": "balanceOf",
-        "outputs": [{"name": "balance", "type": "uint256"}],
-        "type": "function"
-    },
-    {
-        "anonymous": False,
-        "inputs": [
-            {"indexed": True, "name": "from", "type": "address"},
-            {"indexed": True, "name": "to", "type": "address"},
-            {"indexed": False, "name": "value", "type": "uint256"}
-        ],
-        "name": "Transfer",
-        "type": "event"
-    }
-]
-usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
 
 def derive_user_key(user_id: int) -> bytes:
     """Derive a user-specific encryption key from the master key"""
@@ -403,31 +400,6 @@ async def check_subscription(user_id: int) -> bool:
         log_user_action(user_id, "NEW_USER_TRIAL_STARTED")
         return True
         
-    # Check for pending payments
-    if user.get('subscription_payment_sent') and user.get('last_payment_tx'):
-        # Check if payment has been confirmed
-        try:
-            tx_status = await solana_client.get_transaction(
-                user['last_payment_tx'],
-                commitment="confirmed"
-            )
-            
-            if tx_status.value and not tx_status.value.transaction.meta.err:
-                # Payment confirmed!
-                expiry = datetime.now() + timedelta(days=7)
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$set': {
-                        'subscription_status': 'active',
-                        'subscription_expiry': expiry.isoformat(),
-                        'subscription_payment_sent': False
-                    }}
-                )
-                log_user_action(user_id, "SUBSCRIPTION_AUTO_ACTIVATED", f"TX: {user['last_payment_tx']}")
-                return True
-        except Exception as e:
-            logger.error(f"Error checking payment status for user {user_id}: {str(e)}")
-    
     # Existing user check
     status = user.get('subscription_status')
     expiry = user.get('subscription_expiry')
@@ -663,7 +635,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Ensure user exists with trial
     if not users_collection.find_one({'user_id': user_id}):
-        expiry = datetime.now() + timedelta(hours=1)
+        expiry = datetime.now() + timedelta(days=1)
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
@@ -706,7 +678,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         welcome_message = (
             "👋 *Welcome to the Multi-Chain Trading Bot!*\n\n"
-            "🔹 You have a *1-hour free trial* to test all features\n"
+            "🔹 You have a *1-day free trial* to test all features\n"
             "🔹 Trade Solana tokens with ease\n"
             "🔹 Get alerts for new tokens automatically\n\n"
             "Would you like to:\n"
@@ -1194,10 +1166,16 @@ async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error updating performance for {contract_address}: {str(e)}")
 
 def calculate_price_change(token, current_data):
-    """Calculate price change percentage with precision"""
-    initial_price = token['initial_metrics']['price']
-    current_price = current_data['price_usd']
-    return ((current_price - initial_price) / initial_price) * 100 
+    """Calculate price change percentage with None value handling"""
+    initial_price = token['initial_metrics'].get('price')
+    current_price = current_data.get('price_usd')
+    
+    # Handle None values
+    if initial_price is None or current_price is None:
+        logger.warning(f"Missing price data for token {token.get('contract_address')}")
+        return 0  # Return 0% change if data is missing
+    
+    return ((current_price - initial_price) / initial_price) * 100
 
 
 def calculate_liquidity_health(token, current_data):
@@ -1222,12 +1200,20 @@ def calculate_liquidity_health(token, current_data):
 
 
 def calculate_volatility(token, current_data):
-    """Calculate volatility based on price history"""
-    if len(token['performance_history']) < 2:
+    """Calculate volatility with None value handling"""
+    if len(token.get('performance_history', [])) < 2:
         return 0
     
-    prices = [p['price'] for p in token['performance_history']]
-    prices.append(current_data['price_usd'])
+    prices = [p.get('price', 0) for p in token['performance_history']]
+    current_price = current_data.get('price_usd', 0)
+    
+    # Filter out None values
+    prices = [p for p in prices if p is not None]
+    if current_price is not None:
+        prices.append(current_price)
+    
+    if not prices or len(prices) < 2:
+        return 0
     
     # Calculate standard deviation of logarithmic returns
     returns = []
@@ -1970,15 +1956,8 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         to_pubkey = Pubkey.from_string(BOT_SOL_ADDRESS)
         amount_lamports = int(SUBSCRIPTION_SOL_AMOUNT * 10**9)  # Convert SOL to lamports
         
-        # Get recent blockhash with retry logic
-        for attempt in range(MAX_RPC_RETRIES):
-            try:
-                recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
-                break
-            except Exception as e:
-                if attempt == MAX_RPC_RETRIES - 1:
-                    raise e
-                await asyncio.sleep(RPC_RETRY_DELAY * (attempt + 1))
+        # Get recent blockhash
+        recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
         # Create message
         message = Message.new_with_blockhash(
@@ -1993,77 +1972,44 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             recent_blockhash
         )
         
-        # Create and sign transaction
-        txn = Transaction.new_unsigned(message)
+        # Create transaction
+        txn = Transaction([keypair], message, recent_blockhash)
+        
+        # Sign transaction with all required parameters
         txn.sign([keypair], recent_blockhash)
         
-        # Send transaction with retry logic
-        for attempt in range(MAX_RPC_RETRIES):
-            try:
-                tx_hash = await solana_client.send_transaction(txn)
-                logger.info(f"Subscription payment sent: {tx_hash.value}")
-                break
-            except Exception as e:
-                if attempt == MAX_RPC_RETRIES - 1:
-                    raise e
-                await asyncio.sleep(RPC_RETRY_DELAY * (attempt + 1))
+        # Send transaction
+        tx_hash = await solana_client.send_transaction(txn)
+        logger.info(f"Subscription payment sent: {tx_hash.value}")
         
-        # Confirm transaction with timeout
-        try:
-            confirmation = await asyncio.wait_for(
-                solana_client.confirm_transaction(tx_hash.value, commitment="confirmed"),
-                timeout=30.0
-            )
-            
-            if confirmation.value and not confirmation.value[0].err:
-                # Update subscription status
-                expiry = datetime.now() + timedelta(days=7)
-                users_collection.update_one(
-                    {'user_id': user_id},
-                    {'$set': {
-                        'subscription_status': 'active',
-                        'subscription_expiry': expiry.isoformat(),
-                        'last_payment_tx': str(tx_hash.value)
-                    }}
-                )
-                log_user_action(user_id, "SUBSCRIPTION_ACTIVATED", f"Expiry: {expiry}")
-                
-                await query.edit_message_text(
-                    f"✅ Subscription activated! You now have full access until {expiry.strftime('%Y-%m-%d')}.\n\n"
-                    f"Transaction: https://solscan.io/tx/{tx_hash.value}"
-                )
-            else:
-                error_msg = confirmation.value[0].err if confirmation.value else 'Unknown error'
-                raise Exception(f"Transaction failed: {error_msg}")
-                
-        except asyncio.TimeoutError:
-            # Transaction might still succeed, so we'll mark it as pending verification
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': {
-                    'subscription_payment_sent': True,
-                    'last_payment_tx': str(tx_hash.value)
-                }}
-            )
-            await query.edit_message_text(
-                f"⏳ Payment sent but confirmation is taking longer than expected.\n\n"
-                f"Transaction: https://solscan.io/tx/{tx_hash.value}\n\n"
-                f"We'll verify your payment automatically. You'll receive a confirmation message soon."
-            )
+        # Confirm transaction
+        await solana_client.confirm_transaction(tx_hash.value, commitment="confirmed")
+        log_user_action(user_id, "SUBSCRIPTION_PAYMENT_SENT", f"TX: {tx_hash.value}")
         
+        # Update subscription status
+        expiry = datetime.now() + timedelta(days=7)
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {
+                'subscription_status': 'active',
+                'subscription_expiry': expiry.isoformat()
+            }}
+        )
+        log_user_action(user_id, "SUBSCRIPTION_ACTIVATED", f"Expiry: {expiry}")
+        
+        await query.edit_message_text(
+            f"✅ Subscription activated! You now have full access until {expiry.strftime('%Y-%m-%d')}.\n\n"
+            f"Transaction: https://solscan.io/tx/{tx_hash.value}"
+        )
         return ConversationHandler.END
     
     except Exception as e:
         logger.error(f"Subscription payment error: {str(e)}", exc_info=True)
         log_user_action(user_id, "SUBSCRIPTION_ERROR", str(e), "error")
-        
-        error_message = f"❌ Payment failed: {str(e)}"
-        if "429" in str(e) or "rate limit" in str(e).lower():
-            error_message += "\n\nPlease try again in a few moments."
-        elif "insufficient funds" in str(e).lower():
-            error_message += "\n\nPlease ensure you have enough SOL for both the payment and transaction fee."
-        
-        await query.edit_message_text(error_message)
+        await query.edit_message_text(
+            f"❌ Payment failed: {str(e)}\n\n"
+            "Please ensure you have enough SOL for the transaction fee."
+        )
         return ConversationHandler.END
 
 async def verify_sol_payments(context: ContextTypes.DEFAULT_TYPE):
@@ -3526,6 +3472,7 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     return SELECT_TOKEN_ACTION
 
+
 async def fetch_token_by_contract(contract_address: str, include_history: bool = False) -> Optional[Dict[str, Any]]:
     """Fetch token details by contract address with historical data option"""
     # Check cache first
@@ -3598,24 +3545,29 @@ async def fetch_token_by_contract(contract_address: str, include_history: bool =
                 'name': token_info.get('name', 'Unknown'),
                 'symbol': token_info.get('symbol', 'UNKNOWN'),
                 'contract_address': contract_address,
-                'price_usd': float(pair.get('priceUsd', 0)),
+                'price_usd': float(pair.get('priceUsd', 0)) or 0,
                 'market_cap': float(pair.get('marketCap', pair.get('fdv', 0))),
-                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
-                'volume': float(pair.get('volume', {}).get('h24', 0)),
+                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)) or 0,
+                'volume': float(pair.get('volume', {}).get('h24', 0)) or 0,
                 'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{contract_address}"),
                 'image': pair.get('info', {}).get('imageUrl', ''),
                 'socials': {link.get('type', link.get('label', 'website').lower()): link['url'] 
                            for link in pair.get('info', {}).get('socials', [])}
             }
             
+            # Ensure all numeric fields have values, not None
+            for field in ['price_usd', 'liquidity', 'volume', 'market_cap']:
+                if token_data[field] is None:
+                    token_data[field] = 0.0
+            
             # Cache the result
             token_cache[contract_address] = (token_data, time.time())
-            if token_data and include_history:
-        # Immediately fetch historical data for new tokens
-             await fetch_and_store_historical_data(contract_address, token_data)
-    
-
-        return token_data
+            
+            if include_history:
+                # Immediately fetch historical data for new tokens
+                await fetch_and_store_historical_data(contract_address, token_data)
+            
+            return token_data
             
     except Exception as e:
         logger.error(f"Error fetching token by contract {contract_address}: {str(e)}")
@@ -3926,43 +3878,8 @@ async def fetch_token_fallback(contract_address: str, client: Optional[httpx.Asy
         return None
     
 
-def parse_geckoterminal_response(data, contract_address):
-    """Parse GeckoTerminal API response to match token_data structure"""
-    if 'data' in data and 'attributes' in data['data']:
-        attributes = data['data']['attributes']
-        return {
-            'name': attributes.get('name', 'Unknown'),
-            'symbol': attributes.get('symbol', 'UNKNOWN'),
-            'contract_address': contract_address,
-            'price_usd': float(attributes.get('price_usd', 0)),
-            'market_cap': float(attributes.get('fdv_usd', 0)),
-            'liquidity': float(attributes.get('liquidity_usd', 0)),
-            'volume': float(attributes.get('volume_usd', {}).get('h24', 0)),
-            'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
-            'image': attributes.get('image_thumb_url', ''),
-            'socials': {}  # Add if available in response
-        }
-    else:
-        return None
     
-def parse_birdeye_response(data, contract_address):
-    """Parse Birdeye API response to match token_data structure"""
-    if 'data' in data and 'success' in data and data['success']:
-        token_data = data['data']
-        return {
-            'name': token_data.get('name', 'Unknown'),
-            'symbol': token_data.get('symbol', 'UNKNOWN'),
-            'contract_address': contract_address,
-            'price_usd': float(token_data.get('price', 0)),
-            'market_cap': float(token_data.get('mc', 0)),
-            'liquidity': float(token_data.get('liquidity', 0)),
-            'volume': float(token_data.get('v24hUSD', 0)),
-            'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
-            'image': token_data.get('image', ''),
-            'socials': {}  # Birdeye doesn't provide socials in this endpoint
-        }
-    else:
-        return None
+
 
 async def buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle buy amount input with balance check and trade execution"""
@@ -4196,11 +4113,13 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 No wallet found. Please use /start to create a wallet or /set_wallet to import one.")
         return
     
+    # Get balances for all chains
     sol_balance = await check_balance(user_id, 'solana')
     eth_balance = await check_balance(user_id, 'eth') if user.get('eth') else 0.0
     bsc_balance = await check_balance(user_id, 'bsc') if user.get('bsc') else 0.0
     portfolio = user.get('portfolio', {})
     
+    # Build message
     message = (
         f"💰 *Wallet Balance*\n\n"
         f"🔹 Solana (SOL): {sol_balance:.4f}\n"
@@ -4215,34 +4134,31 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_portfolio_value = 0
         
         for contract, details in portfolio.items():
-            # Get current token price
             token = await fetch_token_by_contract(contract)
-            if not token:
-                # Use buy price if current price not available
+            
+            # Handle missing token data
+            if not token or token.get('price_usd') is None:
                 current_price = details['buy_price']
-                current_value = details['amount']
+                token_count = details['amount'] / details['buy_price']
+                current_value = token_count * current_price
                 price_note = " (price unavailable, using buy price)"
             else:
                 current_price = token['price_usd']
-                # Calculate token count and current value
                 token_count = details['amount'] / details['buy_price']
                 current_value = token_count * current_price
                 price_note = ""
-                
-            total_portfolio_value += current_value
             
             # Calculate profit/loss
             profit_loss = current_value - details['amount']
-            profit_loss_percent = (profit_loss / details['amount']) * 100
+            profit_loss_percent = (profit_loss / details['amount']) * 100 if details['amount'] > 0 else 0
             profit_loss_emoji = "📈" if profit_loss >= 0 else "📉"
             
-            # Calculate token count
-            token_count = details['amount'] / details['buy_price']
+            total_portfolio_value += current_value
             
             message += (
                 f"🔸 {details['name']} ({details['symbol']}):\n"
                 f"   - Token Amount: {token_count:.2f}\n"
-                f"   - Current Price: ${current_price:.8f}\n"
+                f"   - Current Price: ${current_price:.8f}{price_note}\n"
                 f"   - Buy Price: ${details['buy_price']:.8f}\n"
                 f"   - P&L: {profit_loss_emoji} {profit_loss:+.4f} SOL ({profit_loss_percent:+.2f}%)\n"
             )
@@ -4250,6 +4166,8 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += f"\n💼 *Total Portfolio Value*: {total_portfolio_value:.4f} SOL"
     
     await update.message.reply_text(message, parse_mode='Markdown')
+
+
 
 async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Initiate token transfer"""
@@ -4383,59 +4301,161 @@ async def transfer_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 # Modified fetch_latest_token function
 async def fetch_latest_token() -> List[Dict[str, Any]]:
-    """Fetch all Solana tokens without time filtering"""
+    """Fetch all Solana tokens using multiple APIs with fallback"""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json'
     }
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    
+    # Try multiple APIs in sequence
+    apis = [
+        {
+            'name': 'DexScreener',
+            'url': DEXSCREENER_NEW_TOKENS_API,
+            'parser': parse_dexscreener_response
+        },
+        {
+            'name': 'Birdeye',
+            'url': 'https://public-api.birdeye.so/public/tokenlist?sort_by=volume&sort_type=desc&offset=0&limit=50',
+            'parser': parse_birdeye_response,
+            'headers': {'X-API-KEY': os.getenv('BIRDEYE_API_KEY', '')}
+        },
+        {
+            'name': 'GeckoTerminal',
+            'url': 'https://api.geckoterminal.com/api/v2/networks/solana/new_pools',
+            'parser': parse_geckoterminal_response
+        }
+    ]
+    
+    for api in apis:
         try:
-            logger.info("🌐 Fetching latest tokens from DexScreener")
-            response = await client.get(DEXSCREENER_NEW_TOKENS_API, headers=headers)
-            
-            if response.status_code != 200:
-                logger.error(f"DexScreener API failed: {response.status_code} - {response.text}")
-                return []
-            
-            data = response.json()
-            logger.debug(f"API response: {json.dumps(data, indent=2)[:500]}...")
-            
-            if not isinstance(data, list) or not data:
-                logger.warning("No tokens found in API response")
-                return []
-            
-            solana_tokens = []
-            
-            for token_data in data:
-                if token_data.get('chainId') != 'solana':
-                    continue
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                logger.info(f"Trying {api['name']} API for new tokens")
+                response = await client.get(
+                    api['url'], 
+                    headers=api.get('headers', headers)
+                )
                 
-                contract_address = token_data.get('tokenAddress', '')
-                if not contract_address:
+                if response.status_code == 200:
+                    data = response.json()
+                    tokens = api['parser'](data)
+                    if tokens:
+                        logger.info(f"Found {len(tokens)} tokens from {api['name']}")
+                        return tokens
+                elif response.status_code == 429:
+                    logger.warning(f"{api['name']} rate limited, trying next API")
                     continue
-                
-                token = await fetch_token_by_contract(contract_address)
-                if not token:
-                    logger.warning(f"Failed to fetch trading data for token {contract_address}")
-                    continue
-                
-                token.update({
-                    'name': token_data.get('name', token['name']),
-                    'symbol': token_data.get('symbol', token['symbol']),
-                    'image': token_data.get('icon', token['image']),
-                    'socials': {link.get('type', link.get('label', 'website').lower()): link['url']
-                               for link in token_data.get('links', [])},
-                    'description': token_data.get('description', ''),
-                    'openGraph': token_data.get('openGraph', '')
-                })
-                solana_tokens.append(token)
-            
-            logger.info(f"Fetched {len(solana_tokens)} Solana tokens")
-            return solana_tokens
-        
+                    
         except Exception as e:
-            logger.error(f"Error fetching latest tokens: {str(e)}")
-            return []
+            logger.error(f"Error fetching from {api['name']}: {str(e)}")
+            continue
+    
+    logger.error("All token APIs failed")
+    return []
+
+def parse_dexscreener_response(data):
+    """Parse DexScreener API response"""
+    tokens = []
+    if isinstance(data, list):
+        for token_data in data:
+            if token_data.get('chainId') == 'solana':
+                tokens.append({
+                    'name': token_data.get('name', 'Unknown'),
+                    'symbol': token_data.get('symbol', 'UNKNOWN'),
+                    'contract_address': token_data.get('tokenAddress', ''),
+                    'price_usd': float(token_data.get('priceUsd', 0)),
+                    'liquidity': float(token_data.get('liquidity', {}).get('usd', 0)),
+                    'volume': float(token_data.get('volume', {}).get('h24', 0)),
+                    'market_cap': float(token_data.get('marketCap', 0)),
+                    'image': token_data.get('icon', ''),
+                    'socials': {link.get('type', 'website'): link['url'] 
+                               for link in token_data.get('links', [])}
+                })
+    return tokens
+
+def parse_birdeye_response(data):
+    """Parse Birdeye API response"""
+    tokens = []
+    if data.get('success') and 'data' in data.get('data', {}):
+        for token_data in data['data']['data']:
+            tokens.append({
+                'name': token_data.get('name', 'Unknown'),
+                'symbol': token_data.get('symbol', 'UNKNOWN'),
+                'contract_address': token_data.get('address', ''),
+                'price_usd': float(token_data.get('price', 0)),
+                'liquidity': float(token_data.get('liquidity', 0)),
+                'volume': float(token_data.get('volume24hUSD', 0)),
+                'market_cap': float(token_data.get('marketCap', 0)),
+                'image': token_data.get('image', '')
+            })
+    return tokens
+
+def parse_geckoterminal_response(data):
+    """Parse GeckoTerminal API response"""
+    tokens = []
+    if 'data' in data:
+        for pool_data in data['data']:
+            attributes = pool_data.get('attributes', {})
+            tokens.append({
+                'name': attributes.get('name', 'Unknown').split(' ')[0],
+                'symbol': attributes.get('name', 'UNKNOWN').split(' ')[0],
+                'contract_address': pool_data.get('id', '').split('_')[-1],
+                'price_usd': float(attributes.get('base_token_price_usd', 0)),
+                'liquidity': float(attributes.get('reserve_in_usd', 0)),
+                'volume': float(attributes.get('volume_usd', {}).get('h24', 0)),
+                'market_cap': 0,
+                'image': attributes.get('image_url', '')
+            })
+    return tokens
+
+
+
+# Add this comprehensive button handler
+async def handle_all_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all button clicks with proper error handling"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+    
+    logger.info(f"Button pressed: {data} by user {user_id}")
+    
+    try:
+        # Handle different button types
+        if data.startswith('buy_') or data.startswith('sell_'):
+            await handle_token_button(update, context)
+        elif data.startswith('buypos_') or data.startswith('sellpos_'):
+            await handle_position_actions(update, context)
+        elif data.startswith('remove_'):
+            await handle_remove_position(update, context)
+        elif data.startswith('confirm_remove_') or data.startswith('cancel_remove_'):
+            await handle_remove_confirmation(update, context)
+        elif data in ['generate_wallet', 'import_wallet']:
+            await handle_wallet_choice(update, context)
+        elif data in ['manual', 'automatic']:
+            await mode_callback(update, context)
+        elif data in ['confirm_subscription', 'cancel_subscription']:
+            await confirm_subscription(update, context)
+        elif data in ['mnemonic', 'private_key', 'cancel_import']:
+            await start_import_method(update, context)
+        elif data in ['confirm_new_wallet', 'cancel_new_wallet']:
+            await confirm_generate_wallet(update, context)
+        elif data in ['confirm_set_wallet', 'cancel_set_wallet']:
+            await confirm_set_wallet(update, context)
+        elif data in ['default_strategy', 'custom_strategy']:
+            await set_profit_strategy(update, context)
+        elif data in ['activate_auto_trading', 'modify_settings']:
+            await review_config_callback(update, context)
+        else:
+            logger.warning(f"Unknown button pressed: {data}")
+            await query.edit_message_text("❌ This button is no longer valid. Please use a command instead.")
+    
+    except Exception as e:
+        logger.error(f"Error handling button {data}: {str(e)}")
+        try:
+            await query.edit_message_text("❌ An error occurred. Please try again.")
+        except:
+            await context.bot.send_message(chat_id=user_id, text="❌ An error occurred. Please try again.")
         
 def escape_markdown(text: str) -> str:
     """Escape Markdown special characters for Telegram messages"""
@@ -5442,16 +5462,16 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             
         # Debug log user settings
         logger.info(f"User {user_id} settings: {user.get('trading_mode')}, {user.get('auto_buy_amount')}")
-
+        
         # Check cooldown
         last_trade_time = user.get('last_trade_time', 0)
         if time.time() - last_trade_time < AUTO_TRADE_COOLDOWN:
             logger.debug(f"Auto-trade cooldown active for user {user_id}")
             return
         
-        # Check if token is blacklisted
-        if token and token['contract_address'] in user.get('auto_trade_blacklist', []):
-            logger.info(f"Token {token['name']} is blacklisted")
+        # Check if token is blacklisted (if token provided)
+        if token and token.get('contract_address') in user.get('auto_trade_blacklist', []):
+            logger.info(f"Token {token.get('name', 'Unknown')} is blacklisted")
             return
         
         user_max_positions = user.get('max_positions', MAX_POSITIONS)
@@ -5481,9 +5501,21 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
         # If a specific token was provided, use it
         if token is not None:
             # Skip if already in portfolio or blacklist
-            if (token['contract_address'] in portfolio or 
-                token['contract_address'] in user.get('auto_trade_blacklist', [])):
+            if (token.get('contract_address') in portfolio or 
+                token.get('contract_address') in user.get('auto_trade_blacklist', [])):
                 return
+                
+            # Validate token data
+            if token.get('price_usd') is None:
+                logger.warning(f"Skipping {token.get('name', 'Unknown')} - price is None")
+                return
+                
+            # Also validate other essential fields
+            required_fields = ['liquidity', 'volume', 'contract_address']
+            for field in required_fields:
+                if token.get(field) is None:
+                    logger.warning(f"Skipping {token.get('name', 'Unknown')} - {field} is None")
+                    return
                 
             # Fetch fresh token data with historical data
             fresh_token = await fetch_token_by_contract(token['contract_address'], include_history=True)
@@ -5529,7 +5561,7 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             # Filter tokens using enhanced safety parameters
             valid_tokens = []
             for t in tokens:
-                if t['contract_address'] in portfolio or t['contract_address'] in user.get('auto_trade_blacklist', []):
+                if t.get('contract_address') in portfolio or t.get('contract_address') in user.get('auto_trade_blacklist', []):
                     continue
                     
                 is_safe, reason = await check_token_safety(t, user)
@@ -5544,7 +5576,7 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, to
             best_score = -99999
             
             for t in valid_tokens:
-                score = (t['liquidity'] / 10000) + (t['volume'] / 5000)
+                score = (t.get('liquidity', 0) / 10000) + (t.get('volume', 0) / 5000)
                 if 'price_change_5m' in t:
                     score += t['price_change_5m'] * 100
                     
@@ -5790,17 +5822,20 @@ async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
         if datetime.fromisoformat(t['timestamp']).date() == today
     ]
     
+
     # Calculate today's P&L with proper error handling
     daily_pnl = 0
     for trade in today_trades:
         try:
+            sell_price = trade.get('sell_price', 0) or 0
+            buy_price = trade.get('buy_price', 0) or 0
             if 'profit_pct' in trade:
-                # Convert percentage to SOL amount
+                # RSI recovering from oversold
                 trade_value = trade['amount'] * trade['buy_price']
                 daily_pnl += trade_value * (trade['profit_pct'] / 100)
             elif 'sell_price' in trade and 'buy_price' in trade:
                 # Fallback calculation
-                trade_profit = (trade['sell_price'] - trade['buy_price']) * trade['amount']
+                trade_profit = (sell_price - buy_price) * trade['amount']
                 daily_pnl += trade_profit
             else:
                 logger.warning(f"Incomplete trade record for P&L calculation: {trade}")
@@ -5819,12 +5854,7 @@ async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
         loss_pct = abs(min(daily_pnl, 0)) / portfolio_value
         if loss_pct >= daily_loss_limit:
             # Try to notify the user (we don't have context here)
-            try:
-                # You might need to store the bot instance globally or find another way to send messages
-                # For now, just log it
-                logger.warning(f"User {user_id} reached daily loss limit ({loss_pct*100:.1f}%)")
-            except:
-                pass
+            logger.warning(f"User {user_id} reached daily loss limit ({loss_pct*100:.1f}%)")
             return True
     
     return False
@@ -6074,8 +6104,17 @@ async def emergency_sell_protocol(context, user_id, token, token_data):
 async def execute_auto_sell(context, user_id, token, token_data, reason):
     """Execute automatic sell with emergency fallback"""
     try:
-        current_price = token['price_usd']
-        buy_price = token_data['buy_price']
+        current_price = token.get('price_usd')
+        if current_price is None:
+            logger.error(f"Current price is None for token {token['name']}")
+            return False
+
+        buy_price = token_data.get('buy_price')
+        if buy_price is None:
+            logger.error(f"Buy price is None for token {token['name']}")
+            return False
+        
+       
         price_change_pct = (current_price - buy_price) / buy_price
         
         # Check if we should take partial profits
@@ -6494,10 +6533,18 @@ def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]
     Calculate technical indicators using pure Python.
     Returns an empty dict if not enough data is available.
     """
+
+    
     if len(price_history) < 15:  # Need at least 15 periods for meaningful indicators
         return {}
+
+        
     
     try:
+
+        if not all(isinstance(price, (int, float)) for price in price_history):
+         logger.error("Invalid price values in history")
+         return {}
         # Simple Moving Averages
         sma_5 = sum(price_history[-5:]) / 5
         sma_15 = sum(price_history[-15:]) / 15
@@ -6505,6 +6552,8 @@ def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]
         # Calculate RSI
         gains = []
         losses = []
+
+       
         
         for i in range(1, len(price_history)):
             change = price_history[i] - price_history[i-1]
@@ -6720,239 +6769,67 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Failed to send error message: {str(e)}")
 
+# Replace your setup_handlers function with this improved version
 def setup_handlers(application: Application):
-    """Set up all conversation handlers and command handlers"""
-    def wrap_conversation_entry(entry_handler):
-        """Wrapper for conversation entry points to handle state management"""
-        async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            user_id = update.effective_user.id
-            context.user_data[f'conversation_state_{user_id}'] = entry_handler.__name__
-            context.user_data[f'last_activity_{user_id}'] = datetime.now()
-            
-            # Pause any token update jobs during conversation
-            for job in context.job_queue.jobs():
-                if job.name == f"token_updates_{user_id}":
-                    job.schedule_removal()
-                    logger.debug(f"Paused token_updates_{user_id} due to conversation entry")
-            
-            # Set up timeout check
-            context.job_queue.run_repeating(
-                check_conversation_timeout,
-                interval=10,
-                first=10,
-                user_id=user_id,
-                name=f"timeout_check_{user_id}",
-                data={'last_activity': datetime.now()}
-            )
-            return await entry_handler(update, context)
-        return wrapped
-
-    def wrap_conversation_state(state_handler):
-        """Wrapper for conversation states to handle activity tracking"""
-        async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            user_id = update.effective_user.id
-            context.user_data[f'last_activity_{user_id}'] = datetime.now()
-            
-            # Update last activity in timeout check job
-            for job in context.job_queue.jobs():
-                if job.name == f"timeout_check_{user_id}":
-                    job.data['last_activity'] = datetime.now()
-            
-            result = await state_handler(update, context)
-            if result == ConversationHandler.END:
-                context.user_data[f'conversation_state_{user_id}'] = None
-                
-                # Clean up timeout check job
-                for job in context.job_queue.jobs():
-                    if job.name == f"timeout_check_{user_id}":
-                        job.schedule_removal()
-                        logger.debug(f"Removed timeout_check_{user_id} after conversation end")
-                
-                # Restart token updates if subscribed
-                if await check_subscription(user_id):
-                    await start_token_updates(context, user_id)
-            return result
-        return wrapped
-
-    # Add basic command handlers
+    """Set up all conversation handlers and command handlers with proper state management"""
     
-    application.add_handler(CommandHandler("job_status", job_status))
-    application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
-    application.add_handler(CommandHandler("force_fetch", force_token_fetch))
-    application.add_handler(CommandHandler("trade_status", trade_status))
-    application.add_handler(CommandHandler("emergency_sell", emergency_sell))
+    # Add basic command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("subscribe", subscribe))
+    application.add_handler(CommandHandler("token_analysis", token_analysis))
     application.add_handler(CommandHandler("daily_pnl", daily_pnl))
-    application.add_handler(CommandHandler("share_pnl", share_pnl))
     application.add_handler(CommandHandler("mypositions", mypositions))
-    application.add_handler(CommandHandler("settings", settings))
-    application.add_handler(CallbackQueryHandler(handle_remove_position, pattern='^remove_'))
-    application.add_handler(CallbackQueryHandler(handle_remove_position, pattern='^remove_'))
-    application.add_handler(CallbackQueryHandler(handle_remove_confirmation, pattern='^(confirm_remove|cancel_remove)_'))
-    application.add_handler(CommandHandler("remove_illiquid", remove_illiquid))
+    application.add_handler(CommandHandler("share_pnl", share_pnl))
+    application.add_handler(CommandHandler("generate_wallet", generate_wallet))
+    application.add_handler(CommandHandler("set_wallet", set_wallet))
+    application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
     application.add_handler(CommandHandler("cleanup", cleanup_zero_balance))
-    # Add position actions handler
-    application.add_handler(CallbackQueryHandler(handle_position_actions, pattern='^(sellpos|buypos)_'))
-    #application.add_handler(CallbackQueryHandler(handle_token_button, pattern='^(buy|sell)_'))
-    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(CommandHandler("remove_illiquid", remove_illiquid))
+    application.add_handler(CommandHandler("force_fetch", force_token_fetch))
+    application.add_handler(CommandHandler("settings", settings))
     application.add_handler(CommandHandler("reset_tokens", reset_tokens))
+    application.add_handler(CommandHandler("setmode", set_mode))
+    application.add_handler(CommandHandler("trade", trade))
+    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(CommandHandler("transfer", start_transfer))
+    application.add_handler(CommandHandler("emergency_sell", emergency_sell))
+    application.add_handler(CommandHandler("trade_status", trade_status))
     application.add_handler(CommandHandler("debug", debug))
+    application.add_handler(CommandHandler("cancel", cancel))
+    
+    # Add callback query handler for all buttons
+    application.add_handler(CallbackQueryHandler(handle_all_buttons))
+    
+    # Add error handler
     application.add_error_handler(error_handler)
-
-    # Start command handler
-    start_handler = ConversationHandler(
-    entry_points=[CommandHandler("start", wrap_conversation_entry(start))],
-    states={
-        WALLET_SETUP_CHOICE: [CallbackQueryHandler(wrap_conversation_state(handle_wallet_choice), 
-                             pattern='^(generate_wallet|import_wallet)$')],
-        
-        # New states for import flow in start conversation
-        START_IMPORT_METHOD: [CallbackQueryHandler(wrap_conversation_state(start_import_method), 
-                             pattern='^(mnemonic|private_key|cancel_import)$')],
-        START_INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                            wrap_conversation_state(start_input_mnemonic))],
-        START_INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                              wrap_conversation_state(start_input_private_key))]
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-    per_message=False
-)
-    application.add_handler(start_handler)
-
-    subscription_handler = ConversationHandler(
-    entry_points=[CommandHandler("subscribe", subscribe)],
-    states={
-        SUBSCRIPTION_CONFIRMATION: [
-            CallbackQueryHandler(confirm_subscription, pattern='^(confirm_subscription|cancel_subscription)$')
-        ]
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-    per_message=False
-)
-    application.add_handler(subscription_handler) 
-
-
-
-    analysis_handler = ConversationHandler(
-    entry_points=[CommandHandler("token_analysis", wrap_conversation_entry(token_analysis))],
-    states={
-        INPUT_ANALYSIS_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                              wrap_conversation_state(analysis_contract))]
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-    per_message=False
-)
-    application.add_handler(analysis_handler)
-
-    # Generate wallet handler
-    generate_wallet_handler = ConversationHandler(
-        entry_points=[CommandHandler("generatewallet", wrap_conversation_entry(generate_wallet))],
-        states={
-            CONFIRM_NEW_WALLET: [CallbackQueryHandler(wrap_conversation_state(confirm_generate_wallet), 
-                                pattern='^(confirm_new_wallet|cancel_new_wallet)$')]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
-    )
-    application.add_handler(generate_wallet_handler)
-
-    # Set wallet handler (import)
-    set_wallet_handler = ConversationHandler(
-        entry_points=[CommandHandler("set_wallet", wrap_conversation_entry(set_wallet))],
-        states={
-            SET_WALLET_METHOD: [CallbackQueryHandler(wrap_conversation_state(set_wallet_method), 
-                               pattern='^(mnemonic|private_key|cancel_import)$')],
-            INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                         wrap_conversation_state(input_mnemonic))],
-            INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                            wrap_conversation_state(input_private_key))],
-            CONFIRM_SET_WALLET: [CallbackQueryHandler(wrap_conversation_state(confirm_set_wallet), 
-                                 pattern='^(confirm_set_wallet|cancel_set_wallet)$')]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
-    )
-    application.add_handler(set_wallet_handler)
-
-    # Set mode handler
-    set_mode_handler = ConversationHandler(
-    entry_points=[CommandHandler("setmode", wrap_conversation_entry(set_mode))],
-    states={
-        SET_TRADING_MODE: [CallbackQueryHandler(wrap_conversation_state(mode_callback), 
-                       pattern='^(manual|automatic)$')],
-        SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                           wrap_conversation_state(set_auto_buy_amount))],
-        SET_PROFIT_STRATEGY: [CallbackQueryHandler(wrap_conversation_state(set_profit_strategy), 
-                             pattern='^(default_strategy|custom_strategy)$')],
-        SET_CUSTOM_PROFIT_TARGETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                                 wrap_conversation_state(set_custom_profit_targets))],
-        SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                           wrap_conversation_state(set_sell_percentage))],
-        SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                           wrap_conversation_state(set_loss_percentage))],
-        CONFIRM_HIGH_RISK_LOSS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                              wrap_conversation_state(confirm_high_risk_loss))],
-        SET_ANTI_MEV: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                    wrap_conversation_state(set_anti_mev))],
-        SET_LIQUIDITY_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                               wrap_conversation_state(set_liquidity_threshold))],
-        SET_MAX_POSITIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                 wrap_conversation_state(set_max_positions))],
-        SET_VOLUME_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                            wrap_conversation_state(set_volume_threshold))],
-        SET_RUG_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                     wrap_conversation_state(set_rug_check))],
-        SET_MAX_SLIPPAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                        wrap_conversation_state(set_max_slippage))],
-        SET_MAX_GAS_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                         wrap_conversation_state(set_max_gas_price))],
-        SET_TOKEN_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                     wrap_conversation_state(set_token_age))],
-        REVIEW_CONFIG: [CallbackQueryHandler(wrap_conversation_state(review_config_callback), 
-                        pattern='^(activate_auto_trading|modify_settings)$')]
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-    per_message=False
-)
-    application.add_handler(set_mode_handler)
-
-    # Trade handler
-    # Trade handler
-    trade_handler = ConversationHandler(
-    entry_points=[
-        CommandHandler("trade", wrap_conversation_entry(trade)),
-        CallbackQueryHandler(wrap_conversation_entry(handle_token_button), pattern='^(buy|sell)_')
-    ],
-    states={
-        INPUT_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                     wrap_conversation_state(input_contract))],
-        SELECT_TOKEN_ACTION: [CallbackQueryHandler(wrap_conversation_state(handle_token_button), 
-                              pattern='^(buy|sell)_')],
-        BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                 wrap_conversation_state(buy_amount))],
-        SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                  wrap_conversation_state(sell_amount))],
-        CONFIRM_TRADE: [CallbackQueryHandler(wrap_conversation_state(confirm_trade), 
-                        pattern='^(confirm_trade|cancel_trade)$')]
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-    per_message=False
-)
-    application.add_handler(trade_handler)
-
-    # Transfer handler
-    transfer_handler = ConversationHandler(
-        entry_points=[CommandHandler("transfer", wrap_conversation_entry(start_transfer))],
-        states={
-            TRANSFER_TOKEN: [CallbackQueryHandler(wrap_conversation_state(transfer_token))],
-            TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                           wrap_conversation_state(transfer_amount))],
-            TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
-                                           wrap_conversation_state(transfer_address))]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
-    )
-    application.add_handler(transfer_handler)
+    
+    # Add conversation handlers
+    conv_handlers = [
+        # Subscription handler
+        ConversationHandler(
+            entry_points=[CommandHandler("subscribe", subscribe)],
+            states={
+                SUBSCRIPTION_CONFIRMATION: [
+                    CallbackQueryHandler(confirm_subscription, pattern='^(confirm_subscription|cancel_subscription)$')
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+            per_message=False
+        ),
+        # Token analysis handler
+        ConversationHandler(
+            entry_points=[CommandHandler("token_analysis", token_analysis)],
+            states={
+                INPUT_ANALYSIS_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, analysis_contract)]
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+            per_message=False
+        ),
+        # Add other conversation handlers here...
+    ]
+    
+    for handler in conv_handlers:
+        application.add_handler(handler)
 
 application = None
 
@@ -6970,7 +6847,7 @@ async def setup_bot():
         application = (
             Application.builder()
             .token(TELEGRAM_TOKEN)
-            .concurrent_updates(10)
+            .concurrent_updates(True)
             .build()
         )
         logger.info("🛠️ Setting up command handlers")
@@ -7020,6 +6897,40 @@ async def setup_bot():
         logger.info("🤖 Bot started successfully")
     
     return application  # Make sure to return the application instance
+
+class EnhancedTokenCache:
+    def __init__(self, max_size=1000, ttl_seconds=300):
+        self.cache = {}
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self.hits = 0
+        self.misses = 0
+    
+    def get(self, key):
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                self.hits += 1
+                return data
+            else:
+                del self.cache[key]  # Expired
+        self.misses += 1
+        return None
+    
+    def set(self, key, value):
+        if len(self.cache) >= self.max_size:
+            # Remove oldest item
+            oldest_key = next(iter(self.cache))
+            del self.cache[oldest_key]
+        self.cache[key] = (value, time.time())
+    
+    def stats(self):
+        total = self.hits + self.misses
+        hit_rate = (self.hits / total * 100) if total > 0 else 0
+        return f"Cache hits: {self.hits}, misses: {self.misses}, hit rate: {hit_rate:.2f}%"
+
+# Replace your token_cache with the enhanced version
+token_cache = EnhancedTokenCache(max_size=500, ttl_seconds=180)
 
 @app.on_event("startup")
 async def on_startup():
@@ -7085,10 +6996,10 @@ async def on_startup():
             name="token_performance_updates"
         )
         telegram_app.job_queue.run_daily(
-        send_daily_report,
-        time=time(hour=20, minute=0),
-        name="daily_report"
-    )
+            send_daily_report,
+            time=datetime.time(hour=20, minute=0),
+            name="daily_report"
+        )
         # Add portfolio liquidity monitoring job
         telegram_app.job_queue.run_repeating(
             monitor_portfolio_liquidity,
