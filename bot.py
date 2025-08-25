@@ -49,8 +49,9 @@ try:
 except ImportError:
     raise ImportError("Missing 'cryptography' package. Install it with: pip install cryptography")
 
-from datetime import datetime, timedelta, date 
-import time
+
+from datetime import datetime, timedelta, date, time
+
 import os
 from dotenv import load_dotenv
 from web3 import Web3
@@ -103,7 +104,7 @@ file_handler.addFilter(UserFilter())
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - User:%(user_id)s - %(message)s',
     handlers=[stream_handler, file_handler]
 )
@@ -700,7 +701,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         welcome_message = (
             "👋 *Welcome to the Multi-Chain Trading Bot!*\n\n"
-            "🔹 You have a *1-day free trial* to test all features\n"
+            "🔹 You have a *1-hour free trial* to test all features\n"
             "🔹 Trade Solana tokens with ease\n"
             "🔹 Get alerts for new tokens automatically\n\n"
             "Would you like to:\n"
@@ -7079,10 +7080,10 @@ async def on_startup():
             name="token_performance_updates"
         )
         telegram_app.job_queue.run_daily(
-            send_daily_report,
-            time=datetime.time(hour=20, minute=0),
-            name="daily_report"
-        )
+        send_daily_report,
+        time=time(hour=20, minute=0),
+        name="daily_report"
+    )
         # Add portfolio liquidity monitoring job
         telegram_app.job_queue.run_repeating(
             monitor_portfolio_liquidity,
