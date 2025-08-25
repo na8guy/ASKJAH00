@@ -52,6 +52,7 @@ except ImportError:
     raise ImportError("Missing 'cryptography' package. Install it with: pip install cryptography")
 
 from datetime import datetime, timedelta, date 
+import datetime
 import time
 import os
 from dotenv import load_dotenv
@@ -6915,7 +6916,7 @@ class EnhancedTokenCache:
         self.ttl = ttl_seconds
         self.hits = 0
         self.misses = 0
-    
+
     def get(self, key):
         if key in self.cache:
             data, timestamp = self.cache[key]
@@ -6923,21 +6924,27 @@ class EnhancedTokenCache:
                 self.hits += 1
                 return data
             else:
-                del self.cache[key]  # Expired
+                del self.cache[key]
         self.misses += 1
         return None
-    
+
     def set(self, key, value):
         if len(self.cache) >= self.max_size:
-            # Remove oldest item
             oldest_key = next(iter(self.cache))
             del self.cache[oldest_key]
         self.cache[key] = (value, time.time())
-    
-    def stats(self):
-        total = self.hits + self.misses
-        hit_rate = (self.hits / total * 100) if total > 0 else 0
-        return f"Cache hits: {self.hits}, misses: {self.misses}, hit rate: {hit_rate:.2f}%"
+
+    def __contains__(self, key):
+        return self.get(key) is not None
+
+    def __getitem__(self, key):
+        value = self.get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key, value):
+        self.set(key, value)
 
 # Replace your token_cache with the enhanced version
 token_cache = EnhancedTokenCache(max_size=500, ttl_seconds=180)
