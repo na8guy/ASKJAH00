@@ -246,6 +246,7 @@ if not MONGO_URI:
     logger.error("MONGO_URI not found in .env file")
     raise ValueError("MONGO_URI not found in .env file")
 
+# Replace your MongoDB setup code with this fixed version
 max_retries = 3
 for attempt in range(max_retries):
     try:
@@ -254,14 +255,6 @@ for attempt in range(max_retries):
         mongo_client.admin.command('ping')
         logger.info("✅ MongoDB connection successful")
         db = mongo_client.get_database('trading_bot')
-
-        db.users.create_index([("user_id", 1)])
-        db.users.create_index([("subscription_status", 1), ("subscription_expiry", 1)])
-        db.users.create_index([("solana.public_key", 1)])
-        db.token_performance.create_index([("contract_address", 1)])
-        db.token_performance.create_index([("first_tracked", 1)])
-        db.global_posted_tokens.create_index([("contract_address", 1)])
-        db.global_posted_tokens.create_index([("timestamp", 1)], expireAfterSeconds=86400)
         
         # Create collections using the database object
         if 'users' not in db.list_collection_names():
@@ -284,7 +277,13 @@ for attempt in range(max_retries):
             logger.info("Created users collection with validator")
         
         users_collection = db.users
-        users_collection.create_index('user_id', unique=True)
+        
+        # Check if index already exists before creating
+        existing_indexes = users_collection.index_information()
+        if 'user_id_1' not in existing_indexes:
+            users_collection.create_index('user_id', unique=True, name='user_id_1')
+        else:
+            logger.info("User_id index already exists, skipping creation")
 
         # Create new collection if not exists
         if 'token_performance' not in db.list_collection_names():
@@ -292,19 +291,30 @@ for attempt in range(max_retries):
             logger.info("Created token_performance collection")
 
         token_performance_collection = db.token_performance
-        token_performance_collection.create_index('contract_address')
-        token_performance_collection.create_index('first_posted_at')
+        
+        # Check if indexes exist before creating
+        tp_indexes = token_performance_collection.index_information()
+        if 'contract_address_1' not in tp_indexes:
+            token_performance_collection.create_index('contract_address', name='contract_address_1')
+        if 'first_posted_at_1' not in tp_indexes:
+            token_performance_collection.create_index('first_posted_at', name='first_posted_at_1')
         
         if 'global_posted_tokens' not in db.list_collection_names():
-         db.create_collection('global_posted_tokens')
-         logger.info("Created global_posted_tokens collection")
+            db.create_collection('global_posted_tokens')
+            logger.info("Created global_posted_tokens collection")
     
         global_posted_tokens = db.global_posted_tokens
-        global_posted_tokens.create_index('contract_address', unique=True)
-        global_posted_tokens.create_index('timestamp', expireAfterSeconds=86400)
-        logger.info("Created indexes for global_posted_tokens")
         
+        # Check if indexes exist before creating
+        gpt_indexes = global_posted_tokens.index_information()
+        if 'contract_address_1' not in gpt_indexes:
+            global_posted_tokens.create_index('contract_address', unique=True, name='contract_address_1')
+        if 'timestamp_1' not in gpt_indexes:
+            global_posted_tokens.create_index('timestamp', expireAfterSeconds=86400, name='timestamp_1')
+        
+        logger.info("Created indexes for global_posted_tokens")
         break
+        
     except ConnectionFailure as e:
         logger.error(f"Attempt {attempt + 1} failed to connect to MongoDB Atlas: {str(e)}")
         if attempt < max_retries - 1:
