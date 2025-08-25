@@ -186,33 +186,30 @@ app = FastAPI()
 
 @app.get("/health")
 async def health_check():
-    return JSONResponse(content={'status': 'ok'})
+    global application
+    status = {
+        'fastapi': 'running',
+        'telegram_bot': 'running' if application and application.running else 'not running',
+        'mongodb': 'connected' if mongo_client and mongo_client.admin.command('ping') else 'disconnected'
+    }
+    return JSONResponse(content=status)
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     global application
     try:
+        # Initialize application if not exists
         if application is None:
-            logger.error("🚫 Application instance is None")
-            return JSONResponse(
-                content={'error': 'Application not created'},
-                status_code=503
-            )
+            application = await setup_bot()
         
-        if not hasattr(application, '_initialized') or not application._initialized:
-            logger.error("🚫 Application not initialized")
-            return JSONResponse(
-                content={'error': 'Application not initialized'},
-                status_code=503
-            )
-        
+        # Check if application is running
         if not application.running:
-            logger.error("🚫 Application not running")
-            return JSONResponse(
-                content={'error': 'Application not running'},
-                status_code=503
-            )
+            logger.error("🚫 Application not running - initializing...")
+            await application.initialize()
+            await application.start()
+            logger.info("✅ Application started successfully")
         
+        # Process the update
         update_data = await request.json()
         update = Update.de_json(update_data, application.bot)
         await application.process_update(update)
@@ -224,7 +221,7 @@ async def telegram_webhook(request: Request):
             content={'error': str(e)},
             status_code=500
         )
-
+    
 @app.get("/debug/address")
 async def debug_address(mnemonic: str):
     keypair = derive_solana_keypair_from_mnemonic(mnemonic)
