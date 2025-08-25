@@ -7,6 +7,7 @@ import json
 import httpx
 import base64
 import base58
+from functools import lru_cache
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, 
@@ -117,6 +118,10 @@ def log_user_action(user_id: int, action: str, details: str = "", level: str = "
     extra = {'user_id': user_id}
     log_method = getattr(logger, level.lower(), logger.info)
     log_method(f"👤 USER ACTION: {action} - {details}", extra=extra)
+
+@lru_cache(maxsize=1000)
+async def check_subscription_cached(user_id: int) -> bool:
+    return await check_subscription(user_id)
 
 # Load environment variables
 load_dotenv()
@@ -6965,7 +6970,7 @@ async def setup_bot():
         application = (
             Application.builder()
             .token(TELEGRAM_TOKEN)
-            .concurrent_updates(True)
+            .concurrent_updates(10)
             .build()
         )
         logger.info("🛠️ Setting up command handlers")
