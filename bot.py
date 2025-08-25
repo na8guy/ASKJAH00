@@ -86,7 +86,7 @@ from textblob import TextBlob
 import matplotlib.pyplot as plt
 import io
 import seaborn as sns
-
+import concurrent.futures
 
 
 # Custom filter to add user_id to logs
@@ -101,6 +101,8 @@ stream_handler.addFilter(UserFilter())
 
 file_handler = logging.FileHandler("bot_activity.log")
 file_handler.addFilter(UserFilter())
+
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
 # Configure logging
 logging.basicConfig(
@@ -155,6 +157,7 @@ RPC_RETRY_DELAY = 3  # seconds between RPC retries
 MAX_RPC_RETRIES = 5  # maximum RPC retry attempts
 TWITTER_ENABLED = False  # disable Twitter until properly configured
 MIN_ACTIVE_LIQUIDITY = 500
+user_last_command = {}
 
 
 # Bot states for conversation
@@ -385,51 +388,51 @@ async def check_subscription(user_id: int) -> bool:
     """Check if user has an active subscription or trial"""
     user = users_collection.find_one({'user_id': user_id})
     
-    # New user - create trial
     if not user:
+        # Create new trial
         expiry = datetime.now() + timedelta(days=1)
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
                 'subscription_status': 'trial',
                 'subscription_expiry': expiry.isoformat(),
-                'trial_used': True,  # Mark trial as used
+                'trial_used': True,
                 'created_at': datetime.now().isoformat()
             }},
             upsert=True
         )
-        log_user_action(user_id, "NEW_USER_TRIAL_STARTED")
         return True
-        
-    # Existing user check
+    
+    # Check subscription status
     status = user.get('subscription_status')
-    expiry = user.get('subscription_expiry')
+    expiry_str = user.get('subscription_expiry')
     
-    # Convert expiry to datetime if needed
-    if isinstance(expiry, str):
-        expiry = datetime.fromisoformat(expiry)
+    if not expiry_str:
+        return False
+        
+    # Convert to datetime if needed
+    if isinstance(expiry_str, str):
+        expiry = datetime.fromisoformat(expiry_str)
+    else:
+        expiry = expiry_str
     
-    # Active subscription
+    # Check if subscription is active and not expired
     if status == 'active' and datetime.now() < expiry:
         return True
         
-    # Trial status check
+    # Check if trial is active and not expired
     if status == 'trial' and datetime.now() < expiry:
         return True
         
-    # Expired trial - prevent reuse
-    if user.get('trial_used'):
-        users_collection.update_one(
-            {'user_id': user_id},
-            {'$set': {
-                'subscription_status': 'inactive',
-                'subscription_expiry': None
-            }}
-        )
-        log_user_action(user_id, "SUBSCRIPTION_EXPIRED")
-        return False
-        
-    # Should never reach here
+    # If we get here, subscription is expired
+    # Update status to inactive
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {
+            'subscription_status': 'inactive',
+            'subscription_expiry': None
+        }}
+    )
     return False
 
 async def get_subscription_status_message(user: dict) -> str:
@@ -633,6 +636,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /start command"""
     user_id = update.effective_user.id
     log_user_action(user_id, "START_COMMAND")
+
+    if not await rate_limit(user_id, "start", 3):
+        await update.message.reply_text("⏳ Please wait a moment before using this command again.")
+        return
+
+    if 'user_data' not in context.user_data:
+        context.user_data['user_data'] = users_collection.find_one({'user_id': user_id})
+    
+    user = context.user_data['user_data']
     
     # Ensure user exists with trial
     if not users_collection.find_one({'user_id': user_id}):
@@ -1590,11 +1602,24 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return ConversationHandler.END
 
+
+async def rate_limit(user_id: int, command: str, cooldown: int = 2) -> bool:
+    current_time = time.time()
+    key = f"{user_id}_{command}"
+    
+    if key in user_last_command:
+        if current_time - user_last_command[key] < cooldown:
+            return False
+    
+    user_last_command[key] = current_time
+    return True
+
 # Modified fetch_tokens_manual function
 async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     log_user_action(user_id, "MANUAL_TOKEN_FETCH")
-    
+    loop = asyncio.get_event_loop()
+    tokens = await loop.run_in_executor(executor, fetch_latest_token)
     try:
         if not await check_subscription(user_id):
             await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
@@ -6801,17 +6826,18 @@ def setup_handlers(application: Application):
 )
     application.add_handler(start_handler)
 
+    # Ensure the subscription handler is properly set up
     subscription_handler = ConversationHandler(
-    entry_points=[CommandHandler("subscribe", subscribe)],
-    states={
-        SUBSCRIPTION_CONFIRMATION: [
-            CallbackQueryHandler(confirm_subscription, pattern='^(confirm_subscription|cancel_subscription)$')
-        ]
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-    per_message=False
-)
-    application.add_handler(subscription_handler) 
+        entry_points=[CommandHandler("subscribe", subscribe)],
+        states={
+            SUBSCRIPTION_CONFIRMATION: [
+                CallbackQueryHandler(confirm_subscription, pattern='^(confirm_subscription|cancel_subscription)$')
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False
+    )
+    application.add_handler(subscription_handler)
 
 
 
