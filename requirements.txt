@@ -22,4 +22,3 @@ TextBlob
 seaborn
 matplotlib
 cachetools
-motor  # Add this for async MongoDB
