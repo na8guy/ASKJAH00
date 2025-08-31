@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+from eth_account import Account
+Account.enable_unaudited_hdwallet_features()
 import asyncio
 import logging
+from functools import lru_cache
 import json
 import aiohttp
 import httpx
-from bip32utils import BIP32Key, BIP32_HARDEN
 import base64
 import base58
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -20,9 +22,10 @@ from telegram.ext import (
 )
 from typing import Optional, List, Dict, Any
 import re
+import hashlib
+import hmac
 from typing import Optional
 from typing import Tuple
-import pandas as pd
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.api import Client
 from solders.keypair import Keypair
@@ -48,7 +51,7 @@ try:
 except ImportError:
     raise ImportError("Missing 'cryptography' package. Install it with: pip install cryptography")
 
-import datetime  # Fixed import: changed from 'from datetime import datetime' to 'import datetime'
+from datetime import datetime, timedelta, date 
 import time
 import os
 from dotenv import load_dotenv
@@ -56,8 +59,19 @@ from web3 import Web3
 from eth_account.hdaccount import ETHEREUM_DEFAULT_PATH
 from eth_account.hdaccount import generate_mnemonic
 from eth_account.hdaccount import key_from_seed
-from bip_utils import Bip39MnemonicValidator, Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes, Bip32Slip10Ed25519
+from pymongo import UpdateOne, ReplaceOne
+from bip44 import Wallet
+from bip32utils import BIP32Key, BIP32_HARDEN
+from bip_utils import Bip32Slip10Ed25519
+from solders.keypair import Keypair
+from bip_utils import Bip39MnemonicValidator, Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 from solders.message import Message
+from solana.rpc.types import TxOpts
+from solders.message import Message
+from solders.transaction import Transaction
+from solders.transaction import VersionedTransaction, Transaction
+from solders.message import MessageV0
+import pandas as pd
 from solana.rpc.types import TxOpts
 from solders.instruction import Instruction, AccountMeta
 from solders.address_lookup_table_account import AddressLookupTableAccount
@@ -72,6 +86,9 @@ from typing import Tuple
 from textblob import TextBlob
 import matplotlib.pyplot as plt
 import io
+import seaborn as sns
+
+
 
 # Custom filter to add user_id to logs
 class UserFilter(logging.Filter):
@@ -93,52 +110,41 @@ logging.basicConfig(
     handlers=[stream_handler, file_handler]
 )
 
+# Your module's logger
 logger = logging.getLogger(__name__)
 
+# Example usage remains unchanged
 def log_user_action(user_id: int, action: str, details: str = "", level: str = "info"):
     extra = {'user_id': user_id}
     log_method = getattr(logger, level.lower(), logger.info)
     log_method(f"👤 USER ACTION: {action} - {details}", extra=extra)
 
-class EnhancedTokenCache:
+
+class TokenCache:
     def __init__(self, max_size=1000, ttl_seconds=300):
         self.cache = {}
         self.max_size = max_size
         self.ttl = ttl_seconds
-        self.hits = 0
-        self.misses = 0
-
+    
     def get(self, key):
         if key in self.cache:
             data, timestamp = self.cache[key]
             if time.time() - timestamp < self.ttl:
-                self.hits += 1
                 return data
             else:
-                del self.cache[key]
-        self.misses += 1
+                del self.cache[key]  # Expired
         return None
-
+    
     def set(self, key, value):
         if len(self.cache) >= self.max_size:
+            # Remove oldest item
             oldest_key = next(iter(self.cache))
             del self.cache[oldest_key]
         self.cache[key] = (value, time.time())
 
-    def __contains__(self, key):
-        return self.get(key) is not None
-
-    def __getitem__(self, key):
-        value = self.get(key)
-        if value is None:
-            raise KeyError(key)
-        return value
-
-    def __setitem__(self, key, value):
-        self.set(key, value)
-
 # Global cache instance
-token_cache = EnhancedTokenCache(max_size=500, ttl_seconds=180)
+token_cache = TokenCache(max_size=500, ttl_seconds=180)  # Smaller TTL for faster data
+
 
 # Load environment variables
 load_dotenv()
@@ -148,36 +154,40 @@ SUBSCRIPTION_SOL_AMOUNT = 0.005
 PBKDF2_ROUNDS = 2048
 DEXSCREENER_NEW_TOKENS_API = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_TOKEN_API = "https://api.dexscreener.com/tokens/v1/solana/{token_address}"
-MIN_LIQUIDITY = 1000
-AUTO_TRADE_COOLDOWN = 60
-TOKEN_PERFORMANCE_INTERVAL = 5 * 60
-PERFORMANCE_TRACKING_DAYS = 7
+MIN_LIQUIDITY = 1000  # Minimum liquidity threshold in USD
+AUTO_TRADE_COOLDOWN = 60  # 60 seconds cooldown between auto-trades
+TOKEN_PERFORMANCE_INTERVAL = 5 * 60  # 5 minutes in seconds
+PERFORMANCE_TRACKING_DAYS = 7  # Track tokens for 7 days
+token_cache = {}
 CACHE_DURATION = 300
-MAX_POSITIONS = 5
-POSITION_SIZE_PERCENT = 0.05
-TRAILING_STOP_PERCENT = 0.15
-PROFIT_TARGETS = [0.20, 0.50, 1.00]
-PROFIT_ALLOCATIONS = [0.4, 0.3, 0.3]
-MIN_TOKEN_AGE = 15 * 60
+MAX_POSITIONS = 5  # Maximum open positions
+POSITION_SIZE_PERCENT = 0.05  # 5% of capital per trade
+TRAILING_STOP_PERCENT = 0.15  # 15% trailing stop
+PROFIT_TARGETS = [0.20, 0.50, 1.00]  # 20%, 50%, 100% profit targets
+PROFIT_ALLOCATIONS = [0.4, 0.3, 0.3]  # Sell 40% at 20%, 30% at 50%, 30% at 100%
+MIN_TOKEN_AGE = 15 * 60  # 15 minutes in seconds
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
 ADX_THRESHOLD = 25
-MIN_VOLUME_CHANGE = 0.10
-HARD_STOP_LOSS = 0.10
-MIN_SAFE_LIQUIDITY = 25000
-MIN_SAFE_VOLUME = 10000
-MIN_HOLDERS = 100
-MAX_TOP_HOLDER_PERCENT = 25
-RPC_RETRY_DELAY = 3
-MAX_RPC_RETRIES = 5
-TWITTER_ENABLED = False
+MIN_VOLUME_CHANGE = 0.10  # 10% price increase in last 5-15 minutes
+
+HARD_STOP_LOSS = 0.10  # 10% hard stop loss
+MIN_SAFE_LIQUIDITY = 25000  # $25,000 ABSOLUTE minimum for real liquidity
+MIN_SAFE_VOLUME = 10000  # $10,000 minimum 24h volume
+MIN_HOLDERS = 100  # Minimum holder count to avoid hyper-concentrated tokens
+MAX_TOP_HOLDER_PERCENT = 25  # Maximum % a single wallet can hold
+RPC_RETRY_DELAY = 3  # seconds between RPC retries
+MAX_RPC_RETRIES = 5  # maximum RPC retry attempts
+TWITTER_ENABLED = False  # disable Twitter until properly configured
 MIN_ACTIVE_LIQUIDITY = 500
+
 
 # Bot states for conversation
 (WALLET_SETUP_CHOICE, SET_TRADING_MODE, SET_AUTO_BUY_AMOUNT, SET_SELL_PERCENTAGE, SET_LOSS_PERCENTAGE, 
  SELECT_TOKEN, BUY_AMOUNT, CONFIRM_TRADE, TRANSFER_TOKEN, TRANSFER_AMOUNT, TRANSFER_ADDRESS,
  CONFIRM_NEW_WALLET, SET_WALLET_METHOD, INPUT_MNEMONIC, INPUT_PRIVATE_KEY, CONFIRM_SET_WALLET,
  SELECT_TOKEN_ACTION, SELL_AMOUNT, INPUT_CONTRACT,
+ # New states for start flow
  START_IMPORT_METHOD, START_INPUT_MNEMONIC, START_INPUT_PRIVATE_KEY,SUBSCRIPTION_CONFIRMATION,INPUT_ANALYSIS_CONTRACT,SET_ANTI_MEV, SET_LIQUIDITY_THRESHOLD, SET_VOLUME_THRESHOLD, SET_RUG_CHECK, 
  SET_MAX_SLIPPAGE, SET_MAX_GAS_PRICE, SET_TOKEN_AGE,SET_PROFIT_STRATEGY, SET_CUSTOM_PROFIT_TARGETS, CONFIRM_HIGH_RISK_LOSS,REVIEW_CONFIG,SET_MAX_POSITIONS) = range(36)
 
@@ -186,30 +196,33 @@ app = FastAPI()
 
 @app.get("/health")
 async def health_check():
-    global application
-    status = {
-        'fastapi': 'running',
-        'telegram_bot': 'running' if application and application.running else 'not running',
-        'mongodb': 'connected' if mongo_client and mongo_client.admin.command('ping') else 'disconnected'
-    }
-    return JSONResponse(content=status)
+    return JSONResponse(content={'status': 'ok'})
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     global application
     try:
-        # Initialize application if not exists
         if application is None:
-            application = await setup_bot()
+            logger.error("🚫 Application instance is None")
+            return JSONResponse(
+                content={'error': 'Application not created'},
+                status_code=503
+            )
         
-        # Check if application is running
+        if not hasattr(application, '_initialized') or not application._initialized:
+            logger.error("🚫 Application not initialized")
+            return JSONResponse(
+                content={'error': 'Application not initialized'},
+                status_code=503
+            )
+        
         if not application.running:
-            logger.error("🚫 Application not running - initializing...")
-            await application.initialize()
-            await application.start()
-            logger.info("✅ Application started successfully")
+            logger.error("🚫 Application not running")
+            return JSONResponse(
+                content={'error': 'Application not running'},
+                status_code=503
+            )
         
-        # Process the update
         update_data = await request.json()
         update = Update.de_json(update_data, application.bot)
         await application.process_update(update)
@@ -221,7 +234,7 @@ async def telegram_webhook(request: Request):
             content={'error': str(e)},
             status_code=500
         )
-    
+
 @app.get("/debug/address")
 async def debug_address(mnemonic: str):
     keypair = derive_solana_keypair_from_mnemonic(mnemonic)
@@ -237,31 +250,64 @@ max_retries = 3
 for attempt in range(max_retries):
     try:
         logger.info("🔌 Connecting to MongoDB...")
-        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=60000)  # Increased timeout
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30000)
         mongo_client.admin.command('ping')
         logger.info("✅ MongoDB connection successful")
         db = mongo_client.get_database('trading_bot')
         
-        # Create collections if needed
+        # Create collections using the database object
         if 'users' not in db.list_collection_names():
-            db.create_collection('users')
-        users_collection = db.users
+            db.create_collection(
+                'users',
+                validator={
+                    '$jsonSchema': {
+                        'bsonType': 'object',
+                        'required': ['user_id'],
+                        'properties': {
+                            'user_id': {'bsonType': 'int'},
+                            'subscription_status': {'bsonType': 'string'},
+                            'subscription_expiry': {'bsonType': ['string', 'date']},
+                            'created_at': {'bsonType': 'string'},
+                        }
+                    }
+                },
+                validationLevel='moderate'
+            )
+            logger.info("Created users collection with validator")
         
+        users_collection = db.users
+        users_collection.create_index('user_id', unique=True)
+
+        # Create new collection if not exists
         if 'token_performance' not in db.list_collection_names():
             db.create_collection('token_performance')
+            logger.info("Created token_performance collection")
+
         token_performance_collection = db.token_performance
+        token_performance_collection.create_index('contract_address')
+        token_performance_collection.create_index('first_posted_at')
         
         if 'global_posted_tokens' not in db.list_collection_names():
-            db.create_collection('global_posted_tokens')
+         db.create_collection('global_posted_tokens')
+         logger.info("Created global_posted_tokens collection")
+    
         global_posted_tokens = db.global_posted_tokens
+        global_posted_tokens.create_index('contract_address', unique=True)
+        global_posted_tokens.create_index('timestamp', expireAfterSeconds=86400)
+        logger.info("Created indexes for global_posted_tokens")
         
         break
     except ConnectionFailure as e:
-        logger.error(f"Attempt {attempt + 1} failed to connect to MongoDB: {str(e)}")
+        logger.error(f"Attempt {attempt + 1} failed to connect to MongoDB Atlas: {str(e)}")
         if attempt < max_retries - 1:
             time.sleep(5)
-        else:
-            raise
+            continue
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in MongoDB setup: {str(e)}")
+        raise
+
+    
 
 # Master key for encryption
 MASTER_KEY = os.getenv("MASTER_KEY")
@@ -292,7 +338,45 @@ w3_bsc = Web3(Web3.HTTPProvider(BSC_RPC))
 
 BOT_SOL_ADDRESS = os.getenv("BOT_SOL_ADDRESS")
 
+# USDT contract setup
+BOT_USDT_ADDRESS = os.getenv("BOT_USDT_ADDRESS")
+if not BOT_USDT_ADDRESS:
+    logger.error("BOT_USDT_ADDRESS not found in .env file")
+    raise ValueError("BOT_USDT_ADDRESS not found in .env file")
+
+try:
+    if not Web3.is_address(BOT_USDT_ADDRESS):
+        logger.error("Invalid BOT_USDT_ADDRESS: Not a valid Ethereum address")
+        raise ValueError("Invalid BOT_USDT_ADDRESS: Not a valid Ethereum address")
+    BOT_USDT_ADDRESS = Web3.to_checksum_address(BOT_USDT_ADDRESS)
+except Exception as e:
+    logger.error(f"Error validating BOT_USDT_ADDRESS: {str(e)}")
+    raise ValueError(f"Error validating BOT_USDT_ADDRESS: {str(e)}")
+
+USDT_CONTRACT_ADDRESS = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+USDT_ABI = [
+    {
+        "constant": True,
+        "inputs": [{"name": "_owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "balance", "type": "uint256"}],
+        "type": "function"
+    },
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "name": "from", "type": "address"},
+            {"indexed": True, "name": "to", "type": "address"},
+            {"indexed": False, "name": "value", "type": "uint256"}
+        ],
+        "name": "Transfer",
+        "type": "event"
+    }
+]
+usdt_contract = w3_eth.eth.contract(address=USDT_CONTRACT_ADDRESS, abi=USDT_ABI)
+
 def derive_user_key(user_id: int) -> bytes:
+    """Derive a user-specific encryption key from the master key"""
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
@@ -302,6 +386,7 @@ def derive_user_key(user_id: int) -> bytes:
     return kdf.derive(master_key)
 
 def encrypt_data(data: str, key: bytes) -> dict:
+    """Encrypt sensitive data with AES-256-CBC"""
     iv = os.urandom(16)
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
     encryptor = cipher.encryptor()
@@ -313,6 +398,7 @@ def encrypt_data(data: str, key: bytes) -> dict:
     }
 
 def decrypt_data(encrypted_data: dict, key: bytes) -> str:
+    """Decrypt data encrypted with encrypt_data"""
     iv = base64_cryptography.b64decode(encrypted_data['iv'])
     ciphertext = base64_cryptography.b64decode(encrypted_data['ciphertext'])
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
@@ -321,35 +407,42 @@ def decrypt_data(encrypted_data: dict, key: bytes) -> str:
     return padded_data.rstrip(b'\0').decode()
 
 async def check_subscription(user_id: int) -> bool:
+    """Check if user has an active subscription or trial"""
     user = users_collection.find_one({'user_id': user_id})
     
+    # New user - create trial
     if not user:
-        expiry = datetime.datetime.now() + datetime.timedelta(days=1)
+        expiry = datetime.now() + timedelta(days=1)
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
                 'subscription_status': 'trial',
                 'subscription_expiry': expiry.isoformat(),
-                'trial_used': True,
-                'created_at': datetime.datetime.now().isoformat()
+                'trial_used': True,  # Mark trial as used
+                'created_at': datetime.now().isoformat()
             }},
             upsert=True
         )
         log_user_action(user_id, "NEW_USER_TRIAL_STARTED")
         return True
         
+    # Existing user check
     status = user.get('subscription_status')
     expiry = user.get('subscription_expiry')
     
+    # Convert expiry to datetime if needed
     if isinstance(expiry, str):
-        expiry = datetime.datetime.fromisoformat(expiry)
+        expiry = datetime.fromisoformat(expiry)
     
-    if status == 'active' and datetime.datetime.now() < expiry:
+    # Active subscription
+    if status == 'active' and datetime.now() < expiry:
         return True
         
-    if status == 'trial' and datetime.datetime.now() < expiry:
+    # Trial status check
+    if status == 'trial' and datetime.now() < expiry:
         return True
         
+    # Expired trial - prevent reuse
     if user.get('trial_used'):
         users_collection.update_one(
             {'user_id': user_id},
@@ -361,32 +454,40 @@ async def check_subscription(user_id: int) -> bool:
         log_user_action(user_id, "SUBSCRIPTION_EXPIRED")
         return False
         
+    # Should never reach here
     return False
 
 async def get_subscription_status_message(user: dict) -> str:
+    """Generate a user-friendly subscription status message"""
     status = user.get('subscription_status')
     expiry = user.get('subscription_expiry')
     
     if status == 'trial':
         if isinstance(expiry, str):
-            expiry = datetime.datetime.fromisoformat(expiry)
-        time_left = expiry - datetime.datetime.now()
+            expiry = datetime.fromisoformat(expiry)
+        time_left = expiry - datetime.now()
         hours = int(time_left.total_seconds() // 3600)
         return f"⏳ You're on a free trial ({hours} hours remaining)"
     elif status == 'active':
         if isinstance(expiry, str):
-            expiry = datetime.datetime.fromisoformat(expiry)
+            expiry = datetime.fromisoformat(expiry)
         return f"✅ Active subscription until {expiry.strftime('%Y-%m-%d %H:%M')}"
     else:
         return "❌ No active subscription. Use /subscribe to start."
 
-def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None) -> dict:
+
+
+
+# Update the set_user_wallet function with proper derivation paths
+async def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None) -> dict:
+    """Set up a user wallet from mnemonic or private key with proper derivation paths"""
     logger.info(f"🔐 [set_user_wallet] Starting for user {user_id}")
     try:
         user_key = derive_user_key(user_id)
         
         
         if mnemonic:
+            # Validate mnemonic
             if not Bip39MnemonicValidator().IsValid(mnemonic):
                 raise ValueError("Invalid mnemonic phrase.")
             
@@ -394,20 +495,23 @@ def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None)
             if word_count not in [12, 24]:
                 raise ValueError(f"Invalid mnemonic length: {word_count} words (must be 12 or 24)")
             
-            eth_account = account.from_mnemonic(mnemonic, account_path=ETHEREUM_DEFAULT_PATH)
+            # Create Ethereum account with standard derivation path
+            eth_account = Account.from_mnemonic(mnemonic, account_path=ETHEREUM_DEFAULT_PATH)
             eth_address = eth_account.address
             eth_private_key = eth_account.key.hex()
             
+            # Create Solana account with Phantom-compatible derivation path using bip-utils
             seed = Bip39SeedGenerator(mnemonic).Generate()
             bip44_mst = Bip44.FromSeed(seed, Bip44Coins.SOLANA)
             bip44_acc = bip44_mst.Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT)
             solana_private_key_bytes = bip44_acc.PrivateKey().Raw().ToBytes()
             solana_keypair = Keypair.from_seed(solana_private_key_bytes[:32])
-            solana_private_key = base58.b58encode(bytes(solana_keypair)).decode()
+            solana_private_key = base58.b58encode(bytes(solana_keypair)).decode()  # FIXED LINE
         
         elif private_key:
+            # Private key handling
             if private_key.startswith('0x'):
-                account = account.from_key(private_key)
+                account = Account.from_key(private_key)
                 eth_address = account.address
                 eth_private_key = private_key
                 new_seed = os.urandom(32)
@@ -421,16 +525,17 @@ def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None)
                     solana_private_key = private_key
                 elif len(key_bytes) == 32:
                     solana_keypair = Keypair.from_seed(key_bytes)
-                    solana_private_key = base58.b58encode(bytes(solana_keypair)).decode()
+                    solana_private_key = base58.b58encode(bytes(solana_keypair)).decode()  # FIXED LINE
                 else:
                     raise ValueError("Invalid Solana private key length")
-                account = account.create()
+                account = Account.create()
                 eth_address = account.address
                 eth_private_key = account.key.hex()
                 logger.warning("Solana private key provided - generated new ETH/BSC wallet")
         else:
             raise ValueError("Must provide either mnemonic or private key")
 
+        # Encrypt all sensitive data
         encrypted_mnemonic = encrypt_data(mnemonic if mnemonic else 'Imported via private key', user_key)
         encrypted_solana_private_key = encrypt_data(solana_private_key, user_key)
         encrypted_eth_private_key = encrypt_data(eth_private_key, user_key) if eth_private_key else None
@@ -438,7 +543,7 @@ def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None)
         return {
             'mnemonic': encrypted_mnemonic,
             'solana': {
-                'public_key': str(solana_keypair.pubkey()),
+                'public_key': str(solana_keypair.pubkey()),  # Updated to pubkey()
                 'private_key': encrypted_solana_private_key
             },
             'eth': {
@@ -456,51 +561,70 @@ def set_user_wallet(user_id: int, mnemonic: str = None, private_key: str = None)
         raise ValueError(f"Wallet creation failed: {str(e)}")
     
 
+
 def derive_solana_keypair_from_mnemonic(
     mnemonic: str,
     passphrase: str = "",
     derivation_path: str = "m/44'/501'/0'/0'"
 ) -> Keypair:
+    """
+    Derive a Solana Keypair from a BIP39 mnemonic using SLIP-0010 (ed25519).
+    Default path is m/44'/501'/0'/0' (Phantom/Exodus style). If result doesn't
+    match the wallet you expect, try other paths (see helper below).
+    Raises ValueError for an invalid mnemonic.
+    """
     mnemo = Mnemonic("english")
     if not mnemo.check(mnemonic):
         raise ValueError("Invalid mnemonic phrase")
 
+    # 1) Get seed from mnemonic (BIP39)
+    # Generate(passphrase) accepts an optional passphrase (BIP39)
     seed_bytes = Bip39SeedGenerator(mnemonic).Generate(passphrase)
 
+    # 2) Build master SLIP-0010 ed25519 context and derive the path
     bip32_ctx = Bip32Slip10Ed25519.FromSeed(seed_bytes)
     derived_ctx = bip32_ctx.DerivePath(derivation_path)
 
+    # 3) Get the raw private key bytes (32 bytes) suitable as seed for Solana
     priv_key_bytes = derived_ctx.PrivateKey().Raw().ToBytes()
     if len(priv_key_bytes) != 32:
         raise ValueError(f"unexpected private key length: {len(priv_key_bytes)}")
 
+    # 4) Convert to solana Keypair. Keypair.from_seed expects 32-bytes seed.
     kp = Keypair.from_seed(priv_key_bytes)
 
     return kp
 
 
 def find_solana_from_mnemonic_by_paths(mnemonic: str, expected_pubkey: str, passphrase: str = ""):
+    """
+    Try common derivation paths and return (path, Keypair) when a match is found.
+    expected_pubkey should be the base58 address you expect (string).
+    """
     common_paths = [
-        "m/44'/501'/0'/0'",      
-        "m/44'/501'/0'/0/0'",    
-        "m/44'/501'/0'/0",       
-        "m/44'/501'/0'/0'/0'",   
-        "m/44'/501'/1'/0'",      
+        "m/44'/501'/0'/0'",      # common Phantom / Exodus
+        "m/44'/501'/0'/0/0'",    # some variants
+        "m/44'/501'/0'/0",       # variant without final hardened
+        "m/44'/501'/0'/0'/0'",   # extra-depth variant
+        "m/44'/501'/1'/0'",      # account=1
         "m/44'/501'/0'",
+        # add more if you want...
     ]
 
     for path in common_paths:
         try:
             kp = derive_solana_keypair_from_mnemonic(mnemonic, passphrase, path)
-            pub = str(kp.public_key)         
+            pub = str(kp.public_key)         # base58 address
             if pub == expected_pubkey:
                 return path, kp
         except Exception:
+            # ignore invalid derivation attempts and continue
             continue
     return None, None
 
 
 async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
+    """Decrypt sensitive wallet information for a user"""
     user_key = derive_user_key(user_id)
     decrypted_user = user.copy()
 
@@ -531,17 +655,19 @@ async def decrypt_user_wallet(user_id: int, user: dict) -> dict:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /start command"""
     user_id = update.effective_user.id
     log_user_action(user_id, "START_COMMAND")
     
+    # Ensure user exists with trial
     if not users_collection.find_one({'user_id': user_id}):
-        expiry = datetime.datetime.now() + datetime.timedelta(days=1)
+        expiry = datetime.now() + timedelta(days=1)
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
                 'subscription_status': 'trial',
                 'subscription_expiry': expiry.isoformat(),
-                'created_at': datetime.datetime.now().isoformat(),
+                'created_at': datetime.now().isoformat(),
                 'trade_history': [],
                 'portfolio': {},
                 'auto_trade_blacklist': []
@@ -550,13 +676,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         log_user_action(user_id, "NEW_USER_TRIAL_STARTED", f"Trial until {expiry}")
     
+    # SECOND: Check subscription status
     if not await check_subscription(user_id):
         await update.message.reply_text("🚫 Your trial has expired. Use /subscribe to continue.")
         return
     
+    # THIRD: Check if wallet exists
     user = users_collection.find_one({'user_id': user_id})
     
     if not user or not user.get('solana') or not user['solana'].get('public_key'):
+
+         # Initialize with empty trade_history array
         users_collection.update_one(
         {'user_id': user_id},
         {'$set': {
@@ -614,6 +744,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await start_token_updates(context, user_id)
 
 async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job to delete a message with logging"""
     job = context.job
     try:
         await context.bot.delete_message(job.chat_id, job.data)
@@ -622,6 +753,7 @@ async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Failed to delete message {job.data} in chat {job.chat_id}: {str(e)}")
 
 async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle user's choice of wallet setup method"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -633,10 +765,10 @@ async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         log_user_action(user_id, "MNEMONIC_GENERATED")
         
         try:
-            user_data = await set_user_wallet(user_id, mnemonic)
+            user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
             users_collection.update_one(
     {'user_id': user_id},
-    {'$set': user_data},
+    {'$set': user_data},  # Only set wallet fields
     upsert=True
 )
             log_user_action(user_id, "WALLET_CREATED")
@@ -672,7 +804,8 @@ async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYP
             return ConversationHandler.END
             
     elif query.data == 'import_wallet':
-        context.user_data['is_start_flow'] = True
+        # Start wallet import flow directly in start conversation
+        context.user_data['is_start_flow'] = True  # Flag to identify start flow
         
         keyboard = [
             [InlineKeyboardButton("🔐 Mnemonic (12/24 words)", callback_data='mnemonic')],
@@ -690,14 +823,17 @@ async def handle_wallet_choice(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode='Markdown'
         )
         
+        # Schedule message deletion
         context.job_queue.run_once(
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=message.message_id),
             60,
             user_id=user_id
         )
-        return START_IMPORT_METHOD  
+        return START_IMPORT_METHOD  # New state for start flow
+    
 
 async def start_import_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle wallet method selection in start flow"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -715,6 +851,7 @@ async def start_import_method(update: Update, context: ContextTypes.DEFAULT_TYPE
             "⚠️ This message and your input will auto-delete in 30 seconds for security.",
             parse_mode='Markdown'
         )
+        # Schedule message deletion
         context.job_queue.run_once(
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=message.message_id),
             60,
@@ -739,10 +876,12 @@ async def start_import_method(update: Update, context: ContextTypes.DEFAULT_TYPE
     
 
 async def start_input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle mnemonic input in start flow"""
     user_id = update.effective_user.id
     mnemonic = update.message.text.strip()
     logger.info(f"📝 [start_input_mnemonic] Received mnemonic from user {user_id}")
     
+    # Delete the sensitive message immediately
     try:
         await context.bot.delete_message(chat_id=user_id, message_id=update.message.message_id)
     except Exception as e:
@@ -757,9 +896,11 @@ async def start_input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYP
         if not mnemo.check(mnemonic):
             raise ValueError("Invalid mnemonic phrase")
         
+        # Create and save wallet (no confirmation needed for new users)
         logger.info("Creating new wallet from mnemonic in start flow")
         
         
+        # Save to database
      
 
         wallet_data = await set_user_wallet(user_id, mnemonic=mnemonic)
@@ -769,16 +910,20 @@ async def start_input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYP
             upsert=True
         )
         
+        # Log the update result properly
         logger.info(f"Database update - matched: {update_result.matched_count}, "
                    f"modified: {update_result.modified_count}, "
                    f"upserted_id: {update_result.upserted_id}")
+        # Verify the wallet was saved
         db_user = users_collection.find_one({'user_id': user_id})
         if not db_user or not db_user.get('solana') or not db_user['solana'].get('public_key'):
             raise RuntimeError("Wallet not saved to database")
         
+        # Get decrypted info for display
         decrypted_user = await decrypt_user_wallet(user_id, db_user)
         eth_bsc_address = db_user['eth']['address'] if db_user.get('eth') else "Not set"
         
+        # Prepare success message with self-destruct
         success_msg = (
             f"✅ *Wallet Imported Successfully!*\n\n"
             f"🔐 *Recovery Phrase*: `{decrypted_user['mnemonic']}`\n"
@@ -794,14 +939,16 @@ async def start_input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYP
         
         msg = await update.message.reply_text(success_msg, parse_mode='Markdown')
         
+        # Schedule message deletion with proper context
         context.job_queue.run_once(
             callback=delete_message_job,
-            when=120,
+            when=120,  # 2 minutes
             chat_id=user_id,
             data=msg.message_id,
             name=f"delete_msg_{msg.message_id}"
         )
         
+        # Start token updates
         await start_token_updates(context, user_id)
         return ConversationHandler.END
         
@@ -815,10 +962,12 @@ async def start_input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYP
         return START_INPUT_MNEMONIC
     
 async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle private key input in start flow"""
     user_id = update.effective_user.id
     private_key = update.message.text.strip()
     log_user_action(user_id, "PRIVATE_KEY_RECEIVED")
     
+    # Delete the sensitive message immediately
     try:
         await context.bot.delete_message(
             chat_id=user_id,
@@ -828,15 +977,18 @@ async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_
         logger.warning(f"Could not delete private key message: {str(e)}")
 
     try:
+        # Validate the private key format
         key_type = None
         if not private_key.startswith('0x'):
             try:
+                # Try to decode as Solana private key (base58)
                 key_bytes = base58.b58decode(private_key)
                 if len(key_bytes) == 64:
                     key_type = 'solana'
                 else:
                     raise ValueError("Invalid Solana private key length")
             except:
+                # Try to decode as ETH/BSC private key (hex)
                 private_key = '0x' + private_key
                 key_bytes = bytes.fromhex(private_key[2:])
                 if len(key_bytes) == 32:
@@ -852,6 +1004,7 @@ async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_
                 
         log_user_action(user_id, "VALID_PRIVATE_KEY_RECEIVED", f"Type: {key_type}")
         
+        # Create and save wallet
         
 
         wallet_data = await set_user_wallet(user_id, private_key=private_key)
@@ -861,13 +1014,16 @@ async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_
             upsert=True
         )
         
+        # Properly log the update result
         logger.info(f"Database update - matched: {update_result.matched_count}, "
                    f"modified: {update_result.modified_count}, "
                    f"upserted_id: {update_result.upserted_id}")
         
+        # Get decrypted info for display
         decrypted_user = await decrypt_user_wallet(user_id, wallet_data)
         eth_bsc_address = wallet_data['eth']['address'] if wallet_data.get('eth') else "Not set"
         
+        # Prepare success message
         success_msg = (
             f"✅ *Wallet Imported Successfully!*\n\n"
             f"🔑 *Solana Address*: `{wallet_data['solana']['public_key']}`\n"
@@ -878,6 +1034,7 @@ async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(success_msg, parse_mode='Markdown')
         log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
         
+        # Start token updates
         await start_token_updates(context, user_id)
         return ConversationHandler.END
         
@@ -891,6 +1048,7 @@ async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_
             "- ETH/BSC private key (hex encoded, 32 bytes with or without 0x prefix)\n\n"
             "Try again or use /cancel to abort."
         )
+        # Delete error message after 1 minute
         context.job_queue.run_once(
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
             60,
@@ -900,14 +1058,17 @@ async def start_input_private_key(update: Update, context: ContextTypes.DEFAULT_
     
 
 async def record_token_performance(token: dict):
+    """Record token metrics with backward compatibility"""
     contract_address = token['contract_address']
     
+    # Check if token exists
     existing = token_performance_collection.find_one({'contract_address': contract_address})
     
     if existing:
+        # Update existing record with new fields if missing
         update_data = {}
         if 'first_tracked' not in existing:
-            update_data['first_tracked'] = existing.get('first_posted_at', datetime.datetime.now())
+            update_data['first_tracked'] = existing.get('first_posted_at', datetime.now())
         if 'performance_history' not in existing:
             update_data['performance_history'] = []
         
@@ -918,12 +1079,13 @@ async def record_token_performance(token: dict):
             )
         return
     
+    # Create new performance document
     token_performance_collection.insert_one({
         'contract_address': contract_address,
         'name': token.get('name', ''),
         'symbol': token.get('symbol', ''),
-        'first_tracked': datetime.datetime.now(),
-        'first_posted_at': datetime.datetime.now(),
+        'first_tracked': datetime.now(),
+        'first_posted_at': datetime.now(),  # Backward compatibility
         'initial_metrics': {
             'price': token['price_usd'],
             'liquidity': token['liquidity'],
@@ -938,18 +1100,20 @@ async def record_token_performance(token: dict):
         },
         'performance_history': [],
         'ath': token['price_usd'],
-        'ath_time': datetime.datetime.now(),
+        'ath_time': datetime.now(),
         'atl': token['price_usd'],
-        'atl_time': datetime.datetime.now()
+        'atl_time': datetime.now()
     })
 
 
 async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
+    """Update token performance metrics with advanced analysis"""
     logger.info("🔄 Updating token performance metrics...")
     
+    # Get all tokens being tracked
     tokens = token_performance_collection.find({
         'first_tracked': {
-            '$gte': datetime.datetime.now() - datetime.timedelta(days=PERFORMANCE_TRACKING_DAYS)
+            '$gte': datetime.now() - timedelta(days=PERFORMANCE_TRACKING_DAYS)
         }
     })
     
@@ -957,21 +1121,19 @@ async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
         for token in tokens:
             contract_address = token['contract_address']
             try:
-                # Fetch current token data with try/except for cache access (added as per recommendation)
-                try:
-                    current_data = await fetch_token_by_contract(contract_address)
-                except KeyError:
-                    logger.warning(f"Cache miss for {contract_address}, fetching new data")
-                    current_data = await fetch_token_by_contract(contract_address)
+                # Fetch current token data
+                current_data = await fetch_token_by_contract(contract_address)
                 if not current_data:
                     continue
                 
+                # Calculate performance metrics
                 price_change = calculate_price_change(token, current_data)
                 liquidity_health = calculate_liquidity_health(token, current_data)
                 volatility = calculate_volatility(token, current_data)
                 sentiment = await calculate_sentiment(token, client)
                 prediction = generate_prediction(token, current_data)
                 
+                # Update all-time high/low
                 new_ath = token['ath']
                 new_ath_time = token['ath_time']
                 new_atl = token['atl']
@@ -979,13 +1141,14 @@ async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
                 
                 if current_data['price_usd'] > token['ath']:
                     new_ath = current_data['price_usd']
-                    new_ath_time = datetime.datetime.now()
+                    new_ath_time = datetime.now()
                 elif current_data['price_usd'] < token['atl']:
                     new_atl = current_data['price_usd']
-                    new_atl_time = datetime.datetime.now()
+                    new_atl_time = datetime.now()
                 
+                # Add performance update
                 update_data = {
-                    'timestamp': datetime.datetime.now(),
+                    'timestamp': datetime.now(),
                     'price': current_data['price_usd'],
                     'liquidity': current_data['liquidity'],
                     'volume': current_data['volume'],
@@ -996,6 +1159,7 @@ async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
                     'sentiment': sentiment
                 }
                 
+                # Update database
                 token_performance_collection.update_one(
                     {'_id': token['_id']},
                     {'$set': {
@@ -1014,12 +1178,12 @@ async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
                         'liquidity_health': liquidity_health,
                         'sentiment_score': sentiment,
                         'prediction': prediction,
-                        'last_updated': datetime.datetime.now()
+                        'last_updated': datetime.now()
                     },
                     '$push': {
                         'performance_history': {
                             '$each': [update_data],
-                            '$slice': -500
+                            '$slice': -500  # Keep last 500 updates
                         }
                     }}
                 )
@@ -1028,40 +1192,48 @@ async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error updating performance for {contract_address}: {str(e)}")
 
 def calculate_price_change(token, current_data):
+    """Calculate price change percentage with None value handling"""
     initial_price = token['initial_metrics'].get('price')
     current_price = current_data.get('price_usd')
     
+    # Handle None values
     if initial_price is None or current_price is None:
         logger.warning(f"Missing price data for token {token.get('contract_address')}")
-        return 0
+        return 0  # Return 0% change if data is missing
     
     return ((current_price - initial_price) / initial_price) * 100
 
 
 def calculate_liquidity_health(token, current_data):
+    """Calculate liquidity health score (0-100)"""
     initial_liquidity = token['initial_metrics']['liquidity']
     current_liquidity = current_data['liquidity']
     
+    # Liquidity growth factor
     growth_factor = current_liquidity / initial_liquidity if initial_liquidity > 0 else 1
     
+    # Liquidity to market cap ratio
     market_cap = current_data.get('market_cap', current_liquidity * 2)
     liquidity_ratio = current_liquidity / market_cap if market_cap > 0 else 0
     
+    # Calculate score (weighted average)
     score = min(100, (
-        (min(growth_factor, 10) * 40) + 
-        (min(liquidity_ratio * 100, 50) * 60) 
+        (min(growth_factor, 10) * 40) +  # Growth contributes 40% (capped at 10x)
+        (min(liquidity_ratio * 100, 50) * 60)  # Ratio contributes 60% (max 50 score)
     ))
     
     return round(score, 1)
 
 
 def calculate_volatility(token, current_data):
+    """Calculate volatility with None value handling"""
     if len(token.get('performance_history', [])) < 2:
         return 0
     
     prices = [p.get('price', 0) for p in token['performance_history']]
     current_price = current_data.get('price_usd', 0)
     
+    # Filter out None values
     prices = [p for p in prices if p is not None]
     if current_price is not None:
         prices.append(current_price)
@@ -1069,6 +1241,7 @@ def calculate_volatility(token, current_data):
     if not prices or len(prices) < 2:
         return 0
     
+    # Calculate standard deviation of logarithmic returns
     returns = []
     for i in range(1, len(prices)):
         returns.append(math.log(prices[i] / prices[i-1]))
@@ -1080,16 +1253,19 @@ def calculate_volatility(token, current_data):
     variance = sum((x - mean_return) ** 2 for x in returns) / len(returns)
     std_dev = math.sqrt(variance)
     
+    # Annualized volatility
     volatility = std_dev * math.sqrt(365 * 24 * 60 / TOKEN_PERFORMANCE_INTERVAL)
-    return round(volatility * 100, 2)
+    return round(volatility * 100, 2)  # as percentage
 
 
 async def calculate_sentiment(token, client):
+    """Calculate market sentiment score (0-100) from multiple sources"""
     try:
         symbol = token['symbol']
         total_polarity = 0
         count = 0
         
+        # Source 1: Twitter (X) - Use X Keyword Search
         twitter_response = await client.get(
             f"https://api.twitter.com/2/tweets/search/recent?query={symbol}&max_results=50",
             headers={"Authorization": f"Bearer {os.getenv('TWITTER_BEARER_TOKEN')}"},
@@ -1102,8 +1278,13 @@ async def calculate_sentiment(token, client):
             total_polarity += blob.sentiment.polarity
             count += 1
         
+        # Source 2: Reddit - Use web search for recent comments
+        reddit_query = f"site:reddit.com {symbol} crypto sentiment"
+        # Simulate web search call (use tool in bot)
+        # For demo, assume reddit_comments list from previous search
         reddit_comments = [
             "On average, the sentiment seems fairly positive, however altcoins seem to have a more positive sentiment than Bitcoin",
+            # ... add more from search results
         ]
         for comment in reddit_comments:
             blob = TextBlob(comment.lower())
@@ -1111,26 +1292,29 @@ async def calculate_sentiment(token, client):
             count += 1
         
         if count == 0:
-            return 50
+            return 50  # Neutral if no data
         
         avg_polarity = total_polarity / count
-        score = ((avg_polarity + 1) / 2) * 100
+        score = ((avg_polarity + 1) / 2) * 100  # Normalize -1..1 to 0..100
         return round(score, 1)
         
     except Exception as e:
         logger.error(f"Sentiment analysis failed: {str(e)}")
-        return 50
-
+        return 50  # Neutra
+    
 def generate_prediction(token, current_data):
+    """Generate short-term prediction using technical indicators"""
     if len(token['performance_history']) < 10:
         return None
         
     prices = [p['price'] for p in token['performance_history'][-50:]]
     prices.append(current_data['price_usd'])
     
+    # Calculate SMA and EMA
     sma = sum(prices[-10:]) / 10
-    ema = prices[-1] * 0.2 + sma * 0.8
+    ema = prices[-1] * 0.2 + sma * 0.8  # Simple EMA approximation
     
+    # Calculate RSI
     gains = []
     losses = []
     for i in range(1, len(prices)):
@@ -1145,6 +1329,7 @@ def generate_prediction(token, current_data):
     rs = avg_gain / avg_loss if avg_loss != 0 else 100
     rsi = 100 - (100 / (1 + rs))
     
+    # Generate prediction
     prediction = ""
     confidence = 0
     
@@ -1171,8 +1356,10 @@ def generate_prediction(token, current_data):
 
 
 async def migrate_token_performance_data():
+    """Migrate old token performance data to new format"""
     logger.info("🔄 Migrating token performance data...")
     
+    # Update all documents missing the new fields
     token_performance_collection.update_many(
         {'first_tracked': {'$exists': False}},
         {'$set': {
@@ -1183,6 +1370,7 @@ async def migrate_token_performance_data():
         }}
     )
     
+    # Initialize empty performance history where missing
     token_performance_collection.update_many(
         {'performance_history': {'$exists': False}},
         {'$set': {'performance_history': []}}
@@ -1191,67 +1379,83 @@ async def migrate_token_performance_data():
     logger.info("✅ Token performance data migration complete")
 
 async def generate_performance_chart(token_data):
-    performance_history = token_data.get('performance_history', [])
-    if not performance_history:
-        return None
+    """Generate performance chart with robust error handling"""
+    try:
+        performance_history = token_data.get('performance_history', [])
+        if not performance_history:
+            return None
 
-    timestamps = [pd.to_datetime(entry['timestamp']) for entry in performance_history]
-    prices = [entry['price'] for entry in performance_history]
-    liquidity = [entry['liquidity'] for entry in performance_history]
-    
-    df = pd.DataFrame({
-        'timestamp': timestamps,
-        'price': prices,
-        'liquidity': liquidity
-    })
-    df.set_index('timestamp', inplace=True)
-    
-    df = df.resample('5T').ffill()
-    
-    chart_config = {
-        "type": "line",
-        "data": {
-            "labels": [ts.strftime('%m/%d %H:%M') for ts in df.index],
-            "datasets": [
-                {
-                    "label": "Price (USD)",
-                    "data": df['price'].tolist(),
-                    "borderColor": "rgb(75, 192, 192)",
-                    "yAxisID": "y",
-                    "fill": False
-                },
-                {
-                    "label": "Liquidity (USD)",
-                    "data": df['liquidity'].tolist(),
-                    "borderColor": "rgb(255, 99, 132)",
-                    "yAxisID": "y1",
-                    "fill": False
-                }
-            ]
-        },
-        "options": {
-            "scales": {
-                "y": {
-                    "type": "linear",
-                    "display": True,
-                    "position": "left",
-                    "title": {"text": "Price (USD)", "display": True}
-                },
-                "y1": {
-                    "type": "linear",
-                    "display": True,
-                    "position": "right",
-                    "title": {"text": "Liquidity (USD)", "display": True},
-                    "grid": {"drawOnChartArea": False}
+        timestamps = [pd.to_datetime(entry['timestamp']) for entry in performance_history]
+        prices = [entry['price'] for entry in performance_history]
+        liquidity = [entry['liquidity'] for entry in performance_history]
+        
+        # Create DataFrame
+        df = pd.DataFrame({
+            'timestamp': timestamps,
+            'price': prices,
+            'liquidity': liquidity
+        })
+        df.set_index('timestamp', inplace=True)
+        
+        # Resample to consistent intervals
+        df = df.resample('5T').ffill()
+        
+        # Create chart config
+        chart_config = {
+            "type": "line",
+            "data": {
+                "labels": [ts.strftime('%m/%d %H:%M') for ts in df.index],
+                "datasets": [
+                    {
+                        "label": "Price (USD)",
+                        "data": df['price'].tolist(),
+                        "borderColor": "rgb(75, 192, 192)",
+                        "yAxisID": "y",
+                        "fill": False
+                    },
+                    {
+                        "label": "Liquidity (USD)",
+                        "data": df['liquidity'].tolist(),
+                        "borderColor": "rgb(255, 99, 132)",
+                        "yAxisID": "y1",
+                        "fill": False
+                    }
+                ]
+            },
+            "options": {
+                "scales": {
+                    "y": {
+                        "type": "linear",
+                        "display": True,
+                        "position": "left",
+                        "title": {"text": "Price (USD)", "display": True}
+                    },
+                    "y1": {
+                        "type": "linear",
+                        "display": True,
+                        "position": "right",
+                        "title": {"text": "Liquidity (USD)", "display": True},
+                        "grid": {"drawOnChartArea": False}
+                    }
                 }
             }
         }
-    }
-    
-    chart_url = f"https://quickchart.io/chart?c={json.dumps(chart_config)}"
-    return chart_url
+        
+        # Generate chart URL
+        chart_url = f"https://quickchart.io/chart?c={json.dumps(chart_config)}"
+        return chart_url
+
+    except Exception as e:
+        logger.error(f"Chart generation failed: {str(e)}")
+        return None
+
+
+
+
+
 
 async def token_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Initiate token performance analysis with detailed metrics"""
     user_id = update.effective_user.id
     log_user_action(user_id, "TOKEN_ANALYSIS_REQUEST")
     
@@ -1262,12 +1466,15 @@ async def token_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return INPUT_ANALYSIS_CONTRACT
 
 async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle token contract input with comprehensive analysis"""
     user_id = update.effective_user.id
     contract_address = update.message.text.strip()
     
     try:
+        # Show processing message
         processing_msg = await update.message.reply_text("⏳ Performing deep analysis...")
         
+        # Fetch performance data
         token_data = token_performance_collection.find_one(
             {'contract_address': contract_address}
         )
@@ -1279,25 +1486,30 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
         
+        # Fetch current token data
         current_token = await fetch_token_by_contract(contract_address)
         if not current_token:
             await processing_msg.edit_text("❌ Failed to fetch current token data.")
             return ConversationHandler.END
         
+        # Get first tracked time with fallback
         first_tracked = token_data.get('first_tracked')
         if not first_tracked:
-            first_tracked = token_data.get('first_posted_at', datetime.datetime.now())
+            first_tracked = token_data.get('first_posted_at', datetime.now())
         
         if isinstance(first_tracked, str):
-            first_tracked = datetime.datetime.fromisoformat(first_tracked)
+            first_tracked = datetime.fromisoformat(first_tracked)
             
-        time_tracked = datetime.datetime.now() - first_tracked
+        # Calculate time since first tracking
+        time_tracked = datetime.now() - first_tracked
         days_tracked = time_tracked.days
         hours_tracked = time_tracked.seconds // 3600
         
+        # Calculate performance metrics
         initial_price = token_data['initial_metrics']['price']
         current_price = current_token['price_usd']
         
+        # Calculate percentage change and multiple
         if initial_price > 0:
             price_change_percent = ((current_price - initial_price) / initial_price) * 100
             price_multiple = current_price / initial_price
@@ -1305,6 +1517,7 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price_change_percent = 0
             price_multiple = 1
             
+        # Calculate market cap changes
         initial_mc = token_data['initial_metrics'].get('market_cap', 
                      token_data['initial_metrics'].get('liquidity', 0) * 2)
         current_mc = current_token.get('market_cap', current_token.get('liquidity', 0) * 2)
@@ -1316,6 +1529,7 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mc_change_percent = 0
             mc_multiple = 1
         
+        # Format the analysis message
         message = (
             f"🚀 *{current_token.get('name', 'Unknown Token')} ({current_token.get('symbol', 'UNKNOWN')})*\n\n"
             f"🔗 *Contract:* `{contract_address}`\n\n"
@@ -1338,6 +1552,7 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• *Holders:* {current_token.get('holders', 'N/A')}\n\n"
         )
         
+        # Add volatility and sentiment if available
         if 'volatility' in token_data:
             message += f"📊 *Volatility:* {token_data.get('volatility', 0):.2f}%\n"
         if 'sentiment_score' in token_data:
@@ -1345,6 +1560,7 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sentiment_emoji = "😊" if sentiment > 60 else "😐" if sentiment > 40 else "😞"
             message += f"📣 *Market Sentiment:* {sentiment}/100 {sentiment_emoji}\n"
         
+        # Add prediction if available
         if token_data.get('prediction'):
             pred = token_data['prediction']
             emoji = "📈" if pred['trend'] == 'bullish' else "📉" if pred['trend'] == 'bearish' else "↔️"
@@ -1353,6 +1569,7 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"(Confidence: {pred['confidence']:.1f}%)\n"
             )
         
+        # Add links section
         solscan_url = f"https://solscan.io/token/{contract_address}"
         dexscreener_url = f"https://dexscreener.com/solana/{contract_address}"
         birdeye_url = f"https://birdeye.so/token/{contract_address}"
@@ -1364,17 +1581,21 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• [Birdeye]({birdeye_url})\n\n"
         )
         
+        # Add trading platforms if available
         message += "🤖 *Trading Platforms*\n"
         message += "• Jupiter | Raydium | Orca | Phantom | Solflare\n\n"
         
+        # Add footer
         message += "---\n"
         message += "📊 *Powered by Trading Bot Analytics*\n"
         message += "Your multi-chain trading companion"
         
+        # Generate performance chart
         chart_url = await generate_performance_chart(token_data)
         if chart_url:
             message += f"\n\n[View Performance Chart]({chart_url})"
         
+        # Send message
         try:
             await processing_msg.delete()
         except:
@@ -1394,6 +1615,7 @@ async def analysis_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return ConversationHandler.END
 
+# Modified fetch_tokens_manual function
 async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     log_user_action(user_id, "MANUAL_TOKEN_FETCH")
@@ -1406,7 +1628,7 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
         user = users_collection.find_one({'user_id': user_id})
         if not user or not user.get('solana') or not user['solana'].get('public_key'):
             await update.message.reply_text(
-                "🚫 You need to set up a wallet first. Use /start to create a wallet or /set_wallet to import one."
+                "🚫 You need to set up a wallet first. Use /start to create a new wallet or /set_wallet to import an existing one."
             )
             return
 
@@ -1427,7 +1649,8 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
         new_tokens = [t for t in tokens if t['contract_address'] not in posted_tokens]
         
         if new_tokens:
-            token = new_tokens[0] 
+            token = new_tokens[0]  # Take the most recent unseen token
+            # Record token performance
             await record_token_performance(token)
 
             message = format_token_message(token)
@@ -1462,6 +1685,7 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
                     reply_markup=reply_markup
                 )
             
+            # Add to user's posted tokens
             users_collection.update_one(
                 {'user_id': user_id},
                 {
@@ -1478,6 +1702,7 @@ async def fetch_tokens_manual(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ An error occurred while fetching tokens. Please try again.")
 
 async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show trade system status"""
     user_id = update.effective_user.id
     log_user_action(user_id, "TRADE_STATUS_REQUEST")
     
@@ -1490,7 +1715,7 @@ async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = (
         f"📊 *Trade System Status*\n\n"
         f"🔄 Auto-fetch: {'✅ Enabled' if user.get('last_token_check') else '❌ Disabled'}\n"
-        f"⏱️ Last check: {datetime.datetime.fromtimestamp(user.get('last_token_check', 0)).strftime('%Y-%m-%d %H:%M') if user.get('last_token_check') else 'Never'}\n"
+        f"⏱️ Last check: {datetime.fromtimestamp(user.get('last_token_check', 0)).strftime('%Y-%m-%d %H:%M') if user.get('last_token_check') else 'Never'}\n"
         f"📋 Tokens seen: {len(user.get('posted_tokens', []))}\n"
         f"💼 Active trades: {len(user.get('portfolio', {}))}\n\n"
         f"🔹 Use /fetch_tokens to manually check for new tokens\n"
@@ -1500,7 +1725,28 @@ async def trade_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status, parse_mode='Markdown') 
 
 
+def calculate_timeframe_change(token_data, hours):
+    """Calculate price change for specific timeframe"""
+    now = datetime.now()
+    time_threshold = now - timedelta(hours=hours)
+    
+    # Find closest historical point
+    closest_point = None
+    for point in reversed(token_data['performance_history']):
+        if point['timestamp'] <= time_threshold:
+            closest_point = point
+            break
+            
+    if not closest_point:
+        return 0
+        
+    current_price = token_data['current_metrics']['price']
+    historical_price = closest_point['price']
+    
+    return ((current_price - historical_price) / historical_price) * 100 
+
 async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Start periodic token updates for a user"""
     logger.info(f"🔔 [start_token_updates] Starting for user {user_id}")
     try:
         user = users_collection.find_one({'user_id': user_id})
@@ -1514,6 +1760,7 @@ async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
         
         if not user.get('solana') or not user['solana'].get('public_key'):
             logger.warning(f"User {user_id} has no wallet set up")
+            # DEBUG: Log the actual user document for inspection
             logger.debug(f"User document: {user}")
             await context.bot.send_message(
                 chat_id=user_id,
@@ -1530,11 +1777,12 @@ async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     )
         context.job_queue.run_repeating(
     auto_cleanup_zero_balance,
-    interval=3600,  
+    interval=3600,  # Run every hour
     first=60,
     user_id=user_id,
     name=f"auto_cleanup_{user_id}"
 )
+        # Remove any existing jobs for this user
         for job in context.job_queue.jobs():
             if job.name.startswith(f"user_{user_id}_"):
                 job.schedule_removal()
@@ -1556,12 +1804,17 @@ async def start_token_updates(context: ContextTypes.DEFAULT_TYPE, user_id: int):
 
 
 async def is_position_active(contract_address: str) -> bool:
+    """Check if a position has sufficient liquidity to be considered active"""
+    # Define your minimum liquidity threshold
+    MIN_ACTIVE_LIQUIDITY = 2000  # $500 USD
+    
     token = await fetch_token_by_contract(contract_address)
     if token and token.get('liquidity', 0) >= MIN_ACTIVE_LIQUIDITY:
         return True
     return False
 
 async def remove_illiquid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove all illiquid positions from portfolio"""
     user_id = update.effective_user.id
     user = users_collection.find_one({'user_id': user_id})
     
@@ -1572,7 +1825,7 @@ async def remove_illiquid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     portfolio = user['portfolio']
     removed_count = 0
     
-    for contract in list(portfolio.keys()):
+    for contract in list(portfolio.keys()):  # Create a copy of keys for safe iteration
         if not await is_position_active(contract):
             users_collection.update_one(
                 {'user_id': user_id},
@@ -1590,16 +1843,21 @@ async def remove_illiquid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def check_conversation_timeout(context: ContextTypes.DEFAULT_TYPE):
+    """Check if conversation has timed out and resume token updates"""
     user_id = context.job.user_id
-    last_activity = context.job.data.get('last_activity', datetime.datetime.now())
+    last_activity = context.job.data.get('last_activity', datetime.now())
     
-    if (datetime.datetime.now() - last_activity).total_seconds() > 120:
+    # 2 minutes timeout
+    if (datetime.now() - last_activity).total_seconds() > 120:
         logger.info(f"⏰ Conversation timeout for user {user_id}")
         
+        # Clear conversation state
         context.user_data[f'conversation_state_{user_id}'] = None
         
+        # Remove timeout job itself
         context.job.schedule_removal()
         
+        # Send notification
         try:
             await context.bot.send_message(
                 chat_id=user_id,
@@ -1608,10 +1866,12 @@ async def check_conversation_timeout(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Couldn't send timeout message: {str(e)}")
         
+        # Restart token updates if subscribed
         if await check_subscription(user_id):
             await start_token_updates(context, user_id)
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle subscription with direct SOL payment"""
     user_id = update.effective_user.id
     log_user_action(user_id, "SUBSCRIPTION_REQUEST")
     
@@ -1620,13 +1880,15 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("🚫 Please use /start first to initialize your account.")
         return
     
+    # Check current subscription status
     if user.get('subscription_status') == 'active':
-        expiry = datetime.datetime.fromisoformat(user['subscription_expiry'])
+        expiry = datetime.fromisoformat(user['subscription_expiry'])
         await update.message.reply_text(
             f"✅ You already have an active subscription until {expiry.strftime('%Y-%m-%d %H:%M:%S')}."
         )
         return
     
+    # Check if user has a Solana wallet connected
     if not user.get('solana') or not user['solana'].get('public_key'):
         await update.message.reply_text(
             "🔑 You need to have a Solana wallet connected to subscribe.\n\n"
@@ -1634,6 +1896,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return
     
+    # Check SOL balance
     sol_balance = await check_balance(user_id, 'solana')
     if sol_balance < SUBSCRIPTION_SOL_AMOUNT:
         await update.message.reply_text(
@@ -1643,6 +1906,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return
     
+    # Request confirmation
     keyboard = [
         [InlineKeyboardButton("✅ Confirm Payment", callback_data='confirm_subscription')],
         [InlineKeyboardButton("❌ Cancel", callback_data='cancel_subscription')]
@@ -1660,7 +1924,37 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return SUBSCRIPTION_CONFIRMATION
 
+async def check_trade_feasibility(token: Dict[str, Any], trade_amount_sol: float) -> Tuple[bool, str]:
+    """
+    Check if a trade is feasible based on liquidity and market conditions.
+    Returns (is_feasible, reason)
+    """
+
+    
+    # Calculate approximate trade size in USD
+    trade_size_usd = trade_amount_sol * 150  # Approximate SOL price
+    
+    # Rule 1: Absolute liquidity minimum
+    if token['liquidity'] < 500:  # $500 absolute minimum
+        return False, f"Insufficient liquidity (${token['liquidity']} < $500)"
+    
+    # Rule 2: Trade size should be less than 5% of liquidity
+    if trade_size_usd > token['liquidity'] * 0.05:
+        return False, f"Trade size (${trade_size_usd:.2f}) > 5% of liquidity (${token['liquidity']})"
+    
+    # Rule 3: Check if token is in a death spiral (price dropping rapidly)
+    if 'price_change_5m' in token and token['price_change_5m'] < -0.3:  # 30% drop in 5min
+        return False, f"Token price crashing ({token['price_change_5m']*100:.1f}% in 5min)"
+    
+    # Rule 4: Check if volume has dried up
+    if token['volume'] < 1000:  # Less than $1000 volume
+        return False, f"Low volume (${token['volume']} < $1000)"
+    
+    return True, "Trade is feasible"
+   
+
 async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle subscription confirmation and execute SOL payment"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -1675,6 +1969,7 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
     user = users_collection.find_one({'user_id': user_id})
     
     try:
+        # Decrypt private key
         decrypted_user = await decrypt_user_wallet(user_id, user)
         solana_private_key = decrypted_user['solana']['private_key']
         
@@ -1683,11 +1978,14 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         
         keypair = Keypair.from_bytes(base58.b58decode(solana_private_key))
         
+        # Create transfer instruction
         to_pubkey = Pubkey.from_string(BOT_SOL_ADDRESS)
-        amount_lamports = int(SUBSCRIPTION_SOL_AMOUNT * 10**9)
+        amount_lamports = int(SUBSCRIPTION_SOL_AMOUNT * 10**9)  # Convert SOL to lamports
         
+        # Get recent blockhash
         recent_blockhash = (await solana_client.get_latest_blockhash()).value.blockhash
         
+        # Create message
         message = Message.new_with_blockhash(
             [transfer(
                 TransferParams(
@@ -1700,17 +1998,22 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             recent_blockhash
         )
         
+        # Create transaction
         txn = Transaction([keypair], message, recent_blockhash)
         
+        # Sign transaction with all required parameters
         txn.sign([keypair], recent_blockhash)
         
+        # Send transaction
         tx_hash = await solana_client.send_transaction(txn)
         logger.info(f"Subscription payment sent: {tx_hash.value}")
         
+        # Confirm transaction
         await solana_client.confirm_transaction(tx_hash.value, commitment="confirmed")
         log_user_action(user_id, "SUBSCRIPTION_PAYMENT_SENT", f"TX: {tx_hash.value}")
         
-        expiry = datetime.datetime.now() + datetime.timedelta(days=7)
+        # Update subscription status
+        expiry = datetime.now() + timedelta(days=7)
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
@@ -1736,8 +2039,10 @@ async def confirm_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
 async def verify_sol_payments(context: ContextTypes.DEFAULT_TYPE):
+    """Background job to verify SOL subscription payments"""
     logger.info("🔍 Verifying SOL subscription payments...")
     
+    # Get all pending payments (users who initiated payment but we haven't confirmed)
     pending_payments = users_collection.find({
         'subscription_payment_sent': True,
         'subscription_status': {'$ne': 'active'}
@@ -1751,13 +2056,15 @@ async def verify_sol_payments(context: ContextTypes.DEFAULT_TYPE):
             continue
         
         try:
+            # Check transaction status
             tx_status = await solana_client.get_transaction(
                 tx_hash,
                 commitment="confirmed"
             )
             
             if tx_status.value and not tx_status.value.transaction.meta.err:
-                expiry = datetime.datetime.now() + datetime.timedelta(days=7)
+                # Payment confirmed!
+                expiry = datetime.now() + timedelta(days=7)
                 users_collection.update_one(
                     {'user_id': user_id},
                     {'$set': {
@@ -1776,6 +2083,7 @@ async def verify_sol_payments(context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.error(f"Failed to notify user {user_id}: {str(e)}")
             else:
+                # Transaction failed or not found
                 users_collection.update_one(
                     {'user_id': user_id},
                     {'$unset': {'subscription_payment_sent': "", 'last_payment_tx': ""}}
@@ -1792,6 +2100,7 @@ async def verify_sol_payments(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Payment verification error for user {user_id}: {str(e)}")
 
 async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle wallet generation command"""
     user_id = update.effective_user.id
     log_user_action(user_id, "WALLET_GENERATE_INITIATED")
     
@@ -1826,10 +2135,12 @@ async def generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return await confirm_generate_wallet(update, context, new_user=True)
 
 async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE, new_user=False) -> int:
+    """Confirm and generate a new wallet"""
     user_id = update.effective_user.id if new_user else update.callback_query.from_user.id
     log_user_action(user_id, "WALLET_GENERATION_STARTED")
     
     try:
+        # Show processing message
         if new_user:
             processing_msg = await update.message.reply_text("⏳ Generating your new wallet...")
         else:
@@ -1841,13 +2152,16 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
                 return ConversationHandler.END
             await query.edit_message_text("⏳ Generating your new wallet...")
         
+        # Generate new wallet
         mnemo = Mnemonic("english")
         mnemonic = mnemo.generate(strength=256)
         log_user_action(user_id, "MNEMONIC_GENERATED")
         
-        user_data = await set_user_wallet(user_id, mnemonic)
+        # Create wallet from mnemonic
+        user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
         log_user_action(user_id, "WALLET_CREATED_FROM_MNEMONIC")
         
+        # Save to database
        
         
         update_result = users_collection.update_one(
@@ -1856,13 +2170,16 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
             upsert=True
         )
         
+        # Properly log the update result
         logger.info(f"Database update - matched: {update_result.matched_count}, "
                    f"modified: {update_result.modified_count}, "
                    f"upserted_id: {update_result.upserted_id}")
         
+        # Get decrypted info for display
         decrypted_user = await decrypt_user_wallet(user_id, user_data)
         eth_bsc_address = user_data['eth']['address'] if user_data.get('eth') else "Not set"
         
+        # Prepare success message
         success_msg = (
             f"✨ *New Wallet Generated!* ✨\n\n"
             f"🔐 *Recovery Phrase*:\n`{decrypted_user['mnemonic']}`\n\n"
@@ -1875,6 +2192,7 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
             f"🚀 You're all set! The bot will now start sending you token alerts."
         )
         
+        # Send success message
         if new_user:
             await processing_msg.edit_text(success_msg, parse_mode='Markdown')
             msg_to_delete = processing_msg
@@ -1882,14 +2200,16 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text(success_msg, parse_mode='Markdown')
             msg_to_delete = query.message
         
+        # Schedule message deletion
         context.job_queue.run_once(
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=msg_to_delete.message_id),
-            120,  
+            120,  # 2 minutes
             user_id=user_id
         )
         
         log_user_action(user_id, "WALLET_GENERATION_SUCCESS")
         
+        # Start token updates
         await start_token_updates(context, user_id)
         return ConversationHandler.END
         
@@ -1904,6 +2224,7 @@ async def confirm_generate_wallet(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
 async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle wallet import command (standalone)"""
     user_id = update.effective_user.id
     log_user_action(user_id, "WALLET_IMPORT_INITIATED")
     
@@ -1912,6 +2233,7 @@ async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
         return ConversationHandler.END
     
+    # Set flag to identify standalone import flow
     context.user_data['is_start_flow'] = False
     
     keyboard = [
@@ -1929,7 +2251,7 @@ async def set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
-    return SET_WALLET_METHOD
+    return SET_WALLET_METHOD  # Existing state for standalone import
 
 async def set_wallet_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -1978,6 +2300,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info(f"📝 [input_mnemonic] Received mnemonic from user {user_id}")
     
     try:
+        # Delete the sensitive message immediately
         await context.bot.delete_message(chat_id=user_id, message_id=update.message.message_id)
     except Exception as e:
         logger.warning(f"Could not delete mnemonic message: {str(e)}")
@@ -1995,6 +2318,7 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         user = users_collection.find_one({'user_id': user_id})
         if user and user.get('solana') and user['solana'].get('public_key'):
+            # Existing wallet - confirm overwrite
             keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data='confirm_set_wallet')],
                         [InlineKeyboardButton("❌ Cancel", callback_data='cancel_set_wallet')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2005,11 +2329,14 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return CONFIRM_SET_WALLET
         else:
+            # Create and save wallet
             logger.info("Creating new wallet from mnemonic")
             user_data = await set_user_wallet(user_id, mnemonic=mnemonic)
             
+            # DEBUG: Log before database operation
             logger.debug(f"Wallet data to save: {user_data.keys()}")
             
+            # Use replace_one with upsert to ensure document is properly created
          
 
            
@@ -2018,27 +2345,35 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             {'$set': user_data},
             upsert=True
         )
+              # Log the update result properly
             logger.info(f"Database update - matched: {update_result.matched_count}, "
                    f"modified: {update_result.modified_count}, "
                    f"upserted_id: {update_result.upserted_id}")
+            # Verify the wallet was saved
             db_user = users_collection.find_one({'user_id': user_id})
         if not db_user or not db_user.get('solana') or not db_user['solana'].get('public_key'):
             raise RuntimeError("Wallet not saved to database")
             
+            # DEBUG: Log successful save
             logger.info(f"Wallet successfully saved for user {user_id}")
             logger.debug(f"SOL public key: {db_user['solana']['public_key']}")
             
+            # Get decrypted info for display
+           
             eth_bsc_address = db_user['eth']['address'] if db_user.get('eth') else "Not set"
             
-            success_msg = (
+            success_msg = await update.message.reply_text(
                 f"✅ *Wallet Imported Successfully!*\n\n"
-                f"🔑 *Solana Address*: `{db_user['solana']['public_key']}`\n"
-                f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
-                f"🚀 You're all set! The bot will now start sending you token alerts."
+                f"🔑 Solana Address: `{db_user['solana']['public_key']}`\n"
+                f"🌐 ETH/BSC Address: `{eth_bsc_address}`\n\n"
+                f"🚀 You're all set! The bot will now start sending you token alerts.",
+                parse_mode='Markdown'
             )
             
         if context.user_data.get('is_start_flow', False):
-            return await start_input_mnemonic(update, context)
+        # This should never happen but just in case
+         return await start_input_mnemonic(update, context)
+            # Start token updates
         await start_token_updates(context, user_id)
         return ConversationHandler.END
             
@@ -2052,10 +2387,12 @@ async def input_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return INPUT_MNEMONIC
     
 async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle private key input for wallet import"""
     user_id = update.effective_user.id
     private_key = update.message.text.strip()
     log_user_action(user_id, "PRIVATE_KEY_RECEIVED")
     
+    # Delete the sensitive message immediately
     try:
         await context.bot.delete_message(
             chat_id=user_id,
@@ -2063,31 +2400,39 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
     except Exception as e:
         logger.warning(f"Could not delete private key message: {str(e)}")
+        log_user_action(user_id, "MESSAGE_DELETION_FAILED", "Private key message")
 
     try:
+        # Validate the private key format
         key_type = None
         if private_key.startswith('0x'):
-            account = account.from_key(private_key)
-            eth_address = account.address
-            eth_private_key = private_key
-            new_seed = os.urandom(32)
-            solana_keypair = Keypair.from_seed(new_seed)
-            solana_private_key = base58.b58encode(solana_keypair.to_bytes()).decode()
-            logger.warning("ETH private key provided - generated new Solana wallet")
-        else:
-            key_bytes = base58.b58decode(private_key)
-            if len(key_bytes) == 64:
-                solana_keypair = Keypair.from_bytes(key_bytes)
-                solana_private_key = private_key
-            elif len(key_bytes) == 32:
-                solana_keypair = Keypair.from_seed(key_bytes)
-                solana_private_key = base58.b58encode(bytes(solana_keypair)).decode()
+            # Ethereum/BSC private key (hex format)
+            key_bytes = bytes.fromhex(private_key[2:])
+            if len(key_bytes) == 32:
+                key_type = 'ethereum'
             else:
-                raise ValueError("Invalid Solana private key length")
-            account = account.create()
-            eth_address = account.address
-            eth_private_key = account.key.hex()
-            logger.warning("Solana private key provided - generated new ETH/BSC wallet")
+                raise ValueError("Invalid Ethereum private key length")
+        else:
+            try:
+                # Try to decode as Solana private key (base58)
+                key_bytes = base58.b58decode(private_key)
+                if len(key_bytes) == 64:
+                    key_type = 'solana'  # Full 64-byte keypair
+                elif len(key_bytes) == 32:
+                    key_type = 'solana_seed'  # 32-byte seed
+                else:
+                    raise ValueError("Invalid Solana key length (must be 32 or 64 bytes)")
+            except:
+                # Try to decode as ETH/BSC private key without 0x prefix
+                try:
+                    key_bytes = bytes.fromhex(private_key)
+                    if len(key_bytes) == 32:
+                        key_type = 'ethereum'
+                        private_key = '0x' + private_key  # Add 0x prefix
+                    else:
+                        raise ValueError("Invalid Ethereum key length")
+                except:
+                    raise ValueError("Could not decode as Solana (base58) or ETH/BSC (hex)")
                 
         log_user_action(user_id, "VALID_PRIVATE_KEY_RECEIVED", f"Type: {key_type}")
         
@@ -2096,6 +2441,7 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         user = users_collection.find_one({'user_id': user_id})
         if user and user.get('solana') and user['solana'].get('public_key'):
+            # Existing wallet found - confirm overwrite
             log_user_action(user_id, "WALLET_EXISTS_CONFIRM_OVERWRITE")
             keyboard = [
                 [InlineKeyboardButton("✅ Confirm Import", callback_data='confirm_set_wallet')],
@@ -2113,7 +2459,7 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 reply_markup=reply_markup,
                 parse_mode='Markdown'
             )
-            
+            # Delete confirmation message after 2 minutes
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=confirm_msg.message_id),
                 120,
@@ -2121,15 +2467,18 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return CONFIRM_SET_WALLET
         else:
+            # No existing wallet - proceed directly
             log_user_action(user_id, "WALLET_IMPORT_START")
             user_data = await set_user_wallet(user_id, private_key=private_key)
             
+            # Save to database
             update_result = users_collection.update_one(
                 {'user_id': user_id},
                 {'$set': user_data},
                 upsert=True
             )
             
+            # Verify save was successful
             db_user = users_collection.find_one({'user_id': user_id})
             if not db_user or not db_user.get('solana') or not db_user['solana'].get('public_key'):
                 raise RuntimeError("Wallet not saved to database")
@@ -2138,14 +2487,15 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             
             success_msg = await update.message.reply_text(
                 f"✅ *Wallet Imported Successfully!*\n\n"
-                f"🔑 *Solana Address*: `{db_user['solana']['public_key']}`\n"
-                f"🌐 *ETH/BSC Address*: `{eth_bsc_address}`\n\n"
+                f"🔑 Solana Address: `{db_user['solana']['public_key']}`\n"
+                f"🌐 ETH/BSC Address: `{eth_bsc_address}`\n\n"
                 f"🚀 You're all set! The bot will now start sending you token alerts.",
                 parse_mode='Markdown'
             )
             
             log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
 
+            # Start token updates
             await start_token_updates(context, user_id)
             return ConversationHandler.END
             
@@ -2153,6 +2503,7 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.error(f"Error in input_private_key for user {user_id}: {str(e)}")
         log_user_action(user_id, "WALLET_IMPORT_ERROR", f"Error: {str(e)}", "error")
         
+        # Create user-friendly error message
         if "32 bytes" in str(e):
             error_details = (
                 "For ETH/BSC: Must be 32-byte hex key (64 hex characters)\n"
@@ -2175,6 +2526,7 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             f"{error_details}\n\n"
             "Try again or use /cancel to abort."
         )
+        # Delete error message after 1 minute
         context.job_queue.run_once(
             lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=error_msg.message_id),
             60,
@@ -2182,6 +2534,7 @@ async def input_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return INPUT_PRIVATE_KEY
 async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Confirm wallet import"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -2193,12 +2546,14 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if query.data == 'cancel_set_wallet':
         await query.edit_message_text("🛑 Wallet import cancelled. Your existing wallet remains unchanged.")
+        log_user_action(user_id, "WALLET_IMPORT_CANCELLED")
         return ConversationHandler.END
 
     try:
         wallet_input = context.user_data['wallet_input']
         method = context.user_data['wallet_method']
         
+        # Show processing message
         await query.edit_message_text("⏳ Processing your wallet import...")
         
         
@@ -2207,12 +2562,14 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
     mnemonic=wallet_input if method == 'mnemonic' else None,
     private_key=wallet_input if method == 'private_key' else None
 )
+        
         update_result = users_collection.update_one(
             {'user_id': user_id},
             {'$set': user_data},
             upsert=True
         )
         
+        # Properly log the update result
         logger.info(f"Database update - matched: {update_result.matched_count}, "
                    f"modified: {update_result.modified_count}, "
                    f"upserted_id: {update_result.upserted_id}")
@@ -2244,6 +2601,7 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         
         if method == 'mnemonic':
+            # Delete sensitive mnemonic message after 30 seconds
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=user_id, message_id=query.message.message_id),
                 30,
@@ -2252,6 +2610,7 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         log_user_action(user_id, "WALLET_IMPORT_SUCCESS")
         
+        # Start token updates
         await start_token_updates(context, user_id)
         return ConversationHandler.END
         
@@ -2265,6 +2624,7 @@ async def confirm_set_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
 async def reset_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reset the list of seen tokens for a user"""
     user_id = update.effective_user.id
     log_user_action(user_id, "RESET_TOKENS")
     context.user_data[f'conversation_state_{user_id}'] = None
@@ -2293,6 +2653,7 @@ async def reset_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_token_updates(context, user_id)
 
 async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set trading mode (manual/automatic)"""
     user_id = update.effective_user.id
     log_user_action(user_id, "SET_MODE_COMMAND")
     
@@ -2322,11 +2683,16 @@ async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return SET_TRADING_MODE
 
 async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle trading mode selection"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     mode = query.data
     log_user_action(user_id, "TRADING_MODE_SELECTED", mode)
+    
+    if not await check_subscription(user_id):
+        await query.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return ConversationHandler.END
     
     users_collection.update_one(
         {'user_id': user_id},
@@ -2335,6 +2701,7 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     log_user_action(user_id, "TRADING_MODE_UPDATED", mode)
 
     if mode == 'manual':
+        # Remove auto-trade job if it exists
         for job in context.job_queue.jobs():
             if job.name == f"auto_trade_{user_id}":
                 job.schedule_removal()
@@ -2354,6 +2721,7 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return SET_AUTO_BUY_AMOUNT
 
 async def set_auto_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set auto-buy amount for automatic trading"""
     user_id = update.effective_user.id
     try:
         amount = float(update.message.text)
@@ -2377,8 +2745,10 @@ async def set_auto_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE
         return SET_AUTO_BUY_AMOUNT
 
 async def set_sell_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set profit-taking strategy with user customization options"""
     user_id = update.effective_user.id
     
+    # Present profit strategy options
     keyboard = [
         [InlineKeyboardButton("✅ Use Recommended Multi-Tier", callback_data='default_strategy')],
         [InlineKeyboardButton("⚙️ Customize Strategy", callback_data='custom_strategy')]
@@ -2401,11 +2771,13 @@ async def set_sell_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     
 async def set_profit_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle profit strategy selection"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     
     if query.data == 'default_strategy':
+        # Set default multi-tier strategy
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
@@ -2428,7 +2800,7 @@ async def set_profit_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return SET_LOSS_PERCENTAGE
         
-    else:  
+    else:  # custom_strategy
         await query.edit_message_text(
             "⚙️ *Custom Profit Strategy Setup*\n\n"
             "Enter your profit targets in the format:\n"
@@ -2443,10 +2815,12 @@ async def set_profit_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE
         return SET_CUSTOM_PROFIT_TARGETS
     
 async def set_custom_profit_targets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle custom profit target input"""
     user_id = update.effective_user.id
     targets_text = update.message.text.strip()
     
     try:
+        # Parse custom profit targets
         targets = []
         total_allocation = 0
         
@@ -2455,8 +2829,8 @@ async def set_custom_profit_targets(update: Update, context: ContextTypes.DEFAUL
                 raise ValueError("Invalid format. Use 'profit:allocation' format.")
             
             profit, allocation = line.split(':', 1)
-            profit_pct = float(profit.strip()) / 100  
-            allocation_pct = float(allocation.strip()) / 100  
+            profit_pct = float(profit.strip()) / 100  # Convert to decimal
+            allocation_pct = float(allocation.strip()) / 100  # Convert to decimal
             
             if profit_pct <= 0 or allocation_pct <= 0:
                 raise ValueError("Values must be positive.")
@@ -2467,11 +2841,13 @@ async def set_custom_profit_targets(update: Update, context: ContextTypes.DEFAUL
             })
             total_allocation += allocation_pct
         
-        if abs(total_allocation - 1.0) > 0.01:  
+        # Validate allocations sum to 100%
+        if abs(total_allocation - 1.0) > 0.01:  # Allow for small rounding errors
             raise ValueError(f"Allocations must sum to 100% (current sum: {total_allocation*100:.1f}%)")
         
+        # Check for risky strategy
         risk_warning = ""
-        high_risk_targets = [t for t in targets if t['percentage'] > 2.0]  
+        high_risk_targets = [t for t in targets if t['percentage'] > 2.0]  # 200%+ profit targets
         if high_risk_targets:
             risk_warning = "⚠️ Warning: Profit targets over 200% are very ambitious and rarely hit.\n"
         
@@ -2501,12 +2877,48 @@ async def set_custom_profit_targets(update: Update, context: ContextTypes.DEFAUL
         return SET_CUSTOM_PROFIT_TARGETS
     
 
+async def is_virtual_liquidity_token(token: Dict[str, Any], user_settings: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Heuristically determines if a token is using virtual/bonding curve liquidity
+    (e.g., from Pump.fun, Raydium Launchpad) which is high risk.
+    """
+    reasons = []
+    contract_address = token['contract_address']
+
+    # 1. The Primary Signal: Near-Zero Reported Liquidity
+    if token['liquidity'] < 100:  # Often shows as $0.00 or a very small amount
+        reasons.append(f"Low reported liquidity (${token['liquidity']:.2f})")
+
+    # 2. High Volume + No Liquidity Paradox (Classic Pump.fun signature)
+    if token['liquidity'] < MIN_SAFE_LIQUIDITY and token['volume'] > 5000:
+        reasons.append(f"Suspicious activity: High volume (${token['volume']}) with no liquidity")
+
+    # 3. Check if the token has a supply on Birdeye (most virtual tokens don't initially)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            birdeye_url = f"https://public-api.birdeye.so/defi/token_overview?address={contract_address}"
+            response = await client.get(birdeye_url, headers={"X-API-KEY": os.getenv('BIRDEYE_API_KEY', '')})
+            if response.status_code == 200:
+                data = response.json().get('data', {})
+                supply = data.get('supply', 0)
+                # Virtual tokens often have a supply of 0 or 1 on Birdeye initially
+                if supply <= 1:
+                    reasons.append("No measurable token supply (common in bonding curve)")
+    except Exception as e:
+        logger.warning(f"Could not check Birdeye for {contract_address}: {str(e)}")
+
+    if reasons:
+        return True, "VIRTUAL_LIQUIDITY: " + " | ".join(reasons)
+    return False, "Appears to have real liquidity"
+
 async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set stop-loss percentage with validation"""
     user_id = update.effective_user.id
     
     try:
         percentage = float(update.message.text)
         
+        # Validate stop-loss percentage
         if percentage <= 0:
             await update.message.reply_text("❌ Stop-loss must be a positive percentage.")
             return SET_LOSS_PERCENTAGE
@@ -2538,6 +2950,7 @@ async def set_loss_percentage(update: Update, context: ContextTypes.DEFAULT_TYPE
         return SET_LOSS_PERCENTAGE
 
 async def confirm_high_risk_loss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Confirm high-risk stop-loss setting"""
     user_id = update.effective_user.id
     response = update.message.text.strip().lower()
     
@@ -2563,6 +2976,7 @@ async def confirm_high_risk_loss(update: Update, context: ContextTypes.DEFAULT_T
     return SET_ANTI_MEV
 
 async def set_anti_mev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set anti-MEV protection preference"""
     user_id = update.effective_user.id
     response = update.message.text.strip().lower()
     
@@ -2584,8 +2998,10 @@ async def set_anti_mev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return SET_LIQUIDITY_THRESHOLD
 
 async def set_liquidity_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set minimum liquidity threshold"""
     user_id = update.effective_user.id
     try:
+        # Check if this is a confirmation response
         if 'pending_liquidity_threshold' in context.user_data:
             response = update.message.text.strip().lower()
             if response not in ['yes', 'no', 'y', 'n']:
@@ -2613,8 +3029,10 @@ async def set_liquidity_threshold(update: Update, context: ContextTypes.DEFAULT_
                 )
                 return SET_LIQUIDITY_THRESHOLD
 
+        # This is the initial threshold input
         threshold = float(update.message.text)
         
+        # RECOMMEND much higher minimum to avoid virtual liquidity traps
         if threshold < MIN_SAFE_LIQUIDITY:
             context.user_data['pending_liquidity_threshold'] = threshold
             await update.message.reply_text(
@@ -2644,21 +3062,25 @@ async def set_liquidity_threshold(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def review_config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle configuration review buttons"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     
     if query.data == 'activate_auto_trading':
+        # Activate auto trading
         users_collection.update_one(
             {'user_id': user_id},
             {'$set': {'auto_trading_active': True}}
         )
         log_user_action(user_id, "AUTO_TRADING_ACTIVATED")
         
+        # Remove any existing auto-trade job for this user
         for job in context.job_queue.jobs():
             if job.name == f"auto_trade_{user_id}":
                 job.schedule_removal()
         
+        # Schedule auto-trade job
         context.job_queue.run_repeating(
             auto_trade,
             interval=30,
@@ -2672,7 +3094,8 @@ async def review_config_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
         return ConversationHandler.END
         
-    else:  
+    else:  # modify_settings
+        # Go back to the beginning of configuration
         await query.edit_message_text(
             "⚙️ Let's configure your auto-trading settings again.\n\n"
             "Choose trading mode (Solana only):",
@@ -2684,6 +3107,7 @@ async def review_config_callback(update: Update, context: ContextTypes.DEFAULT_T
         return SET_TRADING_MODE
 
 async def set_volume_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set minimum volume threshold"""
     user_id = update.effective_user.id
     try:
         threshold = float(update.message.text)
@@ -2707,6 +3131,7 @@ async def set_volume_threshold(update: Update, context: ContextTypes.DEFAULT_TYP
         return SET_VOLUME_THRESHOLD
 
 async def set_rug_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set rug pull detection preference"""
     user_id = update.effective_user.id
     response = update.message.text.strip().lower()
     
@@ -2728,6 +3153,7 @@ async def set_rug_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return SET_MAX_SLIPPAGE
 
 async def set_max_slippage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set maximum slippage percentage"""
     user_id = update.effective_user.id
     try:
         slippage = float(update.message.text)
@@ -2751,6 +3177,7 @@ async def set_max_slippage(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return SET_MAX_SLIPPAGE
 
 async def set_max_gas_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set maximum gas price"""
     user_id = update.effective_user.id
     try:
         gas_price = float(update.message.text)
@@ -2774,6 +3201,7 @@ async def set_max_gas_price(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return SET_MAX_GAS_PRICE
 
 async def set_token_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set minimum token age and then ask for max positions"""
     user_id = update.effective_user.id
     
     try:
@@ -2788,6 +3216,7 @@ async def set_token_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         log_user_action(user_id, "MIN_TOKEN_AGE_SET", f"{min_age} minutes")
         
+        # Now ask for maximum positions
         await update.message.reply_text(
             "🔢 Set the maximum number of open positions (e.g., 5):\n\n"
             "This limits how many different tokens you'll hold at once."
@@ -2799,6 +3228,7 @@ async def set_token_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return SET_TOKEN_AGE
 
 async def set_max_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Set the maximum number of open positions"""
     user_id = update.effective_user.id
     
     try:
@@ -2813,6 +3243,7 @@ async def set_max_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         log_user_action(user_id, "MAX_POSITIONS_SET", f"{max_positions}")
         
+        # Continue to the configuration review
         user = users_collection.find_one({'user_id': user_id})
         config_summary = generate_config_summary(user)
         
@@ -2834,6 +3265,7 @@ async def set_max_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return SET_MAX_POSITIONS
 
 def generate_config_summary(user):
+    """Generate a comprehensive summary of the auto-trading configuration"""
     risk_score = calculate_risk_score(user)
     
     summary = (
@@ -2850,6 +3282,7 @@ def generate_config_summary(user):
         f"• Anti-MEV: {'Yes' if user.get('anti_mev', False) else 'No'}\n\n"
     )
     
+    # Add profit strategy details
     if user.get('profit_strategy') == 'multi_tier':
         summary += (
             f"📊 *Profit Strategy:* Multi-tier (Recommended)\n"
@@ -2865,6 +3298,7 @@ def generate_config_summary(user):
             summary += f"   - {target['allocation']*100:.0f}% at +{target['percentage']*100:.0f}% profit\n"
         summary += f"   - {user.get('loss_percentage', 10)}% stop loss\n\n"
     
+    # Add risk assessment
     summary += f"⚠️ *Risk Assessment:* {risk_score}/100\n"
     
     if risk_score > 70:
@@ -2879,35 +3313,41 @@ def generate_config_summary(user):
     return summary
 
 def calculate_risk_score(user):
+    """Calculate a risk score based on configuration"""
     risk_score = 0
     
+    # Liquidity risk (lower liquidity = higher risk)
     if user.get('min_liquidity', 1000) < 5000:
         risk_score += 30
     elif user.get('min_liquidity', 1000) < 10000:
         risk_score += 15
     
+    # Volume risk
     if user.get('min_volume', 500) < 2000:
         risk_score += 20
     elif user.get('min_volume', 500) < 5000:
         risk_score += 10
     
+    # Token age risk
     if user.get('min_token_age', 10) < 5:
         risk_score += 15
     elif user.get('min_token_age', 10) < 10:
         risk_score += 5
     
+    # Stop loss risk
     if user.get('loss_percentage', 10) > 20:
         risk_score += 25
     elif user.get('loss_percentage', 10) > 10:
         risk_score += 10
     
-    return min(100, risk_score)
+    return min(100, risk_score)  # Cap at 100
 
 async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
+    """Send daily trading report to users"""
     logger.info("📊 Generating daily reports...")
     active_users = users_collection.find({
         "subscription_status": "active",
-        "subscription_expiry": {"$gt": datetime.datetime.now().isoformat()}
+        "subscription_expiry": {"$gt": datetime.now().isoformat()}
     })
     
     for user in active_users:
@@ -2918,6 +3358,7 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
         if not portfolio and not trade_history:
             continue
             
+        # Calculate portfolio value
         total_value = 0
         portfolio_details = ""
         for contract, token_data in portfolio.items():
@@ -2927,10 +3368,11 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
                 f"{token_data['amount']:.4f} SOL\n"
             )
         
-        today = datetime.datetime.now().date()
+        # Summarize today's trades
+        today = datetime.now().date()
         today_trades = [
             t for t in trade_history 
-            if datetime.datetime.fromisoformat(t['timestamp']).date() == today
+            if datetime.fromisoformat(t['timestamp']).date() == today
         ]
         
         trade_summary = ""
@@ -2967,6 +3409,7 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
         
 
 async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Initiate manual trading"""
     user_id = update.effective_user.id
     log_user_action(user_id, "TRADE_COMMAND")
     
@@ -2989,6 +3432,7 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return INPUT_CONTRACT
 
 async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle token contract address input"""
     user_id = update.effective_user.id
     contract_address = update.message.text.strip()
     log_user_action(user_id, "CONTRACT_ADDRESS_INPUT", contract_address)
@@ -3054,6 +3498,372 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     return SELECT_TOKEN_ACTION
 
+
+async def fetch_token_by_contract(contract_address: str, include_history: bool = False) -> Optional[Dict[str, Any]]:
+    """Fetch token details by contract address with historical data option"""
+    # Check cache first
+    if contract_address in token_cache:
+        cached_data, timestamp = token_cache[contract_address]
+        if time.time() - timestamp < CACHE_DURATION:
+            return cached_data
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+    }
+    
+    # Try DexScreener first
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            logger.info(f"Fetching token by contract: {contract_address}")
+            token_url = DEXSCREENER_TOKEN_API.format(token_address=contract_address)
+            logger.debug(f"Calling DexScreener API: {token_url}")
+            response = await client.get(token_url, headers=headers)
+            
+            if response.status_code == 429:
+                logger.warning("DexScreener rate limit exceeded, trying fallback...")
+                return await fetch_token_fallback(contract_address, client)
+            
+            if response.status_code != 200:
+                logger.error(f"Token API failed: {response.status_code} - {response.text}")
+                return await fetch_token_fallback(contract_address, client)
+            
+            data = response.json()
+            logger.debug(f"API response: {json.dumps(data, indent=2)[:500]}...")
+            
+            # Handle different response formats
+            if isinstance(data, list):
+                if len(data) == 0:
+                    logger.error(f"Empty list response for token {contract_address}")
+                    return await fetch_token_fallback(contract_address, client)
+                
+                # Try to find the correct pair in the list
+                pair = None
+                for item in data:
+                    if isinstance(item, dict) and item.get('chainId') == 'solana':
+                        pair = item
+                        break
+                
+                if not pair:
+                    logger.error(f"No Solana pairs found in list response for token {contract_address}")
+                    return await fetch_token_fallback(contract_address, client)
+            elif isinstance(data, dict):
+                # Handle object response
+                if 'pairs' in data and isinstance(data['pairs'], list):
+                    # Find Solana pair in pairs array
+                    pair = next((p for p in data['pairs'] if p.get('chainId') == 'solana'), None)
+                    if not pair:
+                        logger.error(f"No Solana pairs found in object response for token {contract_address}")
+                        return await fetch_token_fallback(contract_address, client)
+                else:
+                    # Assume it's a single pair object
+                    pair = data
+            else:
+                logger.error(f"Unexpected response format: {type(data)}")
+                return await fetch_token_fallback(contract_address, client)
+                
+            base_token = pair.get('baseToken', {})
+            quote_token = pair.get('quoteToken', {})
+            
+            token_info = base_token if base_token.get('address', '').lower() == contract_address.lower() else quote_token
+            
+            token_data = {
+                'name': token_info.get('name', 'Unknown'),
+                'symbol': token_info.get('symbol', 'UNKNOWN'),
+                'contract_address': contract_address,
+                'price_usd': float(pair.get('priceUsd', 0)) or 0,
+                'market_cap': float(pair.get('marketCap', pair.get('fdv', 0))),
+                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)) or 0,
+                'volume': float(pair.get('volume', {}).get('h24', 0)) or 0,
+                'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{contract_address}"),
+                'image': pair.get('info', {}).get('imageUrl', ''),
+                'socials': {link.get('type', link.get('label', 'website').lower()): link['url'] 
+                           for link in pair.get('info', {}).get('socials', [])}
+            }
+            
+            # Ensure all numeric fields have values, not None
+            for field in ['price_usd', 'liquidity', 'volume', 'market_cap']:
+                if token_data[field] is None:
+                    token_data[field] = 0.0
+            
+            # Cache the result
+            token_cache[contract_address] = (token_data, time.time())
+            
+            if include_history:
+                # Immediately fetch historical data for new tokens
+                await fetch_and_store_historical_data(contract_address, token_data)
+            
+            return token_data
+            
+    except Exception as e:
+        logger.error(f"Error fetching token by contract {contract_address}: {str(e)}")
+        return await fetch_token_fallback(contract_address)
+
+
+async def fetch_and_store_historical_data(contract_address: str, token_data: Dict[str, Any]):
+    """Fetch historical price data for a token and store it"""
+    try:
+        # Use Birdeye API for historical data
+        historical_data = await fetch_birdeye_historical(contract_address)
+        
+        if historical_data:
+            # Create initial performance record with historical data
+            performance_record = {
+                'contract_address': contract_address,
+                'name': token_data.get('name', ''),
+                'symbol': token_data.get('symbol', ''),
+                'first_tracked': datetime.now(),
+                'first_posted_at': datetime.now(),
+                'initial_metrics': {
+                    'price': token_data['price_usd'],
+                    'liquidity': token_data['liquidity'],
+                    'volume': token_data['volume'],
+                    'market_cap': token_data.get('market_cap', 0)
+                },
+                'current_metrics': {
+                    'price': token_data['price_usd'],
+                    'liquidity': token_data['liquidity'],
+                    'volume': token_data['volume'],
+                    'market_cap': token_data.get('market_cap', 0)
+                },
+                'performance_history': historical_data,
+                'ath': token_data['price_usd'],
+                'ath_time': datetime.now(),
+                'atl': token_data['price_usd'],
+                'atl_time': datetime.now(),
+                'data_quality': 'historical_initialized'
+            }
+            
+            # Store in database
+            token_performance_collection.update_one(
+                {'contract_address': contract_address},
+                {'$set': performance_record},
+                upsert=True
+            )
+            
+            logger.info(f"Stored historical data for {contract_address} with {len(historical_data)} data points")
+            
+    except Exception as e:
+        logger.error(f"Failed to fetch historical data for {contract_address}: {str(e)}")
+
+async def fetch_birdeye_historical(contract_address: str, hours: int = 24) -> List[Dict]:
+    """Fetch historical price data from Birdeye API"""
+    try:
+        birdeye_api_key = os.getenv('BIRDEYE_API_KEY')
+        if not birdeye_api_key:
+            return []
+        
+        url = f"https://public-api.birdeye.so/defi/history_price?address={contract_address}&type=1H&time_range=24"
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, headers={"X-API-KEY": birdeye_api_key})
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('success') and 'data' in data.get('data', {}):
+                    history_items = []
+                    for item in data['data']['data']:
+                        history_items.append({
+                            'timestamp': datetime.fromtimestamp(item['unixTime']),
+                            'price': float(item['value']),
+                            'liquidity': 0,
+                            'volume': 0
+                        })
+                    return history_items
+                    
+    except Exception as e:
+        logger.error(f"Birdeye historical data fetch failed: {str(e)}")
+    
+    return []
+
+async def fetch_dexscreener_historical(contract_address: str):
+    """Fallback to DexScreener for historical data if Birdeye fails"""
+    try:
+        url = f"https://api.dexscreener.com/tokens/v1/solana/{contract_address}/historical?interval=1h&limit=24"
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                history_items = []
+                
+                for item in data.get('candles', []):
+                    history_items.append({
+                        'timestamp': datetime.fromisoformat(item['time'].replace('Z', '+00:00')),
+                        'price': float(item['open']),
+                        'liquidity': 0,
+                        'volume': float(item.get('volume', 0))
+                    })
+                
+                return history_items
+                
+    except Exception as e:
+        logger.error(f"DexScreener historical data fetch failed: {str(e)}")
+    
+    return []
+
+async def fetch_geckoterminal_historical(contract_address: str):
+    """Another fallback for historical data"""
+    try:
+        url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{contract_address}/ohlcv/day"
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                history_items = []
+                
+                for item in data.get('data', {}).get('attributes', {}).get('ohlcv_list', []):
+                    history_items.append({
+                        'timestamp': datetime.fromtimestamp(item[0]),
+                        'price': float(item[1]),
+                        'liquidity': 0,
+                        'volume': float(item[5])
+                    })
+                
+                return history_items
+                
+    except Exception as e:
+        logger.error(f"GeckoTerminal historical data fetch failed: {str(e)}")
+    
+    return []
+
+async def job_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show status of background jobs"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "JOB_STATUS_REQUEST")
+    
+    if not context.job_queue:
+        await update.message.reply_text("❌ Job queue not initialized")
+        return
+        
+    user_jobs = []
+    for job in context.job_queue.jobs():
+        if job.user_id == user_id:
+            next_run = job.next_t.strftime('%Y-%m-%d %H:%M:%S') if job.next_t else "N/A"
+            user_jobs.append(f"- {job.name}: Next run at {next_run}")
+    
+    if not user_jobs:
+        message = "ℹ️ No active jobs for your account"
+    else:
+        message = "📅 Your active jobs:\n" + "\n".join(user_jobs)
+    
+    await update.message.reply_text(message)
+
+async def force_token_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force an immediate token fetch"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "FORCE_TOKEN_FETCH")
+    
+    if not context.job_queue:
+        await update.message.reply_text("❌ Job queue not initialized")
+        return
+        
+    user = users_collection.find_one({'user_id': user_id})
+    if not user or not user.get('solana') or not user['solana'].get('public_key'):
+        await update.message.reply_text(
+            "🚫 You need to set up a wallet first. Use /start to create a wallet or /set_wallet to import one."
+        )
+        return
+        
+    context.job_queue.run_once(
+        update_token_info,
+        when=0,
+        user_id=user_id,
+        name=f"manual_fetch_{user_id}_{int(time.time())}"
+    )
+    
+    await update.message.reply_text("⏳ Token fetch triggered. You should receive tokens shortly.")
+
+async def handle_token_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle buy/sell button clicks on token messages and positions"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data_parts = query.data.split('_', 1)
+    action = data_parts[0]
+    contract_address = data_parts[1] if len(data_parts) > 1 else ''
+    
+    # Map position actions to standard actions
+    if action == 'buypos':
+        action = 'buy'
+    elif action == 'sellpos':
+        action = 'sell'
+    
+    log_user_action(user_id, "TOKEN_BUTTON_CLICKED", f"{action} {contract_address}")
+    
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as e:
+        logger.warning(f"Couldn't remove buttons: {str(e)}")
+    
+    token = await fetch_token_by_contract(contract_address)
+    if not token:
+        await query.message.reply_text("❌ Failed to fetch token details. Please try again.")
+        log_user_action(user_id, "TOKEN_FETCH_FAILED", contract_address, level="warning")
+        return
+    
+    context.user_data['current_token'] = token
+    context.user_data['trade_action'] = action
+    
+    if action == 'buy':
+        await query.message.reply_text(
+            f"💰 *Buy Order for {token['name']} ({token['symbol']})*\n\n"
+            f"Enter amount to buy in SOL:",
+            parse_mode='Markdown'
+        )
+        return BUY_AMOUNT
+    else:  # sell
+        user = users_collection.find_one({'user_id': user_id})
+        portfolio = user.get('portfolio', {})
+        if contract_address not in portfolio:
+            await query.message.reply_text(f"❌ You don't hold any {token['name']} tokens to sell.")
+            return ConversationHandler.END
+            
+        token_data = portfolio[contract_address]
+        buy_price = token_data['buy_price']
+        sol_invested = token_data['amount']
+        
+        available_tokens = sol_invested / buy_price
+        
+        await query.message.reply_text(
+            f"💸 *Sell Order for {token['name']} ({token['symbol']})*\n\n"
+            f"Available: {available_tokens:.2f} tokens\n"
+            f"Current Price: ${token['price_usd']:.6f}\n"
+            f"Enter number of tokens to sell:",
+            parse_mode='Markdown'
+        )
+        return SELL_AMOUNT
+    
+
+async def get_minimal_token_data(contract_address: str) -> Optional[Dict[str, Any]]:
+    """Get minimal token data from on-chain sources"""
+    try:
+        # Get token metadata from on-chain
+        mint_pubkey = Pubkey.from_string(contract_address)
+        account_info = await solana_client.get_account_info(mint_pubkey)
+        
+        if account_info.value:
+            # This is a very basic implementation - in a real scenario,
+            # you would use the SPL Token program to get better data
+            return {
+                'name': 'Unknown Token',
+                'symbol': 'UNKNOWN',
+                'contract_address': contract_address,
+                'price_usd': 0,
+                'market_cap': 0,
+                'liquidity': 0,
+                'volume': 0,
+                'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
+            }
+    except Exception as e:
+        logger.error(f"Failed to get on-chain data for {contract_address}: {str(e)}")
+    
+    return None
+
+
 async def fetch_token_fallback(contract_address: str, client: Optional[httpx.AsyncClient] = None) -> Optional[Dict[str, Any]]:
     """Fallback method to fetch token data when DexScreener fails"""
     try:
@@ -3094,576 +3904,266 @@ async def fetch_token_fallback(contract_address: str, client: Optional[httpx.Asy
         return None
     
 
-async def get_minimal_token_data(contract_address: str) -> Optional[Dict[str, Any]]:
-    """Get minimal token data from on-chain sources"""
-    try:
-        # Get token metadata from on-chain
-        mint_pubkey = Pubkey.from_string(contract_address)
-        account_info = await solana_client.get_account_info(mint_pubkey)
-        
-        if account_info.value:
-            # This is a very basic implementation - in a real scenario,
-            # you would use the SPL Token program to get better data
-            return {
-                'name': 'Unknown Token',
-                'symbol': 'UNKNOWN',
-                'contract_address': contract_address,
-                'price_usd': 0,
-                'market_cap': 0,
-                'liquidity': 0,
-                'volume': 0,
-                'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
-            }
-    except Exception as e:
-        logger.error(f"Failed to get on-chain data for {contract_address}: {str(e)}")
-    
-    return None
-
-
-async def fetch_token_by_contract(contract_address: str, include_history: bool = False) -> Optional[Dict[str, Any]]:
-    try:
-        if contract_address in token_cache:
-            cached_data, timestamp = token_cache[contract_address]
-            if time.time() - timestamp < CACHE_DURATION:
-                return cached_data
-    except KeyError:
-        logger.warning("Cache miss for {contract_address}, fetching new data")
-        # Continue to fetch fresh data
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Accept': 'application/json'
-    }
-    
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            logger.info(f"Fetching token by contract: {contract_address}")
-            token_url = DEXSCREENER_TOKEN_API.format(token_address=contract_address)
-            logger.debug(f"Calling DexScreener API: {token_url}")
-            response = await client.get(token_url, headers=headers)
-            
-            if response.status_code == 429:
-                logger.warning("DexScreener rate limit exceeded, trying fallback...")
-                return await fetch_token_fallback(contract_address, client)
-            
-            if response.status_code != 200:
-                logger.error(f"Token API failed: {response.status_code} - {response.text}")
-                return await fetch_token_fallback(contract_address, client)
-            
-            data = response.json()
-            logger.debug(f"API response: {json.dumps(data, indent=2)[:500]}...")
-            
-            if isinstance(data, list):
-                if len(data) == 0:
-                    logger.error(f"Empty list response for token {contract_address}")
-                    return await fetch_token_fallback(contract_address, client)
-                
-                pair = None
-                for item in data:
-                    if isinstance(item, dict) and item.get('chainId') == 'solana':
-                        pair = item
-                        break
-                
-                if not pair:
-                    logger.error(f"No Solana pairs found in list response for token {contract_address}")
-                    return await fetch_token_fallback(contract_address, client)
-            elif isinstance(data, dict):
-                if 'pairs' in data and isinstance(data['pairs'], list):
-                    pair = next((p for p in data['pairs'] if p.get('chainId') == 'solana'), None)
-                    if not pair:
-                        logger.error(f"No Solana pairs found in object response for token {contract_address}")
-                        return await fetch_token_fallback(contract_address, client)
-                else:
-                    pair = data
-            else:
-                logger.error(f"Unexpected response format: {type(data)}")
-                return await fetch_token_fallback(contract_address, client)
-                
-            base_token = pair.get('baseToken', {})
-            quote_token = pair.get('quoteToken', {})
-            
-            token_info = base_token if base_token.get('address', '').lower() == contract_address.lower() else quote_token
-            
-            token_data = {
-                'name': token_info.get('name', 'Unknown'),
-                'symbol': token_info.get('symbol', 'UNKNOWN'),
-                'contract_address': contract_address,
-                'price_usd': float(pair.get('priceUsd', 0)) or 0,
-                'market_cap': float(pair.get('marketCap', pair.get('fdv', 0))),
-                'liquidity': float(pair.get('liquidity', {}).get('usd', 0)) or 0,
-                'volume': float(pair.get('volume', {}).get('h24', 0)) or 0,
-                'dexscreener_url': pair.get('url', f"https://dexscreener.com/solana/{contract_address}"),
-                'image': pair.get('info', {}).get('imageUrl', ''),
-                'socials': {link.get('type', link.get('label', 'website').lower()): link['url'] 
-                           for link in pair.get('info', {}).get('socials', [])}
-            }
-            
-            for field in ['price_usd', 'liquidity', 'volume', 'market_cap']:
-                if token_data[field] is None:
-                    token_data[field] = 0.0
-            
-            token_cache[contract_address] = (token_data, time.time())
-            
-            if include_history:
-                await fetch_and_store_historical_data(contract_address, token_data)
-            
-            return token_data
-            
-    except Exception as e:
-        logger.error(f"Error fetching token by contract {contract_address}: {str(e)}")
-        return await fetch_token_fallback(contract_address)
-
-
-async def fetch_and_store_historical_data(contract_address: str, token_data: Dict[str, Any]):
-    historical_data = await fetch_historical_data_multi_source(contract_address)
-        
-    if historical_data:
-        performance_record = {
+def parse_geckoterminal_response(data, contract_address):
+    """Parse GeckoTerminal API response to match token_data structure"""
+    if 'data' in data and 'attributes' in data['data']:
+        attributes = data['data']['attributes']
+        return {
+            'name': attributes.get('name', 'Unknown'),
+            'symbol': attributes.get('symbol', 'UNKNOWN'),
             'contract_address': contract_address,
-            'name': token_data.get('name', ''),
-            'symbol': token_data.get('symbol', ''),
-            'first_tracked': datetime.datetime.now(),
-            'first_posted_at': datetime.datetime.now(),
-            'initial_metrics': {
-                'price': token_data['price_usd'],
-                'liquidity': token_data['liquidity'],
-                'volume': token_data['volume'],
-                'market_cap': token_data.get('market_cap', 0)
-            },
-            'current_metrics': {
-                'price': token_data['price_usd'],
-                'liquidity': token_data['liquidity'],
-                'volume': token_data['volume'],
-                'market_cap': token_data.get('market_cap', 0)
-            },
-            'performance_history': historical_data,
-            'ath': token_data['price_usd'],
-            'ath_time': datetime.datetime.now(),
-            'atl': token_data['price_usd'],
-            'atl_time': datetime.datetime.now()
+            'price_usd': float(attributes.get('price_usd', 0)),
+            'market_cap': float(attributes.get('fdv_usd', 0)),
+            'liquidity': float(attributes.get('liquidity_usd', 0)),
+            'volume': float(attributes.get('volume_usd', {}).get('h24', 0)),
+            'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
+            'image': attributes.get('image_thumb_url', ''),
+            'socials': {}  # Add if available in response
         }
-            
-        token_performance_collection.update_one(
-            {'contract_address': contract_address},
-            {'$set': performance_record},
-            upsert=True
-        )
-            
-        logger.info(f"Stored historical data for {contract_address} with {len(historical_data)} data points")
-            
+    else:
+        return None
     
+def parse_birdeye_response(data, contract_address):
+    """Parse Birdeye API response to match token_data structure"""
+    if 'data' in data and 'success' in data and data['success']:
+        token_data = data['data']
+        return {
+            'name': token_data.get('name', 'Unknown'),
+            'symbol': token_data.get('symbol', 'UNKNOWN'),
+            'contract_address': contract_address,
+            'price_usd': float(token_data.get('price', 0)),
+            'market_cap': float(token_data.get('mc', 0)),
+            'liquidity': float(token_data.get('liquidity', 0)),
+            'volume': float(token_data.get('v24hUSD', 0)),
+            'dexscreener_url': f"https://dexscreener.com/solana/{contract_address}",
+            'image': token_data.get('image', ''),
+            'socials': {}  # Birdeye doesn't provide socials in this endpoint
+        }
+    else:
+        return None
 
-async def fetch_birdeye_historical(contract_address: str, hours: int = 24) -> List[Dict]:
+async def buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle buy amount input with balance check and trade execution"""
+    user_id = update.effective_user.id
     try:
-        birdeye_api_key = os.getenv('BIRDEYE_API_KEY')
-        if not birdeye_api_key:
-            return []
+        amount = float(update.message.text)
+        if amount <= 0:
+            await update.message.reply_text("❌ Please enter a positive amount.")
+            return BUY_AMOUNT
         
-        url = f"https://public-api.birdeye.so/defi/history_price?address={contract_address}&type=1H&time_range=24"
+        # Get token from context
+        token = context.user_data.get('current_token')
+        if not token:
+            await update.message.reply_text("❌ Token information missing. Please start the trade again.")
+            return ConversationHandler.END
         
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url, headers={"X-API-KEY": birdeye_api_key})
+        # Check SOL balance
+        balance = await check_balance(user_id, 'solana')
+        if balance < amount:
+            await update.message.reply_text(
+                f"❌ Insufficient SOL balance. Your balance: {balance:.4f} SOL\n"
+                f"You need at least {amount:.4f} SOL to execute this trade."
+            )
+            log_user_action(user_id, "INSUFFICIENT_BALANCE", f"Needed: {amount}, Had: {balance}", level="warning")
+            return ConversationHandler.END
+        
+        # Execute trade immediately
+        await update.message.reply_text(f"⏳ Executing buy order for {amount:.4f} SOL worth of {token['name']}...")
+        success = await execute_trade(user_id, token['contract_address'], amount, 'buy', 'solana', token)
+        
+        if success:
+            # Update portfolio
+            user = users_collection.find_one({'user_id': user_id})
+            portfolio = user.get('portfolio', {})
+            current_holdings = portfolio.get(token['contract_address'], {
+                'name': token['name'],
+                'symbol': token['symbol'],
+                'amount': 0.0,
+                'buy_price': token['price_usd']
+            })
             
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('success') and 'data' in data.get('data', {}):
-                    history_items = []
-                    for item in data['data']['data']:
-                        history_items.append({
-                            'timestamp': datetime.datetime.fromtimestamp(item['unixTime']),
-                            'price': float(item['value']),
-                            'liquidity': 0,
-                            'volume': 0
-                        })
-                    return history_items
-                    
-    except Exception as e:
-        logger.error(f"Birdeye historical data fetch failed: {str(e)}")
-    
-    return []
-
-async def fetch_dexscreener_historical(contract_address: str):
-    try:
-        url = f"https://api.dexscreener.com/tokens/v1/solana/{contract_address}/historical?interval=1h&limit=24"
-        
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url)
-            
-            if response.status_code == 200:
-                data = response.json()
-                history_items = []
-                
-                for item in data.get('candles', []):
-                    history_items.append({
-                        'timestamp': datetime.datetime.fromisoformat(item['time'].replace('Z', '+00:00')),
-                        'price': float(item['open']),
-                        'liquidity': 0,
-                        'volume': float(item.get('volume', 0))
-                    })
-                
-                return history_items
-                
-    except Exception as e:
-        logger.error(f"DexScreener historical data fetch failed: {str(e)}")
-    
-    return []
-
-async def fetch_geckoterminal_historical(contract_address: str):
-    try:
-        url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{contract_address}/ohlcv/day"
-        
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url)
-            
-            if response.status_code == 200:
-                data = response.json()
-                history_items = []
-                
-                for item in data.get('data', {}).get('attributes', {}).get('ohlcv_list', []):
-                    history_items.append({
-                        'timestamp': datetime.datetime.fromtimestamp(item[0]),
-                        'price': float(item[1]),
-                        'liquidity': 0,
-                        'volume': float(item[5])
-                    })
-                
-                return history_items
-                
-    except Exception as e:
-        logger.error(f"GeckoTerminal historical data fetch failed: {str(e)}")
-    
-    return []
-
-async def fetch_historical_data_multi_source(contract_address: str):
-    sources = [
-        fetch_birdeye_historical,
-        fetch_dexscreener_historical,
-        fetch_geckoterminal_historical
-    ]
-    
-    for source in sources:
-        try:
-            data = await source(contract_address)
-            if data:
-                return data
-        except Exception as e:
-            logger.warning(f"Historical data source {source.__name__} failed: {str(e)}")
-            continue
-    
-    return []
-
-def assess_data_quality(historical_data: List[Dict]) -> Dict[str, Any]:
-    if not historical_data:
-        return {'quality': 'poor', 'data_points': 0}
-    
-    time_range = (historical_data[-1]['timestamp'] - historical_data[0]['timestamp']).total_seconds() / 3600
-    data_density = len(historical_data) / max(1, time_range)
-    
-    prices = [item['price'] for item in historical_data]
-    price_volatility = (max(prices) - min(prices)) / np.mean(prices) if prices else 0
-    
-    quality_score = min(100, data_density * 10 + (1 - min(price_volatility, 1)) * 50)
-    
-    return {
-        'quality': 'excellent' if quality_score > 80 else 'good' if quality_score > 60 else 'fair' if quality_score > 40 else 'poor',
-        'score': quality_score,
-        'data_points': len(historical_data),
-        'time_range_hours': time_range
-    }
-
-async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, token: Dict[str, Any] = None):
-    logger.info(f"🤖 Auto-trading for user {user_id}")
-    
-    try:
-        if user_id is None and context.job is not None:
-            user_id = context.job.user_id
-        
-        if user_id is None:
-            logger.error("No user_id provided for auto_trade")
-            return
-            
-        user = users_collection.find_one({'user_id': user_id})
-        if not user or not await check_subscription(user_id):
-            logger.info(f"User {user_id} not subscribed or not found")
-            return
-            
-        logger.info(f"User {user_id} settings: {user.get('trading_mode')}, {user.get('auto_buy_amount')}")
-        
-        last_trade_time = user.get('last_trade_time', 0)
-        if time.time() - last_trade_time < AUTO_TRADE_COOLDOWN:
-            logger.debug(f"Auto-trade cooldown active for user {user_id}")
-            return
-        
-        if token and token.get('contract_address') in user.get('auto_trade_blacklist', []):
-            logger.info(f"Token {token.get('name', 'Unknown')} is blacklisted")
-            return
-        
-        user_max_positions = user.get('max_positions', MAX_POSITIONS)
-        portfolio = user.get('portfolio', {})
-        liquid_positions = 0
-    
-        for contract, position in portfolio.items():
-            token_data = await fetch_token_by_contract(contract)
-            if token_data and token_data.get('liquidity', 0) >= MIN_SAFE_LIQUIDITY:
-                liquid_positions += 1
-    
-        if liquid_positions >= user_max_positions:
-            logger.debug(f"Max liquid positions ({user_max_positions}) reached for user {user_id}")
-            return
-            
-        if await check_daily_loss_limit(user_id, user):
-            logger.debug(f"Daily loss limit reached for user {user_id}")
-            return
-        
-        trading_mode = user.get('trading_mode', 'manual')
-        buy_amount = user.get('auto_buy_amount', 0.01)
-        
-        if token is not None:
-            if (token.get('contract_address') in portfolio or 
-                token.get('contract_address') in user.get('auto_trade_blacklist', [])):
-                return
-                
-            if token.get('price_usd') is None:
-                logger.warning(f"Skipping {token.get('name', 'Unknown')} - price is None")
-                return
-                
-            required_fields = ['liquidity', 'volume', 'contract_address']
-            for field in required_fields:
-                if token.get(field) is None:
-                    logger.warning(f"Skipping {token.get('name', 'Unknown')} - {field} is None")
-                    return
-                
-            fresh_token = await fetch_token_by_contract(token['contract_address'], include_history=True)
-            if not fresh_token:
-                return
-                
-            token_performance = token_performance_collection.find_one(
-                {'contract_address': fresh_token['contract_address']}
+            # Add new purchase to portfolio
+            new_amount = current_holdings['amount'] + amount
+            new_avg_price = (
+                (current_holdings['amount'] * current_holdings['buy_price'] + 
+                 amount * token['price_usd'])
+                / new_amount if new_amount > 0 else token['price_usd']
             )
             
-            if not token_performance or 'performance_history' not in token_performance:
-                logger.info(f"Insufficient data for {fresh_token['name']} - skipping auto-trade")
-                return
-                
-            price_history = [entry['price'] for entry in token_performance['performance_history']]
-            indicators = calculate_technical_indicators(price_history)
+            update_result = users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    f'portfolio.{token["contract_address"]}': {
+                        'name': token['name'],
+                        'symbol': token['symbol'],
+                        'amount': new_amount,
+                        'buy_price': new_avg_price
+                    }
+                }},
+                upsert=True
+            )
             
-            if not indicators:
-                logger.info(f"Not enough historical data for {fresh_token['name']} - skipping")
-                return
-                
-            entry_decision = await evaluate_token_entry(fresh_token, indicators, user)
-            
-            if entry_decision['should_buy']:
-                await execute_auto_buy(context, user_id, fresh_token, buy_amount, entry_decision['reason'])
-            else:
-                logger.info(f"Auto-trade rejected: {entry_decision['reason']}")
-                
+            log_user_action(user_id, "TRADE_EXECUTED", f"Bought {amount} SOL worth of {token['name']}")
+            await update.message.reply_text(
+                f"✅ Successfully bought {amount:.4f} SOL worth of {token['name']} at ${token['price_usd']:.6f}.\n"
+                f"📊 You now hold {new_amount:.4f} SOL worth of {token['symbol']}."
+            )
         else:
-            sol_balance = await check_balance(user_id, 'solana')
-            if sol_balance < buy_amount or len(portfolio) >= MAX_POSITIONS:
-                logger.debug(f"Insufficient SOL or max positions for auto-buy")
-                return
-                
-            tokens = await fetch_latest_token()
-            if not tokens:
-                return
-                
-            valid_tokens = []
-            for t in tokens:
-                if t.get('contract_address') in portfolio or t.get('contract_address') in user.get('auto_trade_blacklist', []):
-                    continue
-                    
-                is_safe, reason = await check_token_safety(t, user)
-                if is_safe:
-                    valid_tokens.append(t)
-            
-            if not valid_tokens:
-                return
-                
-            best_token = None
-            best_score = -99999
-            
-            for t in valid_tokens:
-                score = (t.get('liquidity', 0) / 10000) + (t.get('volume', 0) / 5000)
-                if 'price_change_5m' in t:
-                    score += t['price_change_5m'] * 100
-                    
-                if score > best_score:
-                    best_score = score
-                    best_token = t
-            
-            if best_token:
-                await execute_auto_buy(context, user_id, best_token, buy_amount)
-
-    except Exception as e:
-        logger.error(f"Auto-trade error for user {user_id}: {str(e)}")
-        await notify_user(
-            context, user_id,
-            f"❌ AUTOTRADE ERROR: {str(e)}",
-            "Auto-Trade System Failure"
-        )
-
-async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, trade_details: List[Dict], username: str) -> io.BytesIO:
-    plt.figure(figsize=(10, 8))
-    
-    try:
-        bg_image = plt.imread('askjahback.png')
-        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
-    except:
-        plt.style.use('dark_background')
-    
-    plt.axis('off')
-    
-    multiple = (overall_pnl_percent / 100) + 1
-    
-    current_date = datetime.datetime.now().strftime('%Y-%m-%d')
-    
-    text_elements = [
-        ("TRADING PERFORMANCE SUMMARY", 20, "#FFFFFF", "bold"),
-        (f"Total Return: {overall_pnl_percent:+.1f}%", 18, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold"),
-        (f"Multiple: {multiple:.2f}x", 16, "#FFFFFF", "normal"),
-        ("", 12, "#FFFFFF", "normal"),  
-        ("TOP PERFORMING TRADES:", 16, "#FFFFFF", "bold")
-    ]
-    
-    top_trades = sorted(trade_details, key=lambda x: x['pnl_percent'], reverse=True)[:3]
-    for i, trade in enumerate(top_trades):
-        trade_color = "#00FF00" if trade['pnl_percent'] >= 0 else "#FF0000"
-        text_elements.append(
-            (f"{i+1}. {trade['symbol']}: {trade['pnl_percent']:+.2f}%", 
-             14, trade_color, "normal")
-        )
-    
-    text_elements.extend([
-        ("", 12, "#FFFFFF", "normal"),  
-        (f"Generated for @{username}", 12, "#CCCCCC", "italic"),
-        (f"Date: {current_date}", 12, "#CCCCCC", "italic")
-    ])
-    
-    y_position = 0.9
-    for text, size, color, weight in text_elements:
-        plt.text(0.5, y_position, text, 
-                ha='center', va='center', 
-                fontsize=size, color=color, 
-                weight=weight,
-                transform=plt.gca().transAxes)
-        y_position -= 0.07
-    
-    plt.tight_layout()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
-    buf.seek(0)
-    plt.close()
-    
-    return buf
+            log_user_action(user_id, "TRADE_FAILED", f"Buy {amount} SOL of {token['name']}", level="error")
+            await update.message.reply_text("❌ Trade failed. Please try again later.")
+        
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+        return BUY_AMOUNT
 
 
 
-async def generate_pnl_image(trade_details: List[Dict], total_pnl: float, overall_pnl_percent: float) -> io.BytesIO:
-    plt.figure(figsize=(10, 8))
-    try:
-        bg_image = plt.imread('askjahback.png')
-        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
-    except:
-        plt.style.use('dark_background')
-    
-    plt.axis('off')
-    
-    multiple = (overall_pnl_percent / 100) + 1
-    text_content = [
-        ("ASKJAH TRADING PERFORMANCE", 24, "#FFFFFF", "bold", "normal"),
-        (f"\nTOTAL RETURN: {overall_pnl_percent:+.1f}%", 28, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold", "normal"),
-        (f"\n{multiple:.1f}X YOUR CAPITAL", 22, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold", "normal"),
-        (f"\n\nTOTAL P&L: ${total_pnl:+.2f}", 20, "#FFFFFF", "normal", "normal"),
-        ("\n\nTOP PERFORMERS:", 18, "#FFFFFF", "bold", "normal")
-    ]
-    
-    top_trades = sorted(trade_details, key=lambda x: x['pnl_percent'], reverse=True)[:3]
-    for i, trade in enumerate(top_trades):
-        trade_multiple = (trade['pnl_percent'] / 100) + 1
-        text_content.append(
-            (f"\n{i+1}. {trade['symbol']}: {trade['pnl_percent']:+.1f}% ({trade_multiple:.1f}X)", 
-             16, "#00FF00" if trade['pnl_percent'] >= 0 else "#FF0000", "normal", "normal")
-        )
-    
-    text_content.append(("\n\nTRADING MADE EASIER", 16, "#FFFFFF", "normal", "italic"))
-    text_content.append(("\n@ASKJAH_BOT", 14, "#CCCCCC", "normal", "normal"))
-    
-    y_position = 0.95
-    for text, size, color, weight, style in text_content:
-        plt.text(0.5, y_position, text, 
-                ha='center', va='top', 
-                fontsize=size, color=color, 
-                weight=weight,
-                fontstyle=style,
-                transform=plt.gca().transAxes)
-        y_position -= (size * 0.015)  
-    
-    plt.tight_layout()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
-    buf.seek(0)
-    plt.close()
-    
-    return buf
-
-async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, win_rate: float) -> io.BytesIO:
-    plt.figure(figsize=(8, 6))
-    try:
-        bg_image = plt.imread('askjahback.png')
-        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
-    except:
-        plt.style.use('dark_background')
-    
-    plt.axis('off')
-    
-    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#F9C80E']
-    
-    plt.subplot(1, 2, 1)
-    sizes = [win_rate, 100 - win_rate]
-    labels = ['Wins', 'Losses']
-    explode = (0.1, 0)
-    plt.pie(sizes, explode=explode, labels=labels, colors=colors[:2],
-            autopct='%1.1f%%', shadow=True, startangle=90)
-    plt.axis('equal')
-    plt.title('Win Rate')
-    
-    plt.subplot(1, 2, 2)
-    plt.axis('off')
-    
-    if overall_pnl_percent >= 10:
-        emoji = "🚀"
-    elif overall_pnl_percent >= 0:
-        emoji = "👍"
-    else:
-        emoji = "📉"
-    
-    summary_text = (
-        f"{emoji} Daily Performance {emoji}\n\n"
-        f"Return: {overall_pnl_percent:+.1f}%\n"
-        f"P&L: ${total_pnl:+.2f}\n\n"
-        "Powered by @ASKJAH_BOT\n"
-        "Join: t.me/ASKJAH_BOT"
-    )
-    
-    plt.text(0.5, 0.5, summary_text, ha='center', va='center', 
-             fontsize=12, bbox=dict(boxstyle="round,pad=1", facecolor="#2C3E50", alpha=0.9))
-    
-    plt.tight_layout()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
-    buf.seek(0)
-    plt.close()
-    
-    return buf
-
-async def daily_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle sell amount input with proper token amount calculation"""
     user_id = update.effective_user.id
-    log_user_action(user_id, "DAILY_PNL_REQUEST")
+    try:
+        # Get the token amount user wants to sell
+        token_amount = float(update.message.text)
+        if token_amount <= 0:
+            await update.message.reply_text("❌ Please enter a positive amount.")
+            return SELL_AMOUNT
+        
+        # Get token from context
+        token = context.user_data.get('current_token')
+        if not token:
+            await update.message.reply_text("❌ Token information missing. Please start the trade again.")
+            return ConversationHandler.END
+        
+        # Check token holdings
+        user = users_collection.find_one({'user_id': user_id})
+        portfolio = user.get('portfolio', {})
+        if token['contract_address'] not in portfolio:
+            await update.message.reply_text(f"❌ You don't hold any {token['name']} tokens to sell.")
+            return ConversationHandler.END
+            
+        token_data = portfolio[token['contract_address']]
+        
+        # Calculate how many tokens the user actually holds
+        buy_price = token_data['buy_price']
+        sol_invested = token_data['amount']
+        token_amount_held = sol_invested / buy_price
+        
+        if token_amount > token_amount_held:
+            await update.message.reply_text(
+                f"❌ Insufficient token balance. Available: {token_amount_held:.2f} tokens\n"
+                f"You requested to sell {token_amount:.2f} tokens."
+            )
+            return SELL_AMOUNT
+        
+        # Execute trade immediately
+        await update.message.reply_text(f"⏳ Executing sell order for {token_amount:.2f} {token['symbol']} tokens...")
+        
+        # For sell orders, we need to pass the token amount
+        success, message = await execute_trade(
+            user_id, 
+            token['contract_address'], 
+            token_amount,  # Pass token amount instead of SOL amount
+            'sell', 
+            'solana',
+            token
+        )
+        
+        if success:
+            # Update portfolio
+            new_token_amount = token_amount_held - token_amount
+            new_sol_value = new_token_amount * buy_price  # Keep original buy price for cost basis
+            
+            if new_token_amount <= 0.001:  # Consider dust amounts as zero
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
+                )
+                log_user_action(user_id, "POSITION_CLOSED", f"Sold all {token['name']}")
+            else:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {f'portfolio.{token["contract_address"]}.amount': new_sol_value}}
+                )
+            
+            # Calculate profit/loss
+            current_price = token['price_usd']
+            price_change = ((current_price - buy_price) / buy_price) * 100
+            profit_loss = "profit" if price_change >= 0 else "loss"
+            
+            log_user_action(user_id, "TRADE_EXECUTED", f"Sold {token_amount} tokens of {token['name']}")
+            await update.message.reply_text(
+                f"✅ {message}\n"
+                f"📈 This trade resulted in a {abs(price_change):.2f}% {profit_loss}.\n"
+                f"📊 You now hold {new_token_amount:.2f} {token['symbol']} tokens."
+            )
+        else:
+            log_user_action(user_id, "TRADE_FAILED", f"Sell {token_amount} tokens of {token['name']}: {message}", level="error")
+            await update.message.reply_text(f"❌ {message}")
+        
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+        return SELL_AMOUNT
+    
+async def confirm_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Confirm and execute trade"""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(text="⏳ Processing your trade...")
+    user_id = query.from_user.id
+    
+    token = context.user_data['current_token']
+    action = context.user_data.get('trade_action', 'buy')
+    amount = context.user_data.get('buy_amount' if action == 'buy' else 'sell_amount')
+    
+    # Pass token details to execute_trade
+    success = await execute_trade(user_id, token['contract_address'], amount, action, 'solana', token)
+    
+    if success:
+        if action == 'buy':
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {f'portfolio.{token["contract_address"]}': {
+                    'name': token['name'],
+                    'symbol': token['symbol'],
+                    'amount': amount,
+                    'buy_price': token['price_usd']
+                }}}
+            )
+            log_user_action(user_id, "TRADE_EXECUTED", f"Bought {amount} SOL worth of {token['name']}")
+            await query.message.reply_text(
+                f"✅ Successfully bought {amount:.4f} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
+            )
+        else:
+            user = users_collection.find_one({'user_id': user_id})
+            token_data = user['portfolio'][token['contract_address']]
+            token_data['amount'] -= amount
+            if token_data['amount'] <= 0:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
+                )
+            else:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {f'portfolio.{token["contract_address"]}.amount': token_data['amount']}}
+                )
+            log_user_action(user_id, "TRADE_EXECUTED", f"Sold {amount} SOL worth of {token['name']}")
+            await query.message.reply_text(
+                f"✅ Successfully sold {amount:.4f} SOL worth of {token['name']} at ${token['price_usd']:.6f}."
+            )
+    else:
+        log_user_action(user_id, "TRADE_FAILED", f"{action} {amount} SOL of {token['name']}", level="error")
+        await query.message.reply_text("❌ Trade failed. Please try again.")
+    
+    return ConversationHandler.END
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show wallet balances with current token values"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "BALANCE_REQUEST")
     
     if not await check_subscription(user_id):
         await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
@@ -3671,351 +4171,255 @@ async def daily_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user = users_collection.find_one({'user_id': user_id})
     if not user:
-        await update.message.reply_text("🚫 No user data found.")
-        return
-        
-    today = datetime.datetime.now().date()
-    today_start = datetime.datetime.combine(today, datetime.min.time())
-    today_end = datetime.datetime.combine(today, datetime.max.time())
-    
-    trade_history = user.get('trade_history', [])
-    today_trades = [
-        trade for trade in trade_history 
-        if today_start <= datetime.datetime.fromisoformat(trade['timestamp']) <= today_end
-    ]
-    
-    if not today_trades:
-        await update.message.reply_text("📊 No trades executed today.")
+        await update.message.reply_text("🚫 No wallet found. Please use /start to create a wallet or /set_wallet to import one.")
         return
     
-    total_pnl = 0
-    winning_trades = 0
-    losing_trades = 0
-    trade_details = []
+    # Get balances for all chains
+    sol_balance = await check_balance(user_id, 'solana')
+    eth_balance = await check_balance(user_id, 'eth') if user.get('eth') else 0.0
+    bsc_balance = await check_balance(user_id, 'bsc') if user.get('bsc') else 0.0
+    portfolio = user.get('portfolio', {})
     
-    for trade in today_trades:
-        if 'buy_price' in trade and 'sell_price' in trade:
-            investment = trade['amount'] * trade['buy_price']
-            returns = trade['amount'] * trade['sell_price']
-            pnl = returns - investment
-            pnl_percent = (pnl / investment) * 100 if investment > 0 else 0
-            
-            total_pnl += pnl
-            
-            if pnl > 0:
-                winning_trades += 1
-            elif pnl < 0:
-                losing_trades += 1
-                
-            trade_details.append({
-                'symbol': trade.get('symbol', 'UNKNOWN'),
-                'pnl': pnl,
-                'pnl_percent': pnl_percent,
-                'status': 'CLOSED'
-            })
-        elif 'buy_price' in trade:
-            current_price = await get_current_price(trade.get('contract', ''))
-            if current_price:
-                investment = trade['amount'] * trade['buy_price']
-                current_value = trade['amount'] * current_price
-                pnl = current_value - investment
-                pnl_percent = (pnl / investment) * 100 if investment > 0 else 0
-                
-                trade_details.append({
-                    'symbol': trade.get('symbol', 'UNKNOWN'),
-                    'pnl': pnl,
-                    'pnl_percent': pnl_percent,
-                    'status': 'OPEN'
-                })
-    
-    total_investment = sum(trade['amount'] * trade['buy_price'] for trade in today_trades if 'buy_price' in trade)
-    overall_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
-    win_rate = (winning_trades / len(today_trades)) * 100 if today_trades else 0
-    
-    pnl_image = await generate_pnl_image(trade_details, total_pnl, overall_pnl_percent)
-    
-    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate)
-    
-    await update.message.reply_photo(
-        photo=pnl_image,
-        caption=f"📊 Your Daily P&L Report - {today.strftime('%Y-%m-%d')}"
+    # Build message
+    message = (
+        f"💰 *Wallet Balance*\n\n"
+        f"🔹 Solana (SOL): {sol_balance:.4f}\n"
+        f"🔹 Ethereum (ETH): {eth_balance:.6f}\n"
+        f"🔹 BSC (BNB): {bsc_balance:.6f}\n\n"
+        f"📊 *Token Holdings (Solana)*\n"
     )
     
-    await update.message.reply_photo(
-        photo=shareable_image,
-        caption=(
-            "🎉 Share your success with others!\n\n"
-            "This image is designed for sharing on social media. "
-            "It shows your performance without revealing sensitive details.\n\n"
-            "Tip: You can forward this image to friends or post it in groups to show off your trading skills!"
-        )
-    )
-    
-    report = f"📊 *Daily P&L Report - {today.strftime('%Y-%m-%d')}*\n\n"
-    report += f"• Total P&L: ${total_pnl:+.2f}\n"
-    report += f"• Return: {overall_pnl_percent:+.2f}%\n"
-    report += f"• Winning Trades: {winning_trades}\n"
-    report += f"• Losing Trades: {losing_trades}\n"
-    report += f"• Win Rate: {win_rate:.1f}%\n\n"
-    
-    if total_pnl > 0:
-        report += "🎉 Great job! You're in profit today!"
-    elif total_pnl < 0:
-        report += "📉 You're down today. Review your strategy."
+    if not portfolio:
+        message += "No tokens held."
     else:
-        report += "➖ Break-even day. No gains, no losses."
+        total_portfolio_value = 0
+        
+        for contract, details in portfolio.items():
+            token = await fetch_token_by_contract(contract)
+            
+            # Handle missing token data
+            if not token or token.get('price_usd') is None:
+                current_price = details['buy_price']
+                token_count = details['amount'] / details['buy_price']
+                current_value = token_count * current_price
+                price_note = " (price unavailable, using buy price)"
+            else:
+                current_price = token['price_usd']
+                token_count = details['amount'] / details['buy_price']
+                current_value = token_count * current_price
+                price_note = ""
+            
+            # Calculate profit/loss
+            profit_loss = current_value - details['amount']
+            profit_loss_percent = (profit_loss / details['amount']) * 100 if details['amount'] > 0 else 0
+            profit_loss_emoji = "📈" if profit_loss >= 0 else "📉"
+            
+            total_portfolio_value += current_value
+            
+            message += (
+                f"🔸 {details['name']} ({details['symbol']}):\n"
+                f"   - Token Amount: {token_count:.2f}\n"
+                f"   - Current Price: ${current_price:.8f}{price_note}\n"
+                f"   - Buy Price: ${details['buy_price']:.8f}\n"
+                f"   - P&L: {profit_loss_emoji} {profit_loss:+.4f} SOL ({profit_loss_percent:+.2f}%)\n"
+            )
+        
+        message += f"\n💼 *Total Portfolio Value*: {total_portfolio_value:.4f} SOL"
     
-    await update.message.reply_text(report, parse_mode='Markdown')
+    await update.message.reply_text(message, parse_mode='Markdown')
 
 
 
-async def share_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Initiate token transfer"""
     user_id = update.effective_user.id
-    log_user_action(user_id, "SHARE_PNL_REQUEST")
+    log_user_action(user_id, "TRANSFER_INITIATED")
     
-    today = datetime.datetime.now().date()
-    today_start = datetime.datetime.combine(today, datetime.min.time())
-    today_end = datetime.datetime.combine(today, datetime.max.time())
+    if not await check_subscription(user_id):
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return ConversationHandler.END
     
     user = users_collection.find_one({'user_id': user_id})
     if not user:
-        await update.message.reply_text("🚫 No user data found.")
-        return
-        
-    trade_history = user.get('trade_history', [])
-    today_trades = [
-        trade for trade in trade_history 
-        if today_start <= datetime.datetime.fromisoformat(trade['timestamp']) <= today_end
-    ]
+        await update.message.reply_text("🚫 No wallet found. Please use /start to create a wallet or /set_wallet to import one.")
+        return ConversationHandler.END
     
-    if not today_trades:
-        await update.message.reply_text("📊 No trades executed today. Nothing to share!")
-        return
+    portfolio = user.get('portfolio', {})
+    if not portfolio:
+        await update.message.reply_text("❌ You have no tokens to transfer.")
+        return ConversationHandler.END
     
-    total_pnl = 0
-    winning_trades = 0
+    keyboard = [[InlineKeyboardButton(details['name'], callback_data=contract)] 
+                for contract, details in portfolio.items()]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    for trade in today_trades:
-        if 'buy_price' in trade and 'sell_price' in trade:
-            investment = trade['amount'] * trade['buy_price']
-            returns = trade['amount'] * trade['sell_price']
-            pnl = returns - investment
-            total_pnl += pnl
-            
-            if pnl > 0:
-                winning_trades += 1
-    
-    win_rate = (winning_trades / len(today_trades)) * 100 if today_trades else 0
-    total_investment = sum(trade['amount'] * trade['buy_price'] for trade in today_trades if 'buy_price' in trade)
-    overall_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
-    
-    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate)
-    
-    await update.message.reply_photo(
-        photo=shareable_image,
-        caption=(
-            "🚀 Share your trading success!\n\n"
-            "Show others what's possible with our AI-powered trading bot. "
-            "This image highlights your performance without revealing sensitive details.\n\n"
-            "Pro Tip: Post this in crypto groups with a caption like:\n"
-            "'Another profitable day with the AI Trading Bot! 🚀'\n\n"
-            "Want to try it yourself? Join: t.me/ASKJAH_BOT"
-        )
+    await update.message.reply_text(
+        "📤 Select Solana token to transfer:",
+        reply_markup=reply_markup
     )
+    return TRANSFER_TOKEN
 
-
-async def auto_cleanup_zero_balance(context: ContextTypes.DEFAULT_TYPE):
-    """Automatically remove zero-balance positions"""
-    user_id = context.job.user_id
+async def transfer_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle token selection for transfer"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    log_user_action(user_id, "TRANSFER_TOKEN_SELECTED", query.data)
+    
+    if not await check_subscription(user_id):
+        await query.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return ConversationHandler.END
+    
+    context.user_data['transfer_token'] = query.data
     user = users_collection.find_one({'user_id': user_id})
+    token = user['portfolio'][query.data]
     
-    if not user or 'portfolio' not in user:
-        return
-    
-    portfolio = user['portfolio']
-    removed_count = 0
-    
-    for contract, pos in list(portfolio.items()):
-        if pos['amount'] <= 0.001:  # Consider very small amounts as zero
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$unset': {f'portfolio.{contract}': ""}}
-            )
-            removed_count += 1
-    
-    if removed_count > 0:
-        logger.info(f"Auto-removed {removed_count} zero-balance positions for user {user_id}")
-        # Optionally notify the user
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"🧹 Auto-removed {removed_count} zero-balance positions from your portfolio."
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify user {user_id} about auto-cleanup: {str(e)}")
+    await query.message.reply_text(
+        f"📤 Selected token: {token['name']}\n"
+        f"Enter amount to transfer (in SOL worth):"
+    )
+    return TRANSFER_AMOUNT
 
-async def handle_solana_rpc_rate_limiting():
-    """Monitor and handle Solana RPC rate limiting"""
-    global RPC_RETRY_DELAY
+async def transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle transfer amount input"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "TRANSFER_AMOUNT_INPUT")
     
-    # Check if we're being rate limited and adjust retry delay
-    recent_errors = [log for log in logger.handlers[0].buffer if "429" in log.msg or "Too Many Requests" in log.msg]
+    if not await check_subscription(user_id):
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return ConversationHandler.END
     
-    if len(recent_errors) > 5:
-        # Increase retry delay if we're getting rate limited frequently
-        RPC_RETRY_DELAY = min(RPC_RETRY_DELAY * 1.5, 30)  # Cap at 30 seconds
-        logger.warning(f"Increased RPC retry delay to {RPC_RETRY_DELAY}s due to frequent rate limiting")
-    elif len(recent_errors) < 2 and RPC_RETRY_DELAY > 3:
-        # Decrease retry delay if rate limiting is less frequent
-        RPC_RETRY_DELAY = max(RPC_RETRY_DELAY * 0.8, 3)  # Don't go below 3 seconds
-        logger.info(f"Decreased RPC retry delay to {RPC_RETRY_DELAY}s")
-
-async def monitor_portfolio_liquidity(context: ContextTypes.DEFAULT_TYPE):
-    """Monitor liquidity of tokens in portfolio and alert if deteriorating"""
-    logger.info("🔍 Monitoring portfolio liquidity...")
-    
-    active_users = users_collection.find({
-        "subscription_status": "active",
-        "subscription_expiry": {"$gt": datetime.now().isoformat()}
-    })
-    
-    for user in active_users:
-        user_id = user['user_id']
-        portfolio = user.get('portfolio', {})
+    try:
+        amount = float(update.message.text)
+        if amount <= 0:
+            await update.message.reply_text("❌ Please enter a positive amount.")
+            return TRANSFER_AMOUNT
         
-        for contract, token_data in portfolio.items():
-            token = await fetch_token_by_contract(contract)
-            if not token:
-                continue
-                
-            # Check if liquidity has dropped significantly
-            if (token_data.get('buy_time_liquidity', 0) > 0 and 
-                token['liquidity'] < token_data['buy_time_liquidity'] * 0.5):
-                
-                await notify_user(
-                    context, user_id,
-                    f"⚠️ Liquidity Alert: {token_data['name']}\n"
-                    f"Liquidity dropped from ${token_data['buy_time_liquidity']:,.2f} "
-                    f"to ${token['liquidity']:,.2f} (-{((1 - token['liquidity']/token_data['buy_time_liquidity'])*100):.1f}%)",
-                    "Liquidity Warning"
-                )
-                
-                # Suggest selling if liquidity is critically low
-                if token['liquidity'] < 1000:
-                    await notify_user(
-                        context, user_id,
-                        f"🚨 CRITICAL: {token_data['name']} liquidity is now only ${token['liquidity']:,.2f}. "
-                        f"Consider emergency sell with /emergency_sell {contract}",
-                        "Critical Liquidity Alert"
-                    )
+        token_contract = context.user_data['transfer_token']
+        user = users_collection.find_one({'user_id': user_id})
+        token = user['portfolio'][token_contract]
+        
+        if amount > token['amount']:
+            await update.message.reply_text(
+                f"❌ Insufficient token balance. Available: {token['amount']:.4f} SOL worth"
+            )
+            return TRANSFER_AMOUNT
+        
+        context.user_data['transfer_amount'] = amount
+        await update.message.reply_text("📥 Enter the recipient Solana address:")
+        return TRANSFER_ADDRESS
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+        return TRANSFER_AMOUNT
 
+async def transfer_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle transfer recipient address input"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "TRANSFER_ADDRESS_INPUT")
+    
+    if not await check_subscription(user_id):
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return ConversationHandler.END
+    
+    address = update.message.text
+    try:
+        recipient = Pubkey.from_string(address)
+        token_contract = context.user_data['transfer_token']
+        amount = context.user_data['transfer_amount']
+        
+        success = await execute_transfer(user_id, recipient, token_contract, amount, 'solana')
+        if success:
+            user = users_collection.find_one({'user_id': user_id})
+            token = user['portfolio'][token_contract]
+            token['amount'] -= amount
+            
+            if token['amount'] <= 0:
+            # Remove token from portfolio
+             update_result = users_collection.update_one(
+                {'user_id': user_id},
+                {'$unset': {f'portfolio.{token_contract}': ""}}
+            )
+            else:
+                update_result = users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {f'portfolio.{token_contract}.amount': token['amount']}}
+            )
+        
+        # Log update result
+            logger.info(f"Portfolio update - matched: {update_result.matched_count}, "
+                   f"modified: {update_result.modified_count}, "
+                   f"upserted_id: {update_result.upserted_id}")
+            await update.message.reply_text("✅ Transfer successful.")
+        else:
+            log_user_action(user_id, "TRANSFER_FAILED", 
+                           f"{amount} SOL worth of {token_contract} to {address}", level="error")
+            await update.message.reply_text("❌ Transfer failed. Please check the address and try again.")
+        
+        return ConversationHandler.END
+    except Exception as e:
+        await update.message.reply_text(f"❌ Invalid address: {str(e)}")
+        return TRANSFER_ADDRESS
+
+# Modified fetch_latest_token function
 async def fetch_latest_token() -> List[Dict[str, Any]]:
-    """Fetch all Solana tokens using multiple APIs with fallback"""
+    """Fetch all Solana tokens without time filtering"""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     }
-    
-    # Try multiple APIs in sequence
-    apis = [
-        {
-            'name': 'DexScreener',
-            'url': DEXSCREENER_NEW_TOKENS_API,
-            'parser': parse_dexscreener_response
-        },
-        {
-            'name': 'Birdeye',
-            'url': 'https://public-api.birdeye.so/public/tokenlist?sort_by=volume&sort_type=desc&offset=0&limit=50',
-            'parser': parse_birdeye_response,
-            'headers': {'X-API-KEY': os.getenv('BIRDEYE_API_KEY', '')}
-        },
-        {
-            'name': 'GeckoTerminal',
-            'url': 'https://api.geckoterminal.com/api/v2/networks/solana/new_pools',
-            'parser': parse_geckoterminal_response
-        }
-    ]
-    
-    for api in apis:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                logger.info(f"Trying {api['name']} API for new tokens")
-                response = await client.get(
-                    api['url'], 
-                    headers=api.get('headers', headers)
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    tokens = api['parser'](data)
-                    if tokens:
-                        logger.info(f"Found {len(tokens)} tokens from {api['name']}")
-                        return tokens
-                elif response.status_code == 429:
-                    logger.warning(f"{api['name']} rate limited, trying next API")
+            logger.info("🌐 Fetching latest tokens from DexScreener")
+            response = await client.get(DEXSCREENER_NEW_TOKENS_API, headers=headers)
+            
+            if response.status_code != 200:
+                logger.error(f"DexScreener API failed: {response.status_code} - {response.text}")
+                return []
+            
+            data = response.json()
+            logger.debug(f"API response: {json.dumps(data, indent=2)[:500]}...")
+            
+            if not isinstance(data, list) or not data:
+                logger.warning("No tokens found in API response")
+                return []
+            
+            solana_tokens = []
+            
+            for token_data in data:
+                if token_data.get('chainId') != 'solana':
                     continue
-                    
-        except Exception as e:
-            logger.error(f"Error fetching from {api['name']}: {str(e)}")
-            continue
-    
-    logger.error("All token APIs failed")
-    return []
-
-def parse_dexscreener_response(data):
-    """Parse DexScreener API response"""
-    tokens = []
-    if isinstance(data, list):
-        for token_data in data:
-            if token_data.get('chainId') == 'solana':
-                tokens.append({
-                    'name': token_data.get('name', 'Unknown'),
-                    'symbol': token_data.get('symbol', 'UNKNOWN'),
-                    'contract_address': token_data.get('tokenAddress', ''),
-                    'price_usd': float(token_data.get('priceUsd', 0)),
-                    'liquidity': float(token_data.get('liquidity', {}).get('usd', 0)),
-                    'volume': float(token_data.get('volume', {}).get('h24', 0)),
-                    'market_cap': float(token_data.get('marketCap', 0)),
-                    'image': token_data.get('icon', ''),
-                    'socials': {link.get('type', 'website'): link['url'] 
-                               for link in token_data.get('links', [])}
+                
+                contract_address = token_data.get('tokenAddress', '')
+                if not contract_address:
+                    continue
+                
+                token = await fetch_token_by_contract(contract_address)
+                if not token:
+                    logger.warning(f"Failed to fetch trading data for token {contract_address}")
+                    continue
+                
+                token.update({
+                    'name': token_data.get('name', token['name']),
+                    'symbol': token_data.get('symbol', token['symbol']),
+                    'image': token_data.get('icon', token['image']),
+                    'socials': {link.get('type', link.get('label', 'website').lower()): link['url']
+                               for link in token_data.get('links', [])},
+                    'description': token_data.get('description', ''),
+                    'openGraph': token_data.get('openGraph', '')
                 })
-    return tokens
-
-def parse_birdeye_response(data):
-    """Parse Birdeye API response"""
-    tokens = []
-    if data.get('success') and 'data' in data.get('data', {}):
-        for token_data in data['data']['data']:
-            tokens.append({
-                'name': token_data.get('name', 'Unknown'),
-                'symbol': token_data.get('symbol', 'UNKNOWN'),
-                'contract_address': token_data.get('address', ''),
-                'price_usd': float(token_data.get('price', 0)),
-                'liquidity': float(token_data.get('liquidity', 0)),
-                'volume': float(token_data.get('volume24hUSD', 0)),
-                'market_cap': float(token_data.get('marketCap', 0)),
-                'image': token_data.get('image', '')
-            })
-    return tokens
-
-def parse_geckoterminal_response(data):
-    """Parse GeckoTerminal API response"""
-    tokens = []
-    if 'data' in data:
-        for pool_data in data['data']:
-            attributes = pool_data.get('attributes', {})
-            tokens.append({
-                'name': attributes.get('name', 'Unknown').split(' ')[0],
-                'symbol': attributes.get('name', 'UNKNOWN').split(' ')[0],
-                'contract_address': pool_data.get('id', '').split('_')[-1],
-                'price_usd': float(attributes.get('base_token_price_usd', 0)),
-                'liquidity': float(attributes.get('reserve_in_usd', 0)),
-                'volume': float(attributes.get('volume_usd', {}).get('h24', 0)),
-                'market_cap': 0,
-                'image': attributes.get('image_url', '')
-            })
-    return tokens
+                solana_tokens.append(token)
+            
+            logger.info(f"Fetched {len(solana_tokens)} Solana tokens")
+            return solana_tokens
+        
+        except Exception as e:
+            logger.error(f"Error fetching latest tokens: {str(e)}")
+            return []
+        
+def escape_markdown(text: str) -> str:
+    """Escape Markdown special characters for Telegram messages"""
+    escape_chars = r'\_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
 def format_token_message(token: Dict[str, Any]) -> str:
     """Format token information into a message with escaped Markdown"""
@@ -4060,10 +4464,96 @@ def format_token_message(token: Dict[str, Any]) -> str:
         f"[📊 View Chart]({dexscreener_url})"
     )
 
-def escape_markdown(text: str) -> str:
-    """Escape Markdown special characters for Telegram messages"""
-    escape_chars = r'\_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+# Modified update_token_info function
+async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
+    user_id = context.job.user_id
+    logger.info(f"⏰ Token update job started for user {user_id} at {datetime.now()}")
+    
+    try:
+        user = users_collection.find_one({'user_id': user_id})
+        if not user:
+            logger.info(f"User {user_id} not found in database")
+            return
+            
+        if not await check_subscription(user_id):
+            logger.info(f"User {user_id} subscription inactive")
+            return
+        
+        if not user.get('solana') or not user['solana'].get('public_key'):
+            logger.info(f"User {user_id} has no wallet set up")
+            return
+
+        current_time = time.time()
+        if user.get('last_api_call', 0) > current_time - 1:
+            logger.debug("Skipping due to rate limit")
+            return
+
+        logger.info(f"🔍 Fetching tokens for user {user_id}")
+        tokens = await fetch_latest_token()
+        if not tokens:
+            logger.warning("No tokens fetched")
+            return
+            
+        posted_tokens = user.get('posted_tokens', [])
+        new_tokens = [t for t in tokens if t['contract_address'] not in posted_tokens]
+        
+        if new_tokens:
+            token = new_tokens[0]  # Take the most recent unseen token
+            logger.info(f"Processing token: {token['name']} ({token['contract_address']})")
+            
+            # Record token performance globally
+            await record_token_performance(token)
+
+            message = format_token_message(token)
+            is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
+            warning = "⚠️ *LOW LIQUIDITY - Trade with caution!*\n" if is_suspicious else ""
+            
+            keyboard = [
+                [InlineKeyboardButton("💰 Buy", callback_data=f"buy_{token['contract_address']}"),
+                 InlineKeyboardButton("💸 Sell", callback_data=f"sell_{token['contract_address']}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            try:
+                if token.get('image'):
+                    await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=token['image'],
+                        caption=warning + message,
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=warning + message,
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
+                    )
+            except Exception as e:
+                logger.error(f"Error sending token {token['contract_address']}: {str(e)}")
+                await context.bot.send_message(
+                    user_id,
+                    warning + message,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+            
+            # Add to user's posted tokens
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'posted_tokens': token['contract_address']}}
+            )
+            logger.info(f"Added token {token['contract_address']} to user {user_id}'s posted tokens")
+            
+            if user.get('trading_mode') == 'automatic':
+                # Call auto_trade with the specific token
+                await auto_trade(context, user_id, token)
+        
+    except Exception as e:
+        logger.error(f"🔥 Error in auto token update: {str(e)}", exc_info=True)
+    finally:
+        logger.info(f"🏁 Token update job completed for user {user_id}")
 
 async def check_balance(user_id, chain):
     """Check balance for a specific chain"""
@@ -4088,211 +4578,6 @@ async def check_balance(user_id, chain):
     except Exception as e:
         logger.error(f"Error checking {chain} balance: {str(e)}")
         return 0.0
-    
-async def get_current_price(contract_address: str) -> Optional[float]:
-    token = await fetch_token_by_contract(contract_address)
-    return token['price_usd'] if token else None
-
-async def emergency_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if not context.args:
-        await update.message.reply_text("Please specify a token contract address: /emergency_sell <contract>")
-        return
-        
-    contract_address = context.args[0]
-    
-    user = users_collection.find_one({'user_id': user_id})
-    if not user or contract_address not in user.get('portfolio', {}):
-        await update.message.reply_text("You don't hold this token in your portfolio.")
-        return
-        
-    token_data = user['portfolio'][contract_address]
-    token = await fetch_token_by_contract(contract_address)
-    
-    if not token:
-        await update.message.reply_text("Could not fetch token data.")
-        return
-        
-    await update.message.reply_text(f"🚨 Attempting emergency sell of {token_data['name']}...")
-    
-    success = await emergency_sell_protocol(context, user_id, token, token_data)
-    
-    if success:
-        await update.message.reply_text("Emergency sell completed!")
-    else:
-        await update.message.reply_text("Emergency sell failed. Token may be completely illiquid.")                    
-    
-async def is_legitimate_token(token: Dict[str, Any]) -> bool:
-    try:
-        if 'liquidity' in token and token['liquidity'] < 1000:  
-            return False
-            
-        if 'holders' in token and token.get('holders', 0) < 50:  
-            return False
-            
-        return True
-    except:
-        return False
-
-
-def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]:
-    
-    
-    if len(price_history) < 15:  
-        return {}
-
-        
-    
-    try:
-
-        if not all(isinstance(price, (int, float)) for price in price_history):
-         logger.error("Invalid price values in history")
-         return {}
-        sma_5 = sum(price_history[-5:]) / 5
-        sma_15 = sum(price_history[-15:]) / 15
-        
-        gains = []
-        losses = []
-
-       
-        
-        for i in range(1, len(price_history)):
-            change = price_history[i] - price_history[i-1]
-            if change > 0:
-                gains.append(change)
-                losses.append(0)
-            else:
-                gains.append(0)
-                losses.append(abs(change))
-        
-        if len(gains) >= 14:
-            avg_gain = sum(gains[-14:]) / 14
-            avg_loss = sum(losses[-14:]) / 14
-        else:
-            avg_gain = sum(gains) / len(gains) if gains else 0
-            avg_loss = sum(losses) / len(losses) if losses else 0
-        
-        if avg_loss == 0:
-            rsi = 100  
-        else:
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
-        
-        roc = ((price_history[-1] - price_history[-5]) / price_history[-5]) * 100 if len(price_history) >= 5 else 0
-        logger.info(f"RSI: {rsi}, SMA5: {sma_5}, SMA15: {sma_15}")
-        return {
-            'rsi': rsi,
-            'sma_5': sma_5,
-            'sma_15': sma_15,
-            'roc_5': roc,
-            'ma_crossover': sma_5 > sma_15,
-            'oversold': rsi < 30,  
-            'overbought': rsi > 70,  
-            'positive_momentum': roc > 5,  
-        }
-
-         
-    except Exception as e:
-        logger.error(f"Error calculating indicators: {str(e)}")
-        return {}
-    
-async def check_token_safety(token: Dict[str, Any], user_settings: Dict[str, Any]) -> Tuple[bool, str]:
-    reasons = []
-    
-    is_virtual, virtual_reason = await is_virtual_liquidity_token(token, user_settings)
-    if is_virtual:
-        reasons.append(virtual_reason)
-    
-    min_liquidity = user_settings.get('min_liquidity', MIN_SAFE_LIQUIDITY)
-    if token['liquidity'] < min_liquidity:
-        reasons.append(f"Liquidity (${token['liquidity']:,.2f}) < ${min_liquidity:,.2f}")
-
-    min_volume = user_settings.get('min_volume', MIN_SAFE_VOLUME)
-    if token['volume'] < min_volume:
-        reasons.append(f"Volume (${token['volume']:,.2f}) < ${min_volume:,.2f}")
-
-    if 'market_cap' in token and token['market_cap'] > 0:
-        liquidity_ratio = token['liquidity'] / token['market_cap']
-        if liquidity_ratio < 0.1:  
-            reasons.append(f"Low liquidity ratio ({liquidity_ratio:.2f} < 0.1)")
-    
-    if 'liquidity_change_24h' in token and token['liquidity_change_24h'] < -0.5:
-        reasons.append(f"Liquidity dropping rapidly ({token['liquidity_change_24h']*100:.1f}%)")
-
-    if reasons:
-        return False, " | ".join(reasons)
-    return True, "Passed all safety checks"
-
-async def fetch_holder_info(contract_address: str) -> Optional[Dict[str, Any]]:
-    moralis_api_key = os.getenv('MORALIS_API_KEY')
-    if not moralis_api_key:
-        logger.warning("MORALIS_API_KEY not set. Skipping holder check.")
-        return None
-
-    url = f"https://deep-index.moralis.io/api/v2.2/erc20/{contract_address}/holders?chain=solana&limit=10"
-    headers = {"X-API-Key": moralis_api_key}
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url, headers=headers)
-            if response.status_code == 200:
-                data = response.json()
-                total_holders = data.get('total', 0)
-                top_holder = data['result'][0]['balance'] if data['result'] else 0
-                total_supply = 1  
-                top_holder_percent = (top_holder / total_supply) * 100 if total_supply > 0 else 0
-
-                return {
-                    'holders': total_holders,
-                    'top_holder_percent': top_holder_percent
-                }
-    except Exception as e:
-        logger.error(f"Failed to fetch holder info from Moralis: {str(e)}")
-    return None
-
-async def check_trade_feasibility(token: Dict[str, Any], trade_amount_sol: float) -> Tuple[bool, str]:
-    """
-    Check if a trade is feasible based on liquidity and market conditions.
-    Returns (is_feasible, reason)
-    """
-
-    
-    # Calculate approximate trade size in USD
-    trade_size_usd = trade_amount_sol * 150  # Approximate SOL price
-    
-    # Rule 1: Absolute liquidity minimum
-    if token['liquidity'] < 500:  # $500 absolute minimum
-        return False, f"Insufficient liquidity (${token['liquidity']} < $500)"
-    
-    # Rule 2: Trade size should be less than 5% of liquidity
-    if trade_size_usd > token['liquidity'] * 0.05:
-        return False, f"Trade size (${trade_size_usd:.2f}) > 5% of liquidity (${token['liquidity']})"
-    
-    # Rule 3: Check if token is in a death spiral (price dropping rapidly)
-    if 'price_change_5m' in token and token['price_change_5m'] < -0.3:  # 30% drop in 5min
-        return False, f"Token price crashing ({token['price_change_5m']*100:.1f}% in 5min)"
-    
-    # Rule 4: Check if volume has dried up
-    if token['volume'] < 1000:  # Less than $1000 volume
-        return False, f"Low volume (${token['volume']} < $1000)"
-    
-    return True, "Trade is feasible"
-async def solana_rpc_call_with_retry(func, *args, **kwargs):
-    """Execute Solana RPC call with retry logic for rate limiting"""
-    for attempt in range(MAX_RPC_RETRIES):
-        try:
-            result = await func(*args, **kwargs)
-            return result
-        except Exception as e:
-            if "429" in str(e) or "Too Many Requests" in str(e):
-                wait_time = RPC_RETRY_DELAY * (attempt + 1)
-                logger.warning(f"RPC rate limited, waiting {wait_time}s before retry (attempt {attempt+1}/{MAX_RPC_RETRIES})")
-                await asyncio.sleep(wait_time)
-                continue
-            else:
-                raise e
-    raise Exception(f"RPC call failed after {MAX_RPC_RETRIES} attempts due to rate limiting") 
 
 async def execute_trade(user_id, contract_address, amount, action, chain, token_info):
     logger.info(f"🏁 Starting {action} trade for {amount} of {contract_address}")
@@ -4562,6 +4847,40 @@ async def execute_trade(user_id, contract_address, amount, action, chain, token_
 
     return False, "Max retries exceeded. The token may be too volatile or have insufficient liquidity for trading at this time."
 
+
+async def auto_cleanup_zero_balance(context: ContextTypes.DEFAULT_TYPE):
+    """Automatically remove zero-balance positions"""
+    user_id = context.job.user_id
+    user = users_collection.find_one({'user_id': user_id})
+    
+    if not user or 'portfolio' not in user:
+        return
+    
+    portfolio = user['portfolio']
+    removed_count = 0
+    
+    for contract, pos in list(portfolio.items()):
+        if pos['amount'] <= 0.001:  # Consider very small amounts as zero
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$unset': {f'portfolio.{contract}': ""}}
+            )
+            removed_count += 1
+    
+    if removed_count > 0:
+        logger.info(f"Auto-removed {removed_count} zero-balance positions for user {user_id}")
+        # Optionally notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🧹 Auto-removed {removed_count} zero-balance positions from your portfolio."
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user {user_id} about auto-cleanup: {str(e)}")
+
+# Schedule this job for each user (add this where you schedule other jobs)
+
+
 async def get_token_decimals(token_address: str) -> int:
     """Get token decimals from Solana blockchain with retry logic"""
     try:
@@ -4584,639 +4903,75 @@ async def get_token_decimals(token_address: str) -> int:
     except Exception as e:
         logger.error(f"Error getting decimals for token {token_address}: {str(e)}")
         return 9  # Default to 9 decimals
-    
-async def execute_auto_buy(context, user_id, token, buy_amount):
-    """Execute automatic buy with liquidity-aware position sizing"""
-    try:
-        # Get total capital for position sizing
-        sol_balance = await check_balance(user_id, 'solana')
-        user = users_collection.find_one({'user_id': user_id})
-        portfolio = user.get('portfolio', {})
-        
-        # Calculate total portfolio value
-        total_portfolio_value = sol_balance
-        for contract, holding in portfolio.items():
-            # Get current price for each holding
-            holding_token = await fetch_token_by_contract(contract)
-            if holding_token:
-                token_count = holding['amount'] / holding['buy_price']
-                current_value = token_count * holding_token['price_usd']
-                total_portfolio_value += current_value
-        
-        # Calculate maximum position size based on liquidity
-        liquidity_max = token['liquidity'] * 0.05 / 150  # 5% of liquidity converted to SOL
-        portfolio_max = total_portfolio_value * POSITION_SIZE_PERCENT
-        
-        # Use the smaller of the two limits
-        actual_buy_amount = min(buy_amount, liquidity_max, portfolio_max)
-        
-        if actual_buy_amount < 0.001:  # Minimum trade size
-            await notify_user(
-                context, user_id,
-                f"⏭️ Skipping {token['name']} - liquidity too low for any position",
-                "Auto-Buy Skipped"
-            )
-            return False
-        
-        # Check if we can actually execute this trade
-        is_feasible, reason = await check_trade_feasibility(token, actual_buy_amount)
-        if not is_feasible:
-            await notify_user(
-                context, user_id,
-                f"⏭️ Skipping {token['name']} - {reason}",
-                "Auto-Buy Skipped"
-            )
-            return False
-        
-        # Get technical indicators for better entry timing
-        token_performance = token_performance_collection.find_one(
-            {'contract_address': token['contract_address']}
-        )
-        
-        price_history = []
-        if token_performance and 'performance_history' in token_performance:
-            price_history = [entry['price'] for entry in token_performance['performance_history'][-20:]]  # Last 20 prices
-        
-        indicators = calculate_technical_indicators(price_history)
-        
-        # Enhanced entry criteria
-        good_entry = False
-        entry_reason = ""
-        
-        if indicators:
-            # Strategy 1: Oversold bounce
-            if indicators['oversold'] and indicators['rsi'] > 30 + 5:  # RSI moving up from oversold
-                good_entry = True
-                entry_reason = "Oversold bounce"
-            
-            # Strategy 2: Breakout with volume and momentum
-            elif (indicators['ma_crossover'] and indicators['positive_momentum'] and 
-                  token['volume'] > user.get('min_volume', 1000) * 2):  # Double minimum volume
-                good_entry = True
-                entry_reason = "Breakout with volume and momentum"
-            
-            # Strategy 3: Strong momentum continuation
-            elif (indicators['roc_5'] > 10 and indicators['sma_5'] > indicators['sma_15']):
-                good_entry = True
-                entry_reason = "Strong momentum continuation"
-        else:
-            # Fallback to basic criteria if no indicator data
-            if token['liquidity'] > user.get('min_liquidity', 5000) and token['volume'] > user.get('min_volume', 1000):
-                good_entry = True
-                entry_reason = "Basic criteria"
-        
-        if not good_entry:
-            await notify_user(
-                context, user_id,
-                f"⏭️ Skipping {token['name']} - does not meet entry criteria",
-                "Auto-Buy Skipped"
-            )
-            return False
-        
-        # Execute trade
-        success, message = await execute_trade(
-            user_id, 
-            token['contract_address'], 
-            actual_buy_amount, 
-            'buy', 
-            'solana',
-            token
-        )
-        
-        if success:
-            # Store additional trade metadata
-            trade_metadata = {
-                'name': token['name'],
-                'symbol': token['symbol'],
-                'amount': actual_buy_amount,
-                'buy_price': token['price_usd'],
-                'buy_time': datetime.now().isoformat(),
-                'entry_reason': entry_reason,
-                'indicators': indicators,
-                'stop_loss': token['price_usd'] * (1 - HARD_STOP_LOSS),  # Hard stop loss
-                'profit_targets': [
-                    {'percentage': 0.20, 'target_price': token['price_usd'] * 1.20, 'allocation': 0.4},
-                    {'percentage': 0.50, 'target_price': token['price_usd'] * 1.50, 'allocation': 0.3},
-                    {'percentage': 1.00, 'target_price': token['price_usd'] * 2.00, 'allocation': 0.3}
-                ],
-                'trailing_stop': TRAILING_STOP_PERCENT,
-                'time_entry': time.time(),
-                'buy_time_liquidity': token['liquidity']  # Store liquidity at time of purchase
-            }
-            
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': {
-                    f'portfolio.{token["contract_address"]}': trade_metadata,
-                    'last_trade_time': time.time()
-                }}
-            )
-            
-            await notify_user(
-                context, user_id,
-                f"🤖 AUTOBUY: {message}\nEntry: {entry_reason}\nSize: {actual_buy_amount:.4f} SOL ({POSITION_SIZE_PERCENT*100}% of portfolio)",
-                "Auto-Buy Executed"
-            )
-            return True
-        else:
-            # Add to blacklist if trade fails
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$addToSet': {'auto_trade_blacklist': token['contract_address']}}
-            )
-            await notify_user(
-                context, user_id,
-                f"❌ AUTOBUY FAILED: {message}",
-                "Auto-Buy Failed"
-            )
-            return False
-            
-    except Exception as e:
-        logger.error(f"Auto-buy execution error: {str(e)}")
-        await notify_user(
-            context, user_id,
-            f"❌ AUTOBUY ERROR: {str(e)}",
-            "Auto-Buy Error"
-        )
-        return False
 
-async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
-    """Check if daily loss limit has been exceeded with proper error handling"""
-    daily_loss_limit = user.get('daily_loss_limit', 0.05)  # Default 5%
-    
-    # Get today's trades
-    today = datetime.now().date()
-    today_trades = [
-        t for t in user.get('trade_history', []) 
-        if datetime.fromisoformat(t['timestamp']).date() == today
-    ]
-    
-
-    # Calculate today's P&L with proper error handling
-    daily_pnl = 0
-    for trade in today_trades:
+async def solana_rpc_call_with_retry(func, *args, **kwargs):
+    """Execute Solana RPC call with retry logic for rate limiting"""
+    for attempt in range(MAX_RPC_RETRIES):
         try:
-            sell_price = trade.get('sell_price', 0) or 0
-            buy_price = trade.get('buy_price', 0) or 0
-            if 'profit_pct' in trade:
-                # RSI recovering from oversold
-                trade_value = trade['amount'] * trade['buy_price']
-                daily_pnl += trade_value * (trade['profit_pct'] / 100)
-            elif 'sell_price' in trade and 'buy_price' in trade:
-                # Fallback calculation
-                trade_profit = (sell_price - buy_price) * trade['amount']
-                daily_pnl += trade_profit
-            else:
-                logger.warning(f"Incomplete trade record for P&L calculation: {trade}")
-                continue
-        except KeyError as e:
-            logger.error(f"Missing field in trade record: {e}. Trade: {trade}")
-            continue
-    
-    # Calculate percentage of portfolio
-    sol_balance = await check_balance(user_id, 'solana')
-    portfolio_value = sol_balance
-    for contract, holding in user.get('portfolio', {}).items():
-        portfolio_value += holding['amount']
-    
-    if portfolio_value > 0:
-        loss_pct = abs(min(daily_pnl, 0)) / portfolio_value
-        if loss_pct >= daily_loss_limit:
-            # Try to notify the user (we don't have context here)
-            logger.warning(f"User {user_id} reached daily loss limit ({loss_pct*100:.1f}%)")
-            return True
-    
-    return False
-
-async def evaluate_token_entry(token: Dict[str, Any], indicators: Dict[str, Any], user_settings: Dict[str, Any]) -> Dict[str, Any]:
-    """Evaluate whether to enter a trade based on technical analysis"""
-    decision = {
-        'should_buy': False,
-        'reason': '',
-        'confidence': 0
-    }
-    
-    # Strategy 1: Strong momentum with volume confirmation
-    if (indicators['roc_5'] > 15 and  # 15%+ price increase in last 5 periods
-        indicators['positive_momentum'] and
-        token['volume'] > user_settings.get('min_volume', 1000) * 3):  # 3x minimum volume
-        
-        decision.update({
-            'should_buy': True,
-            'reason': "Strong momentum with volume confirmation",
-            'confidence': 80
-        })
-    
-    # Strategy 2: Oversold bounce with RSI recovery
-    elif (indicators['oversold'] and 
-          indicators['rsi'] > 35 and  # RSI recovering from oversold
-          indicators['roc_5'] > 5):   # Some positive momentum
-        
-        decision.update({
-            'should_buy': True,
-            'reason': "Oversold bounce with RSI recovery",
-            'confidence': 70
-        })
-    
-    # Strategy 3: Breakout above moving averages
-    elif (indicators['ma_crossover'] and 
-          indicators['sma_5'] > indicators['sma_15'] * 1.05 and  # 5% above 15-period SMA
-          token['volume'] > user_settings.get('min_volume', 1000) * 2):
-        
-        decision.update({
-            'should_buy': True,
-            'reason': "Breakout above moving averages with volume",
-            'confidence': 75
-        })
-    
-    else:
-        decision['reason'] = "Does not meet any entry criteria"
-    
-    return decision
-
-
-async def emergency_sell_protocol(context, user_id, token, token_data):
-    """
-    Try to sell tokens that have become illiquid using aggressive parameters
-    """
-    contract_address = token['contract_address']
-    
-    # Try with extremely high slippage
-    user = users_collection.find_one({'user_id': user_id})
-    original_slippage = user.get('max_slippage', 5)
-    users_collection.update_one(
-        {'user_id': user_id},
-        {'$set': {'emergency_sell_mode': True, 'max_slippage': 50}}  # 50% slippage!
-    )
-    
-    try:
-        # Calculate token amount
-        token_amount = token_data['amount'] / token_data['buy_price']
-        
-        # Try to sell with aggressive settings
-        success, message = await execute_trade(
-            user_id, contract_address, token_amount, 'sell', 'solana', token
-        )
-        
-        if success:
-            await notify_user(
-                context, user_id,
-                f"🚨 EMERGENCY SELL: {message}",
-                "Emergency Sell Executed"
-            )
-            return True
-        else:
-            # Mark token as unsellable
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$addToSet': {'unsellable_tokens': contract_address}}
-            )
-            await notify_user(
-                context, user_id,
-                f"💀 Token {token['name']} appears completely illiquid and cannot be sold.",
-                "Token Possibly Rugged"
-            )
-            return False
-            
-    finally:
-        # Restore original settings
-        users_collection.update_one(
-            {'user_id': user_id},
-            {'$set': {'max_slippage': original_slippage}, '$unset': {'emergency_sell_mode': True}}
-        )
-
-
-async def is_virtual_liquidity_token(token: Dict[str, Any], user_settings: Dict[str, Any]) -> Tuple[bool, str]:
-    """
-    Heuristically determines if a token is using virtual/bonding curve liquidity
-    (e.g., from Pump.fun, Raydium Launchpad) which is high risk.
-    """
-    reasons = []
-    contract_address = token['contract_address']
-
-    # 1. The Primary Signal: Near-Zero Reported Liquidity
-    if token['liquidity'] < 100:  # Often shows as $0.00 or a very small amount
-        reasons.append(f"Low reported liquidity (${token['liquidity']:.2f})")
-
-    # 2. High Volume + No Liquidity Paradox (Classic Pump.fun signature)
-    if token['liquidity'] < MIN_SAFE_LIQUIDITY and token['volume'] > 5000:
-        reasons.append(f"Suspicious activity: High volume (${token['volume']}) with no liquidity")
-
-    # 3. Check if the token has a supply on Birdeye (most virtual tokens don't initially)
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            birdeye_url = f"https://public-api.birdeye.so/defi/token_overview?address={contract_address}"
-            response = await client.get(birdeye_url, headers={"X-API-KEY": os.getenv('BIRDEYE_API_KEY', '')})
-            if response.status_code == 200:
-                data = response.json().get('data', {})
-                supply = data.get('supply', 0)
-                # Virtual tokens often have a supply of 0 or 1 on Birdeye initially
-                if supply <= 1:
-                    reasons.append("No measurable token supply (common in bonding curve)")
-    except Exception as e:
-        logger.warning(f"Could not check Birdeye for {contract_address}: {str(e)}")
-
-    if reasons:
-        return True, "VIRTUAL_LIQUIDITY: " + " | ".join(reasons)
-    return False, "Appears to have real liquidity"
-
-async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = users_collection.find_one({'user_id': user_id})
-    
-    if not user:
-        await update.message.reply_text("❌ No user data found.")
-        return
-    
-    if context.args:
-        try:
-            new_max_positions = int(context.args[0])
-            if new_max_positions < 1 or new_max_positions > 20:
-                await update.message.reply_text("❌ Maximum positions should be between 1 and 20.")
-                return
-                
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': {'max_positions': new_max_positions}}
-            )
-            await update.message.reply_text(f"✅ Maximum positions updated to {new_max_positions}.")
-        except ValueError:
-            await update.message.reply_text("❌ Please provide a valid number.")
-    else:
-        current_max = user.get('max_positions', MAX_POSITIONS)
-        await update.message.reply_text(
-            f"Current maximum positions: {current_max}\n\n"
-            f"To change, use: /settings <number>\n"
-            f"Example: /settings 7"
-        )
-
-async def jupiter_api_call(url, params=None, json_data=None, method="GET"):
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                if method == "GET":
-                    response = await client.get(url, params=params)
-                else:
-                    response = await client.post(url, json=json_data)
-                
-                if response.status_code == 200:
-                    return response.json()
-                elif response.status_code == 429:
-                    wait_time = (attempt + 1) * 2
-                    logger.warning(f"Rate limited, waiting {wait_time}s before retry")
-                    await asyncio.sleep(wait_time)
-                    continue
-                else:
-                    logger.error(f"Jupiter API error: {response.status_code} - {response.text}")
-                    return None
-                    
+            result = await func(*args, **kwargs)
+            return result
         except Exception as e:
-            logger.error(f"Jupiter API call failed (attempt {attempt + 1}): {str(e)}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(1)
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                wait_time = RPC_RETRY_DELAY * (attempt + 1)
+                logger.warning(f"RPC rate limited, waiting {wait_time}s before retry (attempt {attempt+1}/{MAX_RPC_RETRIES})")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                raise e
+    raise Exception(f"RPC call failed after {MAX_RPC_RETRIES} attempts due to rate limiting") 
+# Add a function to handle RPC rate limiting in all Solana interactions
+async def handle_solana_rpc_rate_limiting():
+    """Monitor and handle Solana RPC rate limiting"""
+    global RPC_RETRY_DELAY
     
-    return None
+    # Check if we're being rate limited and adjust retry delay
+    recent_errors = [log for log in logger.handlers[0].buffer if "429" in log.msg or "Too Many Requests" in log.msg]
+    
+    if len(recent_errors) > 5:
+        # Increase retry delay if we're getting rate limited frequently
+        RPC_RETRY_DELAY = min(RPC_RETRY_DELAY * 1.5, 30)  # Cap at 30 seconds
+        logger.warning(f"Increased RPC retry delay to {RPC_RETRY_DELAY}s due to frequent rate limiting")
+    elif len(recent_errors) < 2 and RPC_RETRY_DELAY > 3:
+        # Decrease retry delay if rate limiting is less frequent
+        RPC_RETRY_DELAY = max(RPC_RETRY_DELAY * 0.8, 3)  # Don't go below 3 seconds
+        logger.info(f"Decreased RPC retry delay to {RPC_RETRY_DELAY}s")
 
-    
-async def notify_user(context, user_id, message, action):
-    try:
-        await context.bot.send_message(chat_id=user_id, text=message)
-        log_user_action(user_id, action, message)
-    except Exception as e:
-        logger.error(f"Failed to notify user {user_id}: {str(e)}")
 
-async def handle_token_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle buy/sell button clicks on token messages and positions"""
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data_parts = query.data.split('_', 1)
-    action = data_parts[0]
-    contract_address = data_parts[1] if len(data_parts) > 1 else ''
+
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show debug information"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "DEBUG_REQUEST")
     
-    # Map position actions to standard actions
-    if action == 'buypos':
-        action = 'buy'
-    elif action == 'sellpos':
-        action = 'sell'
-    
-    log_user_action(user_id, "TOKEN_BUTTON_CLICKED", f"{action} {contract_address}")
-    
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception as e:
-        logger.warning(f"Couldn't remove buttons: {str(e)}")
-    
-    token = await fetch_token_by_contract(contract_address)
-    if not token:
-        await query.message.reply_text("❌ Failed to fetch token details. Please try again.")
-        log_user_action(user_id, "TOKEN_FETCH_FAILED", contract_address, level="warning")
-        return
-    
-    context.user_data['current_token'] = token
-    context.user_data['trade_action'] = action
-    
-    if action == 'buy':
-        await query.message.reply_text(
-            f"💰 *Buy Order for {token['name']} ({token['symbol']})*\n\n"
-            f"Enter amount to buy in SOL:",
-            parse_mode='Markdown'
-        )
-        return BUY_AMOUNT
-    else:  # sell
-        user = users_collection.find_one({'user_id': user_id})
-        portfolio = user.get('portfolio', {})
-        if contract_address not in portfolio:
-            await query.message.reply_text(f"❌ You don't hold any {token['name']} tokens to sell.")
-            return ConversationHandler.END
-            
-        token_data = portfolio[contract_address]
-        buy_price = token_data['buy_price']
-        sol_invested = token_data['amount']
-        
-        available_tokens = sol_invested / buy_price
-        
-        await query.message.reply_text(
-            f"💸 *Sell Order for {token['name']} ({token['symbol']})*\n\n"
-            f"Available: {available_tokens:.2f} tokens\n"
-            f"Current Price: ${token['price_usd']:.6f}\n"
-            f"Enter number of tokens to sell:",
-            parse_mode='Markdown'
-        )
-        return SELL_AMOUNT
-    
-async def handle_position_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle position action buttons (sell/buy more)"""
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    action, contract_address = query.data.split('_', 1)
-    
-    # Remove buttons from original message
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception as e:
-        logger.warning(f"Couldn't remove buttons: {str(e)}")
-    
-    # Get token info
-    token = await fetch_token_by_contract(contract_address)
-    if not token:
-        await query.message.reply_text("❌ Could not fetch token data.")
-        return
-    
-    context.user_data['current_token'] = token
-    
-    if action == 'sellpos':
-        # Get user portfolio data to calculate available tokens
-        user = users_collection.find_one({'user_id': user_id})
-        if contract_address not in user.get('portfolio', {}):
-            await query.message.reply_text("❌ You don't hold this token.")
-            return
-        
-        token_data = user['portfolio'][contract_address]
-        buy_price = token_data['buy_price']
-        sol_invested = token_data['amount']
-        available_tokens = sol_invested / buy_price
-        
-        await query.message.reply_text(
-            f"💸 Selling {token['name']}\n\n"
-            f"Available: {available_tokens:.2f} tokens\n"
-            f"Current Price: ${token['price_usd']:.6f}\n"
-            f"Enter number of tokens to sell:"
-        )
-        return SELL_AMOUNT
-    elif action == 'buypos':
-        await query.message.reply_text(
-            f"💰 Buying More {token['name']}\n\n"
-            f"Enter additional amount to buy (in SOL):"
-        )
-        return BUY_AMOUNT
-async def handle_remove_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle removal of positions from portfolio"""
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    contract_address = query.data.split('_', 1)[1]
-    
-    # Get the position details
     user = users_collection.find_one({'user_id': user_id})
-    portfolio = user.get('portfolio', {})
-    position = portfolio.get(contract_address, {})
-    token_name = position.get('name', 'Unknown Token')
-    token_balance = position.get('amount', 0)
     
-    # Create confirmation message based on whether it's a zero-balance position
-    if token_balance <= 0.001:
-        message = (
-            f"🗑️ Remove zero-balance position: {token_name}\n\n"
-            f"This position has a balance of {token_balance:.4f} SOL.\n"
-            f"Removing it will clean up your portfolio."
-        )
-    else:
-        message = (
-            f"🗑️ Remove position: {token_name}\n\n"
-            f"Current balance: {token_balance:.4f} SOL\n"
-            f"Are you sure you want to remove this position?\n\n"
-            f"⚠️ This will delete all records of this position from your portfolio."
-        )
+    job_count = 0
+    if context.job_queue:
+        job_count = len(context.job_queue.jobs())
     
-    # Create confirmation keyboard
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Confirm Remove", callback_data=f"confirm_remove_{contract_address}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_remove_{contract_address}")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    sub_status = "Not subscribed"
+    if user and user.get('subscription_status') == 'active':
+        expiry = user.get('subscription_expiry')
+        if isinstance(expiry, str):
+            expiry = datetime.fromisoformat(expiry)
+        if expiry > datetime.now():
+            sub_status = f"Active until {expiry}"
     
-    # Ask for confirmation
-    await query.edit_message_text(
-        message,
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
+    last_check = "Never"
+    if user and 'last_token_check' in user:
+        last_check = datetime.fromtimestamp(user['last_token_check']).strftime('%Y-%m-%d %H:%M:%S')
+    
+    message = (
+        f"🐛 *Debug Information*\n\n"
+        f"🔹 User ID: {user_id}\n"
+        f"🔹 Subscription: {sub_status}\n"
+        f"🔹 Active jobs: {job_count}\n"
+        f"🔹 Last token check: {last_check}\n"
+        f"🔹 Posted tokens: {len(user.get('posted_tokens', [])) if user else 0}"
     )
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
 
-async def handle_remove_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle confirmation of position removal"""
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data_parts = query.data.split('_', 2)
-    action = data_parts[1]
-    contract_address = data_parts[2]
-    
-    if action == 'confirm':
-        # Remove the position from the portfolio
-        users_collection.update_one(
-            {'user_id': user_id},
-            {'$unset': {f'portfolio.{contract_address}': ""}}
-        )
-        
-        # Get the token name for the success message
-        user = users_collection.find_one({'user_id': user_id})
-        portfolio = user.get('portfolio', {})
-        token_name = portfolio.get(contract_address, {}).get('name', 'the token')
-        
-        await query.edit_message_text(
-            f"🗑️ Successfully removed {token_name} from your portfolio.",
-            parse_mode='Markdown'
-        )
-        
-        log_user_action(user_id, "POSITION_REMOVED", contract_address)
-    else:
-        # Cancel removal
-        await query.edit_message_text(
-            "🛑 Removal cancelled. The token remains in your portfolio.",
-            parse_mode='Markdown'
-        )
-
-
-async def handle_all_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all button clicks with proper error handling"""
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-    
-    logger.info(f"Button pressed: {data} by user {user_id}")
-    
-    try:
-        # Handle different button types
-        if data.startswith('buy_') or data.startswith('sell_'):
-            await handle_token_button(update, context)
-        elif data.startswith('buypos_') or data.startswith('sellpos_'):
-            await handle_position_actions(update, context)
-        elif data.startswith('remove_'):
-            await handle_remove_position(update, context)
-        elif data.startswith('confirm_remove_') or data.startswith('cancel_remove_'):
-            await handle_remove_confirmation(update, context)
-        elif data in ['generate_wallet', 'import_wallet']:
-            await handle_wallet_choice(update, context)
-        elif data in ['manual', 'automatic']:
-            await mode_callback(update, context)
-        elif data in ['confirm_subscription', 'cancel_subscription']:
-            await confirm_subscription(update, context)
-        elif data in ['mnemonic', 'private_key', 'cancel_import']:
-            await start_import_method(update, context)
-        elif data in ['confirm_new_wallet', 'cancel_new_wallet']:
-            await confirm_generate_wallet(update, context)
-        elif data in ['confirm_set_wallet', 'cancel_set_wallet']:
-            await confirm_set_wallet(update, context)
-        elif data in ['default_strategy', 'custom_strategy']:
-            await set_profit_strategy(update, context)
-        elif data in ['activate_auto_trading', 'modify_settings']:
-            await review_config_callback(update, context)
-        else:
-            logger.warning(f"Unknown button pressed: {data}")
-            await query.edit_message_text("❌ This button is no longer valid. Please use a command instead.")
-    
-    except Exception as e:
-        logger.error(f"Error handling button {data}: {str(e)}")
-        try:
-            await query.edit_message_text("❌ An error occurred. Please try again.")
-        except:
-            await context.bot.send_message(chat_id=user_id, text="❌ An error occurred. Please try again.")
 
 async def mypositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -5378,252 +5133,157 @@ async def cleanup_zero_balance(update: Update, context: ContextTypes.DEFAULT_TYP
             "✅ No zero-balance positions found."
         )
 
-async def force_token_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Force an immediate token fetch"""
-    user_id = update.effective_user.id
-    log_user_action(user_id, "FORCE_TOKEN_FETCH")
+async def handle_remove_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle removal of positions from portfolio"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    contract_address = query.data.split('_', 1)[1]
     
-    if not context.job_queue:
-        await update.message.reply_text("❌ Job queue not initialized")
-        return
-        
+    # Get the position details
     user = users_collection.find_one({'user_id': user_id})
-    if not user or not user.get('solana') or not user['solana'].get('public_key'):
-        await update.message.reply_text(
-            "🚫 You need to set up a wallet first. Use /start to create a wallet or /set_wallet to import one."
+    portfolio = user.get('portfolio', {})
+    position = portfolio.get(contract_address, {})
+    token_name = position.get('name', 'Unknown Token')
+    token_balance = position.get('amount', 0)
+    
+    # Create confirmation message based on whether it's a zero-balance position
+    if token_balance <= 0.001:
+        message = (
+            f"🗑️ Remove zero-balance position: {token_name}\n\n"
+            f"This position has a balance of {token_balance:.4f} SOL.\n"
+            f"Removing it will clean up your portfolio."
         )
-        return
-        
-    context.job_queue.run_once(
-        update_token_info,
-        when=0,
-        user_id=user_id,
-        name=f"manual_fetch_{user_id}_{int(time.time())}"
-    )
-    
-    await update.message.reply_text("⏳ Token fetch triggered. You should receive tokens shortly.")
-
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show wallet balances with current token values"""
-    user_id = update.effective_user.id
-    log_user_action(user_id, "BALANCE_REQUEST")
-    
-    if not await check_subscription(user_id):
-        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
-        return
-    
-    user = users_collection.find_one({'user_id': user_id})
-    if not user:
-        await update.message.reply_text("🚫 No wallet found. Please use /start to create a wallet or /set_wallet to import one.")
-        return
-    
-    # Get balances for all chains
-    sol_balance = await check_balance(user_id, 'solana')
-    eth_balance = await check_balance(user_id, 'eth') if user.get('eth') else 0.0
-    bsc_balance = await check_balance(user_id, 'bsc') if user.get('bsc') else 0.0
-    portfolio = user.get('portfolio', {})
-    
-    # Build message
-    message = (
-        f"💰 *Wallet Balance*\n\n"
-        f"🔹 Solana (SOL): {sol_balance:.4f}\n"
-        f"🔹 Ethereum (ETH): {eth_balance:.6f}\n"
-        f"🔹 BSC (BNB): {bsc_balance:.6f}\n\n"
-        f"📊 *Token Holdings (Solana)*\n"
-    )
-    
-    if not portfolio:
-        message += "No tokens held."
     else:
-        total_portfolio_value = 0
-        
-        for contract, details in portfolio.items():
-            token = await fetch_token_by_contract(contract)
-            
-            # Handle missing token data
-            if not token or token.get('price_usd') is None:
-                current_price = details['buy_price']
-                token_count = details['amount'] / details['buy_price']
-                current_value = token_count * current_price
-                price_note = " (price unavailable, using buy price)"
-            else:
-                current_price = token['price_usd']
-                token_count = details['amount'] / details['buy_price']
-                current_value = token_count * current_price
-                price_note = ""
-            
-            # Calculate profit/loss
-            profit_loss = current_value - details['amount']
-            profit_loss_percent = (profit_loss / details['amount']) * 100 if details['amount'] > 0 else 0
-            profit_loss_emoji = "📈" if profit_loss >= 0 else "📉"
-            
-            total_portfolio_value += current_value
-            
-            message += (
-                f"🔸 {details['name']} ({details['symbol']}):\n"
-                f"   - Token Amount: {token_count:.2f}\n"
-                f"   - Current Price: ${current_price:.8f}{price_note}\n"
-                f"   - Buy Price: ${details['buy_price']:.8f}\n"
-                f"   - P&L: {profit_loss_emoji} {profit_loss:+.4f} SOL ({profit_loss_percent:+.2f}%)\n"
-            )
-        
-        message += f"\n💼 *Total Portfolio Value*: {total_portfolio_value:.4f} SOL"
+        message = (
+            f"🗑️ Remove position: {token_name}\n\n"
+            f"Current balance: {token_balance:.4f} SOL\n"
+            f"Are you sure you want to remove this position?\n\n"
+            f"⚠️ This will delete all records of this position from your portfolio."
+        )
     
-    await update.message.reply_text(message, parse_mode='Markdown')
-
-async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Initiate token transfer"""
-    user_id = update.effective_user.id
-    log_user_action(user_id, "TRANSFER_INITIATED")
-    
-    if not await check_subscription(user_id):
-        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
-        return ConversationHandler.END
-    
-    user = users_collection.find_one({'user_id': user_id})
-    if not user:
-        await update.message.reply_text("🚫 No wallet found. Please use /start to create a wallet or /set_wallet to import one.")
-        return ConversationHandler.END
-    
-    portfolio = user.get('portfolio', {})
-    if not portfolio:
-        await update.message.reply_text("❌ You have no tokens to transfer.")
-        return ConversationHandler.END
-    
-    keyboard = [[InlineKeyboardButton(details['name'], callback_data=contract)] 
-                for contract, details in portfolio.items()]
+    # Create confirmation keyboard
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Confirm Remove", callback_data=f"confirm_remove_{contract_address}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_remove_{contract_address}")
+        ]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
-        "📤 Select Solana token to transfer:",
-        reply_markup=reply_markup
+    # Ask for confirmation
+    await query.edit_message_text(
+        message,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
     )
-    return TRANSFER_TOKEN
 
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show debug information"""
-    user_id = update.effective_user.id
-    log_user_action(user_id, "DEBUG_REQUEST")
+async def handle_remove_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle confirmation of position removal"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data_parts = query.data.split('_', 2)
+    action = data_parts[1]
+    contract_address = data_parts[2]
     
+    if action == 'confirm':
+        # Remove the position from the portfolio
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$unset': {f'portfolio.{contract_address}': ""}}
+        )
+        
+        # Get the token name for the success message
+        user = users_collection.find_one({'user_id': user_id})
+        portfolio = user.get('portfolio', {})
+        token_name = portfolio.get(contract_address, {}).get('name', 'the token')
+        
+        await query.edit_message_text(
+            f"🗑️ Successfully removed {token_name} from your portfolio.",
+            parse_mode='Markdown'
+        )
+        
+        log_user_action(user_id, "POSITION_REMOVED", contract_address)
+    else:
+        # Cancel removal
+        await query.edit_message_text(
+            "🛑 Removal cancelled. The token remains in your portfolio.",
+            parse_mode='Markdown'
+        )
+
+async def handle_position_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle position action buttons (sell/buy more)"""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    action, contract_address = query.data.split('_', 1)
+    
+    # Remove buttons from original message
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as e:
+        logger.warning(f"Couldn't remove buttons: {str(e)}")
+    
+    # Get token info
+    token = await fetch_token_by_contract(contract_address)
+    if not token:
+        await query.message.reply_text("❌ Could not fetch token data.")
+        return
+    
+    context.user_data['current_token'] = token
+    
+    if action == 'sellpos':
+        # Get user portfolio data to calculate available tokens
+        user = users_collection.find_one({'user_id': user_id})
+        if contract_address not in user.get('portfolio', {}):
+            await query.message.reply_text("❌ You don't hold this token.")
+            return
+        
+        token_data = user['portfolio'][contract_address]
+        buy_price = token_data['buy_price']
+        sol_invested = token_data['amount']
+        available_tokens = sol_invested / buy_price
+        
+        await query.message.reply_text(
+            f"💸 Selling {token['name']}\n\n"
+            f"Available: {available_tokens:.2f} tokens\n"
+            f"Current Price: ${token['price_usd']:.6f}\n"
+            f"Enter number of tokens to sell:"
+        )
+        return SELL_AMOUNT
+    elif action == 'buypos':
+        await query.message.reply_text(
+            f"💰 Buying More {token['name']}\n\n"
+            f"Enter additional amount to buy (in SOL):"
+        )
+        return BUY_AMOUNT
+
+async def execute_transfer(user_id, recipient, token_contract, amount, chain):
+    """Execute a token transfer"""
+    if chain != 'solana':
+        logger.error(f"Transfer not supported for {chain} yet")
+        return False
+    logger.info(f"Transferring {amount} SOL worth of {token_contract} to {recipient} ({chain})")
+    return True
+
+async def notify_trial_ending(context: ContextTypes.DEFAULT_TYPE):
+    """Notify user when trial is about to end"""
+    user_id = context.job.user_id
     user = users_collection.find_one({'user_id': user_id})
     
-    job_count = 0
-    if context.job_queue:
-        job_count = len(context.job_queue.jobs())
-    
-    sub_status = "Not subscribed"
-    if user and user.get('subscription_status') == 'active':
-        expiry = user.get('subscription_expiry')
-        if isinstance(expiry, str):
-            expiry = datetime.fromisoformat(expiry)
-        if expiry > datetime.now():
-            sub_status = f"Active until {expiry}"
-    
-    last_check = "Never"
-    if user and 'last_token_check' in user:
-        last_check = datetime.fromtimestamp(user['last_token_check']).strftime('%Y-%m-%d %H:%M:%S')
-    
-    message = (
-        f"🐛 *Debug Information*\n\n"
-        f"🔹 User ID: {user_id}\n"
-        f"🔹 Subscription: {sub_status}\n"
-        f"🔹 Active jobs: {job_count}\n"
-        f"🔹 Last token check: {last_check}\n"
-        f"🔹 Posted tokens: {len(user.get('posted_tokens', [])) if user else 0}"
-    )
-    
-    await update.message.reply_text(message, parse_mode='Markdown')
-
-async def update_token_info(context: ContextTypes.DEFAULT_TYPE):
-    user_id = context.job.user_id
-    logger.info(f"⏰ Token update job started for user {user_id} at {datetime.now()}")
-    
-    try:
-        user = users_collection.find_one({'user_id': user_id})
-        if not user:
-            logger.info(f"User {user_id} not found in database")
-            return
-            
-        if not await check_subscription(user_id):
-            logger.info(f"User {user_id} subscription inactive")
-            return
+    if user and user.get('subscription_status') == 'trial':
+        expiry = datetime.fromisoformat(user['subscription_expiry'])
+        time_left = expiry - datetime.now()
         
-        if not user.get('solana') or not user['solana'].get('public_key'):
-            logger.info(f"User {user_id} has no wallet set up")
-            return
-
-        current_time = time.time()
-        if user.get('last_api_call', 0) > current_time - 1:
-            logger.debug("Skipping due to rate limit")
-            return
-
-        logger.info(f"🔍 Fetching tokens for user {user_id}")
-        tokens = await fetch_latest_token()
-        if not tokens:
-            logger.warning("No tokens fetched")
-            return
-            
-        posted_tokens = user.get('posted_tokens', [])
-        new_tokens = [t for t in tokens if t['contract_address'] not in posted_tokens]
-        
-        if new_tokens:
-            token = new_tokens[0]  # Take the most recent unseen token
-            logger.info(f"Processing token: {token['name']} ({token['contract_address']})")
-            
-            # Record token performance globally
-            await record_token_performance(token)
-
-            message = format_token_message(token)
-            is_suspicious = token['liquidity'] < 1000 or token['volume'] < 1000
-            warning = "⚠️ *LOW LIQUIDITY - Trade with caution!*\n" if is_suspicious else ""
-            
-            keyboard = [
-                [InlineKeyboardButton("💰 Buy", callback_data=f"buy_{token['contract_address']}"),
-                 InlineKeyboardButton("💸 Sell", callback_data=f"sell_{token['contract_address']}")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            try:
-                if token.get('image'):
-                    await context.bot.send_photo(
-                        chat_id=user_id,
-                        photo=token['image'],
-                        caption=warning + message,
-                        parse_mode='Markdown',
-                        reply_markup=reply_markup
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=warning + message,
-                        parse_mode='Markdown',
-                        reply_markup=reply_markup
-                    )
-            except Exception as e:
-                logger.error(f"Error sending token {token['contract_address']}: {str(e)}")
-                await context.bot.send_message(
-                    user_id,
-                    warning + message,
-                    parse_mode='Markdown',
-                    reply_markup=reply_markup
-                )
-            
-            # Add to user's posted tokens
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$addToSet': {'posted_tokens': token['contract_address']}}
+        if timedelta(hours=1) >= time_left > timedelta(0):
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⏳ Your free trial ends in about 1 hour!\n\n"
+                     f"To continue using the bot after your trial, use /subscribe"
             )
-            logger.info(f"Added token {token['contract_address']} to user {user_id}'s posted tokens")
-            
-            if user.get('trading_mode') == 'automatic':
-                # Call auto_trade with the specific token
-                await auto_trade(context, user_id, token)
-        
-    except Exception as e:
-        logger.error(f"🔥 Error in auto token update: {str(e)}", exc_info=True)
-    finally:
-        logger.info(f"🏁 Token update job completed for user {user_id}")
+            log_user_action(user_id, "TRIAL_ENDING_NOTIFICATION")
+
 async def cleanup_illiquid_positions(context: ContextTypes.DEFAULT_TYPE):
     """Remove illiquid positions from the portfolio"""
     user_id = context.job.user_id
@@ -5653,11 +5313,1392 @@ async def cleanup_illiquid_positions(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Failed to notify user {user_id} about cleanup: {str(e)}")
 
+
+async def evaluate_token_entry(token: Dict[str, Any], indicators: Dict[str, Any], user_settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate whether to enter a trade based on technical analysis"""
+    decision = {
+        'should_buy': False,
+        'reason': '',
+        'confidence': 0
+    }
+    
+    # Strategy 1: Strong momentum with volume confirmation
+    if (indicators['roc_5'] > 15 and  # 15%+ price increase in last 5 periods
+        indicators['positive_momentum'] and
+        token['volume'] > user_settings.get('min_volume', 1000) * 3):  # 3x minimum volume
+        
+        decision.update({
+            'should_buy': True,
+            'reason': "Strong momentum with volume confirmation",
+            'confidence': 80
+        })
+    
+    # Strategy 2: Oversold bounce with RSI recovery
+    elif (indicators['oversold'] and 
+          indicators['rsi'] > 35 and  # RSI recovering from oversold
+          indicators['roc_5'] > 5):   # Some positive momentum
+        
+        decision.update({
+            'should_buy': True,
+            'reason': "Oversold bounce with RSI recovery",
+            'confidence': 70
+        })
+    
+    # Strategy 3: Breakout above moving averages
+    elif (indicators['ma_crossover'] and 
+          indicators['sma_5'] > indicators['sma_15'] * 1.05 and  # 5% above 15-period SMA
+          token['volume'] > user_settings.get('min_volume', 1000) * 2):
+        
+        decision.update({
+            'should_buy': True,
+            'reason': "Breakout above moving averages with volume",
+            'confidence': 75
+        })
+    
+    else:
+        decision['reason'] = "Does not meet any entry criteria"
+    
+    return decision
+
+async def fetch_historical_data_multi_source(contract_address: str):
+    """Try multiple sources for historical data"""
+    sources = [
+        fetch_birdeye_historical,
+        fetch_dexscreener_historical,
+        fetch_geckoterminal_historical
+    ]
+    
+    for source in sources:
+        try:
+            data = await source(contract_address)
+            if data:
+                return data
+        except Exception as e:
+            logger.warning(f"Historical data source {source.__name__} failed: {str(e)}")
+            continue
+    
+    return []
+
+def assess_data_quality(historical_data: List[Dict]) -> Dict[str, Any]:
+    """Assess the quality and reliability of historical data"""
+    if not historical_data:
+        return {'quality': 'poor', 'data_points': 0}
+    
+    # Check data density (how many data points per hour)
+    time_range = (historical_data[-1]['timestamp'] - historical_data[0]['timestamp']).total_seconds() / 3600
+    data_density = len(historical_data) / max(1, time_range)
+    
+    # Check price volatility (reasonable ranges)
+    prices = [item['price'] for item in historical_data]
+    price_volatility = (max(prices) - min(prices)) / np.mean(prices) if prices else 0
+    
+    quality_score = min(100, data_density * 10 + (1 - min(price_volatility, 1)) * 50)
+    
+    return {
+        'quality': 'excellent' if quality_score > 80 else 'good' if quality_score > 60 else 'fair' if quality_score > 40 else 'poor',
+        'score': quality_score,
+        'data_points': len(historical_data),
+        'time_range_hours': time_range
+    }
+
+async def auto_trade(context: ContextTypes.DEFAULT_TYPE, user_id: int = None, token: Dict[str, Any] = None):
+    """Handle automatic trading with enhanced decision logging and historical data integration"""
+    logger.info(f"🤖 Auto-trading for user {user_id}")
+    
+    try:
+        # Get user_id from context if not provided
+        if user_id is None and context.job is not None:
+            user_id = context.job.user_id
+        
+        if user_id is None:
+            logger.error("No user_id provided for auto_trade")
+            return
+            
+        user = users_collection.find_one({'user_id': user_id})
+        if not user or not await check_subscription(user_id):
+            logger.info(f"User {user_id} not subscribed or not found")
+            return
+            
+        # Debug log user settings
+        logger.info(f"User {user_id} settings: {user.get('trading_mode')}, {user.get('auto_buy_amount')}")
+        
+        # Check cooldown
+        last_trade_time = user.get('last_trade_time', 0)
+        if time.time() - last_trade_time < AUTO_TRADE_COOLDOWN:
+            logger.debug(f"Auto-trade cooldown active for user {user_id}")
+            return
+        
+        # Check if token is blacklisted (if token provided)
+        if token and token.get('contract_address') in user.get('auto_trade_blacklist', []):
+            logger.info(f"Token {token.get('name', 'Unknown')} is blacklisted")
+            return
+        
+        user_max_positions = user.get('max_positions', MAX_POSITIONS)
+        # Check maximum open positions
+        portfolio = user.get('portfolio', {})
+        liquid_positions = 0
+    
+        for contract, position in portfolio.items():
+            # Check if the position has sufficient liquidity
+            token_data = await fetch_token_by_contract(contract)
+            if token_data and token_data.get('liquidity', 0) >= MIN_SAFE_LIQUIDITY:
+                liquid_positions += 1
+    
+        if liquid_positions >= user_max_positions:
+            logger.debug(f"Max liquid positions ({user_max_positions}) reached for user {user_id}")
+            return
+            
+        # Check circuit breaker (daily loss limit)
+        if await check_daily_loss_limit(user_id, user):
+            logger.debug(f"Daily loss limit reached for user {user_id}")
+            return
+        
+        # Get trading settings
+        trading_mode = user.get('trading_mode', 'manual')
+        buy_amount = user.get('auto_buy_amount', 0.01)
+        
+        # If a specific token was provided, use it
+        if token is not None:
+            # Skip if already in portfolio or blacklist
+            if (token.get('contract_address') in portfolio or 
+                token.get('contract_address') in user.get('auto_trade_blacklist', [])):
+                return
+                
+            # Validate token data
+            if token.get('price_usd') is None:
+                logger.warning(f"Skipping {token.get('name', 'Unknown')} - price is None")
+                return
+                
+            # Also validate other essential fields
+            required_fields = ['liquidity', 'volume', 'contract_address']
+            for field in required_fields:
+                if token.get(field) is None:
+                    logger.warning(f"Skipping {token.get('name', 'Unknown')} - {field} is None")
+                    return
+                
+            # Fetch fresh token data with historical data
+            fresh_token = await fetch_token_by_contract(token['contract_address'], include_history=True)
+            if not fresh_token:
+                return
+                
+            # Get performance data (should now include historical data)
+            token_performance = token_performance_collection.find_one(
+                {'contract_address': fresh_token['contract_address']}
+            )
+            
+            if not token_performance or 'performance_history' not in token_performance:
+                logger.info(f"Insufficient data for {fresh_token['name']} - skipping auto-trade")
+                return
+                
+            # Calculate technical indicators using the historical data
+            price_history = [entry['price'] for entry in token_performance['performance_history']]
+            indicators = calculate_technical_indicators(price_history)
+            
+            if not indicators:
+                logger.info(f"Not enough historical data for {fresh_token['name']} - skipping")
+                return
+                
+            # Enhanced entry criteria using immediate historical analysis
+            entry_decision = await evaluate_token_entry(fresh_token, indicators, user)
+            
+            if entry_decision['should_buy']:
+                await execute_auto_buy(context, user_id, fresh_token, buy_amount, entry_decision['reason'])
+            else:
+                logger.info(f"Auto-trade rejected: {entry_decision['reason']}")
+                
+        else:
+            # Original logic for scheduled trading
+            sol_balance = await check_balance(user_id, 'solana')
+            if sol_balance < buy_amount or len(portfolio) >= MAX_POSITIONS:
+                logger.debug(f"Insufficient SOL or max positions for auto-buy")
+                return
+                
+            tokens = await fetch_latest_token()
+            if not tokens:
+                return
+                
+            # Filter tokens using enhanced safety parameters
+            valid_tokens = []
+            for t in tokens:
+                if t.get('contract_address') in portfolio or t.get('contract_address') in user.get('auto_trade_blacklist', []):
+                    continue
+                    
+                is_safe, reason = await check_token_safety(t, user)
+                if is_safe:
+                    valid_tokens.append(t)
+            
+            if not valid_tokens:
+                return
+                
+            # Select the token with best risk/reward ratio
+            best_token = None
+            best_score = -99999
+            
+            for t in valid_tokens:
+                score = (t.get('liquidity', 0) / 10000) + (t.get('volume', 0) / 5000)
+                if 'price_change_5m' in t:
+                    score += t['price_change_5m'] * 100
+                    
+                if score > best_score:
+                    best_score = score
+                    best_token = t
+            
+            if best_token:
+                await execute_auto_buy(context, user_id, best_token, buy_amount)
+
+    except Exception as e:
+        logger.error(f"Auto-trade error for user {user_id}: {str(e)}")
+        await notify_user(
+            context, user_id,
+            f"❌ AUTOTRADE ERROR: {str(e)}",
+            "Auto-Trade System Failure"
+        )
+
+async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, trade_details: List[Dict], username: str) -> io.BytesIO:
+    """Generate a marketing-friendly PnL image with custom background"""
+    # Create figure with custom background
+    plt.figure(figsize=(10, 8))
+    
+    # Load custom background image (replace with your image path)
+    try:
+        bg_image = plt.imread('askjahback.png')
+        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
+    except:
+        # Fallback to dark background if custom image not found
+        plt.style.use('dark_background')
+    
+    plt.axis('off')
+    
+    # Calculate profit multiple
+    multiple = (overall_pnl_percent / 100) + 1
+    
+    # Get current date
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    
+    # Prepare text content
+    text_elements = [
+        ("TRADING PERFORMANCE SUMMARY", 20, "#FFFFFF", "bold"),
+        (f"Total Return: {overall_pnl_percent:+.1f}%", 18, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold"),
+        (f"Profit Multiple: {multiple:.2f}x", 16, "#FFFFFF", "normal"),
+        ("", 12, "#FFFFFF", "normal"),  # Spacer
+        ("TOP PERFORMING TRADES:", 16, "#FFFFFF", "bold")
+    ]
+    
+    # Add top 3 trades
+    top_trades = sorted(trade_details, key=lambda x: x['pnl_percent'], reverse=True)[:3]
+    for i, trade in enumerate(top_trades):
+        trade_color = "#00FF00" if trade['pnl_percent'] >= 0 else "#FF0000"
+        text_elements.append(
+            (f"{i+1}. {trade['symbol']}: {trade['pnl_percent']:+.1f}%", 
+             14, trade_color, "normal")
+        )
+    
+    # Add attribution
+    text_elements.extend([
+        ("", 12, "#FFFFFF", "normal"),  # Spacer
+        (f"Generated for @{username}", 12, "#CCCCCC", "italic"),
+        (f"Date: {current_date}", 12, "#CCCCCC", "italic")
+    ])
+    
+    # Add all text elements
+    y_position = 0.9
+    for text, size, color, weight in text_elements:
+        plt.text(0.5, y_position, text, 
+                ha='center', va='center', 
+                fontsize=size, color=color, 
+                weight=weight,
+                transform=plt.gca().transAxes)
+        y_position -= 0.07
+    
+    plt.tight_layout()
+    
+    # Save to bytes buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
+
+
+
+async def generate_pnl_image(trade_details: List[Dict], total_pnl: float, overall_pnl_percent: float) -> io.BytesIO:
+    """Generate a simple text-based performance image without graphs"""
+    # Create figure
+    plt.figure(figsize=(10, 8))
+    try:
+        bg_image = plt.imread('askjahback.png')
+        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
+    except:
+        # Fallback to dark background if custom image not found
+        plt.style.use('dark_background')
+    
+    plt.axis('off')
+    
+    multiple = (overall_pnl_percent / 100) + 1
+    
+    text_content = [
+        ("ASKJAH TRADING PERFORMANCE", 24, "#FFFFFF", "bold", "normal"),
+        (f"\nTOTAL RETURN: {overall_pnl_percent:+.1f}%", 28, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold", "normal"),
+        (f"\n{multiple:.1f}X YOUR CAPITAL", 22, "#00FF00" if overall_pnl_percent >= 0 else "#FF0000", "bold", "normal"),
+        (f"\n\nTOTAL P&L: ${total_pnl:+.2f}", 20, "#FFFFFF", "normal", "normal"),
+        ("\n\nTOP PERFORMERS:", 18, "#FFFFFF", "bold", "normal")
+    ]
+    
+    # Add top 3 performing trades
+    top_trades = sorted(trade_details, key=lambda x: x['pnl_percent'], reverse=True)[:3]
+    for i, trade in enumerate(top_trades):
+        trade_multiple = (trade['pnl_percent'] / 100) + 1
+        text_content.append(
+            (f"\n{i+1}. {trade['symbol']}: {trade['pnl_percent']:+.1f}% ({trade_multiple:.1f}X)", 
+             16, "#00FF00" if trade['pnl_percent'] >= 0 else "#FF0000", "normal", "normal")
+        )
+    
+    text_content.append(("\n\nTRADING MADE EASIER", 16, "#FFFFFF", "normal", "italic"))
+    text_content.append(("\n@ASKJAH_BOT", 14, "#CCCCCC", "normal", "normal"))
+    
+    # Add all text elements
+    y_position = 0.95
+    for text, size, color, weight, style in text_content:
+        plt.text(0.5, y_position, text, 
+                ha='center', va='top', 
+                fontsize=size, color=color, 
+                weight=weight,
+                fontstyle=style,
+                transform=plt.gca().transAxes)
+        y_position -= (size * 0.015)  # Adjust vertical spacing
+    
+    plt.tight_layout()
+    
+    # Save to bytes buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor='#000000')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
+
+# Add this function to generate a shareable PnL image
+async def generate_shareable_pnl_image(total_pnl: float, overall_pnl_percent: float, win_rate: float) -> io.BytesIO:
+    """Generate a marketing-friendly PnL image for sharing"""
+    # Create figure with attractive design
+    plt.figure(figsize=(8, 6))
+    try:
+        bg_image = plt.imread('askjahback.png')
+        plt.imshow(bg_image, extent=[0, 10, 0, 8], alpha=0.3)
+    except:
+        # Fallback to dark background if custom image not found
+        plt.style.use('dark_background')
+    
+    plt.axis('off')
+    
+    # Create a simple, attractive design
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#F9C80E']
+    
+    # Create donut chart for win rate
+    plt.subplot(1, 2, 1)
+    sizes = [win_rate, 100 - win_rate]
+    labels = ['Wins', 'Losses']
+    explode = (0.1, 0)
+    plt.pie(sizes, explode=explode, labels=labels, colors=colors[:2],
+            autopct='%1.1f%%', shadow=True, startangle=90)
+    plt.axis('equal')
+    plt.title('Win Rate')
+    
+    # Create summary section
+    plt.subplot(1, 2, 2)
+    plt.axis('off')
+    
+    # Determine sentiment emoji
+    if overall_pnl_percent >= 10:
+        emoji = "🚀"
+    elif overall_pnl_percent >= 0:
+        emoji = "👍"
+    else:
+        emoji = "📉"
+    
+    summary_text = (
+        f"{emoji} Daily Performance {emoji}\n\n"
+        f"Return: {overall_pnl_percent:+.1f}%\n"
+        f"P&L: ${total_pnl:+.2f}\n\n"
+        "Powered by @ASKJAH_BOT\n"
+        "Join: t.me/ASKJAH_BOT"
+    )
+    
+    plt.text(0.5, 0.5, summary_text, ha='center', va='center', 
+             fontsize=12, bbox=dict(boxstyle="round,pad=1", facecolor="#2C3E50", alpha=0.9))
+    
+    plt.tight_layout()
+    
+    # Save to bytes buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
+
+async def fix_incomplete_trade_records(user_id: int):
+    """Fix trade records that might be missing required fields"""
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        return
+    
+    updated = False
+    trade_history = user.get('trade_history', [])
+    
+    for i, trade in enumerate(trade_history):
+        # Ensure all trade records have both sell_price and profit_pct
+        if 'sell_price' not in trade and 'buy_price' in trade and 'amount' in trade:
+            # Try to get current price for the token
+            try:
+                token = await fetch_token_by_contract(trade.get('contract', ''))
+                if token:
+                    trade_history[i]['sell_price'] = token['price_usd']
+                    # Calculate profit percentage
+                    buy_price = trade['buy_price']
+                    profit_pct = ((token['price_usd'] - buy_price) / buy_price) * 100
+                    trade_history[i]['profit_pct'] = profit_pct
+                    updated = True
+            except Exception as e:
+                logger.error(f"Could not fix trade record for user {user_id}: {e}")
+    
+    if updated:
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'trade_history': trade_history}}
+        )
+        logger.info(f"Fixed incomplete trade records for user {user_id}")
+
+async def check_daily_loss_limit(user_id: int, user: Dict[str, Any]) -> bool:
+    """Check if daily loss limit has been exceeded with proper error handling"""
+    daily_loss_limit = user.get('daily_loss_limit', 0.05)  # Default 5%
+    
+    # Get today's trades
+    today = datetime.now().date()
+    today_trades = [
+        t for t in user.get('trade_history', []) 
+        if datetime.fromisoformat(t['timestamp']).date() == today
+    ]
+    
+
+    # Calculate today's P&L with proper error handling
+    daily_pnl = 0
+    for trade in today_trades:
+        try:
+            sell_price = trade.get('sell_price', 0) or 0
+            buy_price = trade.get('buy_price', 0) or 0
+            if 'profit_pct' in trade:
+                # RSI recovering from oversold
+                trade_value = trade['amount'] * trade['buy_price']
+                daily_pnl += trade_value * (trade['profit_pct'] / 100)
+            elif 'sell_price' in trade and 'buy_price' in trade:
+                # Fallback calculation
+                trade_profit = (sell_price - buy_price) * trade['amount']
+                daily_pnl += trade_profit
+            else:
+                logger.warning(f"Incomplete trade record for P&L calculation: {trade}")
+                continue
+        except KeyError as e:
+            logger.error(f"Missing field in trade record: {e}. Trade: {trade}")
+            continue
+    
+    # Calculate percentage of portfolio
+    sol_balance = await check_balance(user_id, 'solana')
+    portfolio_value = sol_balance
+    for contract, holding in user.get('portfolio', {}).items():
+        portfolio_value += holding['amount']
+    
+    if portfolio_value > 0:
+        loss_pct = abs(min(daily_pnl, 0)) / portfolio_value
+        if loss_pct >= daily_loss_limit:
+            # Try to notify the user (we don't have context here)
+            logger.warning(f"User {user_id} reached daily loss limit ({loss_pct*100:.1f}%)")
+            return True
+    
+    return False
+
+
+async def execute_auto_buy(context, user_id, token, buy_amount):
+    """Execute automatic buy with liquidity-aware position sizing"""
+    try:
+        # Get total capital for position sizing
+        sol_balance = await check_balance(user_id, 'solana')
+        user = users_collection.find_one({'user_id': user_id})
+        portfolio = user.get('portfolio', {})
+        
+        # Calculate total portfolio value
+        total_portfolio_value = sol_balance
+        for contract, holding in portfolio.items():
+            # Get current price for each holding
+            holding_token = await fetch_token_by_contract(contract)
+            if holding_token:
+                token_count = holding['amount'] / holding['buy_price']
+                current_value = token_count * holding_token['price_usd']
+                total_portfolio_value += current_value
+        
+        # Calculate maximum position size based on liquidity
+        liquidity_max = token['liquidity'] * 0.05 / 150  # 5% of liquidity converted to SOL
+        portfolio_max = total_portfolio_value * POSITION_SIZE_PERCENT
+        
+        # Use the smaller of the two limits
+        actual_buy_amount = min(buy_amount, liquidity_max, portfolio_max)
+        
+        if actual_buy_amount < 0.001:  # Minimum trade size
+            await notify_user(
+                context, user_id,
+                f"⏭️ Skipping {token['name']} - liquidity too low for any position",
+                "Auto-Buy Skipped"
+            )
+            return False
+        
+        # Check if we can actually execute this trade
+        is_feasible, reason = await check_trade_feasibility(token, actual_buy_amount)
+        if not is_feasible:
+            await notify_user(
+                context, user_id,
+                f"⏭️ Skipping {token['name']} - {reason}",
+                "Auto-Buy Skipped"
+            )
+            return False
+        
+        # Get technical indicators for better entry timing
+        token_performance = token_performance_collection.find_one(
+            {'contract_address': token['contract_address']}
+        )
+        
+        price_history = []
+        if token_performance and 'performance_history' in token_performance:
+            price_history = [entry['price'] for entry in token_performance['performance_history'][-20:]]  # Last 20 prices
+        
+        indicators = calculate_technical_indicators(price_history)
+        
+        # Enhanced entry criteria
+        good_entry = False
+        entry_reason = ""
+        
+        if indicators:
+            # Strategy 1: Oversold bounce
+            if indicators['oversold'] and indicators['rsi'] > 30 + 5:  # RSI moving up from oversold
+                good_entry = True
+                entry_reason = "Oversold bounce"
+            
+            # Strategy 2: Breakout with volume and momentum
+            elif (indicators['ma_crossover'] and indicators['positive_momentum'] and 
+                  token['volume'] > user.get('min_volume', 1000) * 2):  # Double minimum volume
+                good_entry = True
+                entry_reason = "Breakout with volume and momentum"
+            
+            # Strategy 3: Strong momentum continuation
+            elif (indicators['roc_5'] > 10 and indicators['sma_5'] > indicators['sma_15']):
+                good_entry = True
+                entry_reason = "Strong momentum continuation"
+        else:
+            # Fallback to basic criteria if no indicator data
+            if token['liquidity'] > user.get('min_liquidity', 5000) and token['volume'] > user.get('min_volume', 1000):
+                good_entry = True
+                entry_reason = "Basic criteria"
+        
+        if not good_entry:
+            await notify_user(
+                context, user_id,
+                f"⏭️ Skipping {token['name']} - does not meet entry criteria",
+                "Auto-Buy Skipped"
+            )
+            return False
+        
+        # Execute trade
+        success, message = await execute_trade(
+            user_id, 
+            token['contract_address'], 
+            actual_buy_amount, 
+            'buy', 
+            'solana',
+            token
+        )
+        
+        if success:
+            # Store additional trade metadata
+            trade_metadata = {
+                'name': token['name'],
+                'symbol': token['symbol'],
+                'amount': actual_buy_amount,
+                'buy_price': token['price_usd'],
+                'buy_time': datetime.now().isoformat(),
+                'entry_reason': entry_reason,
+                'indicators': indicators,
+                'stop_loss': token['price_usd'] * (1 - HARD_STOP_LOSS),  # Hard stop loss
+                'profit_targets': [
+                    {'percentage': 0.20, 'target_price': token['price_usd'] * 1.20, 'allocation': 0.4},
+                    {'percentage': 0.50, 'target_price': token['price_usd'] * 1.50, 'allocation': 0.3},
+                    {'percentage': 1.00, 'target_price': token['price_usd'] * 2.00, 'allocation': 0.3}
+                ],
+                'trailing_stop': TRAILING_STOP_PERCENT,
+                'time_entry': time.time(),
+                'buy_time_liquidity': token['liquidity']  # Store liquidity at time of purchase
+            }
+            
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {
+                    f'portfolio.{token["contract_address"]}': trade_metadata,
+                    'last_trade_time': time.time()
+                }}
+            )
+            
+            await notify_user(
+                context, user_id,
+                f"🤖 AUTOBUY: {message}\nEntry: {entry_reason}\nSize: {actual_buy_amount:.4f} SOL ({POSITION_SIZE_PERCENT*100}% of portfolio)",
+                "Auto-Buy Executed"
+            )
+            return True
+        else:
+            # Add to blacklist if trade fails
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'auto_trade_blacklist': token['contract_address']}}
+            )
+            await notify_user(
+                context, user_id,
+                f"❌ AUTOBUY FAILED: {message}",
+                "Auto-Buy Failed"
+            )
+            return False
+            
+    except Exception as e:
+        logger.error(f"Auto-buy execution error: {str(e)}")
+        await notify_user(
+            context, user_id,
+            f"❌ AUTOBUY ERROR: {str(e)}",
+            "Auto-Buy Error"
+        )
+        return False
+
+
+async def generate_auto_trade_report(user_id: int, token: Dict[str, Any], decision_data: Dict[str, Any]):
+    """Generate a detailed report on why a token was/wasn't auto-traded"""
+    report = f"🤖 AUTO-TRADE DECISION REPORT\n\n"
+    report += f"Token: {token['name']} ({token['symbol']})\n"
+    report += f"Contract: {token['contract_address'][:8]}...\n"
+    report += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    
+    report += "📊 TOKEN METRICS:\n"
+    report += f"• Price: ${token['price_usd']:.8f}\n"
+    report += f"• Liquidity: ${token['liquidity']:,.2f}\n"
+    report += f"• Volume: ${token['volume']:,.2f}\n"
+    report += f"• Market Cap: ${token.get('market_cap', 0):,.2f}\n\n"
+    
+    report += "⚙️ USER SETTINGS:\n"
+    user = users_collection.find_one({'user_id': user_id})
+    if user:
+        report += f"• Min Liquidity: ${user.get('min_liquidity', 1000):,.2f}\n"
+        report += f"• Min Volume: ${user.get('min_volume', 500):,.2f}\n"
+        report += f"• Max Positions: {user.get('max_positions', 5)}\n"
+        report += f"• Position Size: {user.get('position_size_percent', 5)}%\n\n"
+    
+    report += "🔍 DECISION ANALYSIS:\n"
+    for check_name, check_result in decision_data.items():
+        status = "✅ PASS" if check_result['passed'] else "❌ FAIL"
+        report += f"• {check_name}: {status}\n"
+        if not check_result['passed']:
+            report += f"  Reason: {check_result['reason']}\n"
+    
+    # Add overall decision
+    all_passed = all(check['passed'] for check in decision_data.values())
+    final_decision = "APPROVED" if all_passed else "REJECTED"
+    report += f"\n🎯 FINAL DECISION: {final_decision}"
+    
+    return report
+    
+async def emergency_sell_protocol(context, user_id, token, token_data):
+    """
+    Try to sell tokens that have become illiquid using aggressive parameters
+    """
+    contract_address = token['contract_address']
+    
+    # Try with extremely high slippage
+    user = users_collection.find_one({'user_id': user_id})
+    original_slippage = user.get('max_slippage', 5)
+    users_collection.update_one(
+        {'user_id': user_id},
+        {'$set': {'emergency_sell_mode': True, 'max_slippage': 50}}  # 50% slippage!
+    )
+    
+    try:
+        # Calculate token amount
+        token_amount = token_data['amount'] / token_data['buy_price']
+        
+        # Try to sell with aggressive settings
+        success, message = await execute_trade(
+            user_id, contract_address, token_amount, 'sell', 'solana', token
+        )
+        
+        if success:
+            await notify_user(
+                context, user_id,
+                f"🚨 EMERGENCY SELL: {message}",
+                "Emergency Sell Executed"
+            )
+            return True
+        else:
+            # Mark token as unsellable
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$addToSet': {'unsellable_tokens': contract_address}}
+            )
+            await notify_user(
+                context, user_id,
+                f"💀 Token {token['name']} appears completely illiquid and cannot be sold.",
+                "Token Possibly Rugged"
+            )
+            return False
+            
+    finally:
+        # Restore original settings
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'max_slippage': original_slippage}, '$unset': {'emergency_sell_mode': True}}
+        )
+
+async def execute_auto_sell(context, user_id, token, token_data, reason):
+    """Execute automatic sell with emergency fallback"""
+    try:
+        current_price = token.get('price_usd')
+        if current_price is None:
+            logger.error(f"Current price is None for token {token['name']}")
+            return False
+
+        buy_price = token_data.get('buy_price')
+        if buy_price is None:
+            logger.error(f"Buy price is None for token {token['name']}")
+            return False
+        
+       
+        price_change_pct = (current_price - buy_price) / buy_price
+        
+        # Check if we should take partial profits
+        take_profit = False
+        sell_reason = reason
+        sell_percentage = 1.0  # Default to 100%
+        
+        # Check profit targets
+        if 'profit_targets' in token_data:
+            for target in token_data['profit_targets']:
+                if current_price >= target['target_price'] and not token_data.get(f'target_{target["percentage"]}_hit', False):
+                    take_profit = True
+                    sell_percentage = target['allocation']
+                    sell_reason = f"{target['percentage']*100}% profit target hit"
+                    # Mark this target as hit
+                    users_collection.update_one(
+                        {'user_id': user_id},
+                        {'$set': {f'portfolio.{token["contract_address"]}.target_{target["percentage"]}_hit': True}}
+                    )
+                    break
+        
+        # Implement trailing stop loss
+        if not take_profit and 'trailing_stop' in token_data:
+            highest_price = token_data.get('highest_price', buy_price)
+            if current_price > highest_price:
+                # Update highest price
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {f'portfolio.{token["contract_address"]}.highest_price': current_price}}
+                )
+            else:
+                # Check if current price has dropped by trailing stop percentage from highest
+                trailing_stop_price = highest_price * (1 - token_data['trailing_stop'])
+                if current_price <= trailing_stop_price:
+                    take_profit = True
+                    sell_reason = f"Trailing stop loss triggered ({token_data['trailing_stop']*100}%)"
+        
+        # Check time-based exit (60 minutes)
+        if not take_profit and 'time_entry' in token_data:
+            time_held = time.time() - token_data['time_entry']
+            if time_held > 3600:  # 60 minutes
+                take_profit = True
+                sell_percentage = 1.0
+                sell_reason = "Time-based exit (60 minutes)"
+        
+        # If not taking profit, check regular stop loss
+        if not take_profit and current_price <= token_data.get('stop_loss', buy_price * (1 - HARD_STOP_LOSS)):
+            take_profit = True
+            sell_reason = f"Stop loss triggered ({((buy_price - current_price)/buy_price)*100:.1f}% loss)"
+        
+        # If none of the conditions are met, don't sell
+        if not take_profit:
+            return False
+        
+        # Calculate token amount to sell
+        token_amount = (token_data['amount'] / token_data['buy_price']) * sell_percentage
+        
+        # Execute trade
+        success, message = await execute_trade(
+            user_id, 
+            token['contract_address'], 
+            token_amount, 
+            'sell', 
+            'solana',
+            token
+        )
+        
+        if success:
+            # Update portfolio
+            remaining_amount = token_data['amount'] * (1 - sell_percentage)
+            
+            if remaining_amount <= 0.001:  # Dust amount, close position
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$unset': {f'portfolio.{token["contract_address"]}': ""}}
+                )
+            else:
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$set': {f'portfolio.{token["contract_address"]}.amount': remaining_amount}}
+                )
+            
+            # Record trade history
+            trade_data = {
+                'token': token['name'],
+                'symbol': token['symbol'],
+                'contract': token['contract_address'],
+                'amount': token_data['amount'] * sell_percentage,
+                'buy_price': token_data['buy_price'],
+                'sell_price': current_price,
+                'reason': sell_reason,
+                'timestamp': datetime.now().isoformat(),
+                'profit_pct': price_change_pct * 100
+            }
+            
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$push': {'trade_history': trade_data}}
+            )
+            
+            # Update last trade time
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {'last_trade_time': time.time()}}
+            )
+            
+            await notify_user(
+                context, user_id,
+                f"🤖 AUTOSELL: {message}\nReason: {sell_reason}\nProfit: {price_change_pct*100:.2f}%",
+                "Auto-Sell Executed"
+            )
+            return True
+        else:
+            # Check if this might be a liquidity issue and try emergency protocol
+            if "6025" in message or "liquidity" in message.lower() or "slippage" in message.lower():
+                return await emergency_sell_protocol(context, user_id, token, token_data)
+            else:
+                await notify_user(
+                    context, user_id,
+                    f"❌ AUTOSELL FAILED: {message}",
+                    "Auto-Sell Failed"
+                )
+                return False
+            
+    except Exception as e:
+        logger.error(f"Auto-sell execution error: {str(e)}")
+        
+        # Check if this might be a liquidity issue
+        if "6025" in str(e) or "liquidity" in str(e).lower():
+            return await emergency_sell_protocol(context, user_id, token, token_data)
+        else:
+            await notify_user(
+                context, user_id,
+                f"❌ AUTOSELL ERROR: {str(e)}",
+                "Auto-Sell Error"
+            )
+            return False
+
+async def monitor_portfolio_liquidity(context: ContextTypes.DEFAULT_TYPE):
+    """Monitor liquidity of tokens in portfolio and alert if deteriorating"""
+    logger.info("🔍 Monitoring portfolio liquidity...")
+    
+    active_users = users_collection.find({
+        "subscription_status": "active",
+        "subscription_expiry": {"$gt": datetime.now().isoformat()}
+    })
+    
+    for user in active_users:
+        user_id = user['user_id']
+        portfolio = user.get('portfolio', {})
+        
+        for contract, token_data in portfolio.items():
+            token = await fetch_token_by_contract(contract)
+            if not token:
+                continue
+                
+            # Check if liquidity has dropped significantly
+            if (token_data.get('buy_time_liquidity', 0) > 0 and 
+                token['liquidity'] < token_data['buy_time_liquidity'] * 0.5):
+                
+                await notify_user(
+                    context, user_id,
+                    f"⚠️ Liquidity Alert: {token_data['name']}\n"
+                    f"Liquidity dropped from ${token_data['buy_time_liquidity']:,.2f} "
+                    f"to ${token['liquidity']:,.2f} (-{((1 - token['liquidity']/token_data['buy_time_liquidity'])*100):.1f}%)",
+                    "Liquidity Warning"
+                )
+                
+                # Suggest selling if liquidity is critically low
+                if token['liquidity'] < 1000:
+                    await notify_user(
+                        context, user_id,
+                        f"🚨 CRITICAL: {token_data['name']} liquidity is now only ${token['liquidity']:,.2f}. "
+                        f"Consider emergency sell with /emergency_sell {contract}",
+                        "Critical Liquidity Alert"
+                    )
+
+async def daily_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Calculate and display daily profit/loss with image"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "DAILY_PNL_REQUEST")
+    
+    if not await check_subscription(user_id):
+        await update.message.reply_text("🔒 You need an active subscription to use this feature. Use /subscribe.")
+        return
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        await update.message.reply_text("🚫 No user data found.")
+        return
+        
+    # Get today's date
+    today = datetime.now().date()
+    today_start = datetime.combine(today, datetime.min.time())
+    today_end = datetime.combine(today, datetime.max.time())
+    
+    # Filter trades from today
+    trade_history = user.get('trade_history', [])
+    today_trades = [
+        trade for trade in trade_history 
+        if today_start <= datetime.fromisoformat(trade['timestamp']) <= today_end
+    ]
+    
+    if not today_trades:
+        await update.message.reply_text("📊 No trades executed today.")
+        return
+    
+    # Calculate P&L
+    total_pnl = 0
+    winning_trades = 0
+    losing_trades = 0
+    trade_details = []
+    
+    for trade in today_trades:
+        if 'buy_price' in trade and 'sell_price' in trade:
+            investment = trade['amount'] * trade['buy_price']
+            returns = trade['amount'] * trade['sell_price']
+            pnl = returns - investment
+            pnl_percent = (pnl / investment) * 100 if investment > 0 else 0
+            
+            total_pnl += pnl
+            
+            if pnl > 0:
+                winning_trades += 1
+            elif pnl < 0:
+                losing_trades += 1
+                
+            trade_details.append({
+                'symbol': trade.get('symbol', 'UNKNOWN'),
+                'pnl': pnl,
+                'pnl_percent': pnl_percent,
+                'status': 'CLOSED'
+            })
+        elif 'buy_price' in trade:
+            # Handle open positions
+            current_price = await get_current_price(trade.get('contract', ''))
+            if current_price:
+                investment = trade['amount'] * trade['buy_price']
+                current_value = trade['amount'] * current_price
+                pnl = current_value - investment
+                pnl_percent = (pnl / investment) * 100 if investment > 0 else 0
+                
+                trade_details.append({
+                    'symbol': trade.get('symbol', 'UNKNOWN'),
+                    'pnl': pnl,
+                    'pnl_percent': pnl_percent,
+                    'status': 'OPEN'
+                })
+    
+    # Calculate overall metrics
+    total_investment = sum(trade['amount'] * trade['buy_price'] for trade in today_trades if 'buy_price' in trade)
+    overall_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
+    win_rate = (winning_trades / len(today_trades)) * 100 if today_trades else 0
+    
+    # Generate detailed image
+    pnl_image = await generate_pnl_image(trade_details, total_pnl, overall_pnl_percent)
+    
+    # Generate shareable image
+    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate)
+    
+    # Send detailed image to user
+    await update.message.reply_photo(
+        photo=pnl_image,
+        caption=f"📊 Your Daily P&L Report - {today.strftime('%Y-%m-%d')}"
+    )
+    
+    # Send shareable image with sharing instructions
+    await update.message.reply_photo(
+        photo=shareable_image,
+        caption=(
+            "🎉 Share your success with others!\n\n"
+            "This image is designed for sharing on social media. "
+            "It shows your overall performance without revealing sensitive details.\n\n"
+            "Tip: You can forward this image to friends or post it in groups to show off your trading skills!"
+        )
+    )
+    
+    # Also send text summary
+    report = f"📊 *Daily P&L Report - {today.strftime('%Y-%m-%d')}*\n\n"
+    report += f"• Total P&L: ${total_pnl:+.2f}\n"
+    report += f"• Return: {overall_pnl_percent:+.2f}%\n"
+    report += f"• Winning Trades: {winning_trades}\n"
+    report += f"• Losing Trades: {losing_trades}\n"
+    report += f"• Win Rate: {win_rate:.1f}%\n\n"
+    
+    if total_pnl > 0:
+        report += "🎉 Great job! You're in profit today!"
+    elif total_pnl < 0:
+        report += "📉 You're down today. Review your strategy."
+    else:
+        report += "➖ Break-even day. No gains, no losses."
+    
+    await update.message.reply_text(report, parse_mode='Markdown')
+
+
+
+async def share_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Share a marketing-friendly PnL image"""
+    user_id = update.effective_user.id
+    log_user_action(user_id, "SHARE_PNL_REQUEST")
+    
+    # Calculate today's P&L (similar to daily_pnl)
+    today = datetime.now().date()
+    today_start = datetime.combine(today, datetime.min.time())
+    today_end = datetime.combine(today, datetime.max.time())
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user:
+        await update.message.reply_text("🚫 No user data found.")
+        return
+        
+    trade_history = user.get('trade_history', [])
+    today_trades = [
+        trade for trade in trade_history 
+        if today_start <= datetime.fromisoformat(trade['timestamp']) <= today_end
+    ]
+    
+    if not today_trades:
+        await update.message.reply_text("📊 No trades executed today. Nothing to share!")
+        return
+    
+    # Calculate total P&L and win rate
+    total_pnl = 0
+    winning_trades = 0
+    
+    for trade in today_trades:
+        if 'buy_price' in trade and 'sell_price' in trade:
+            investment = trade['amount'] * trade['buy_price']
+            returns = trade['amount'] * trade['sell_price']
+            pnl = returns - investment
+            total_pnl += pnl
+            
+            if pnl > 0:
+                winning_trades += 1
+    
+    win_rate = (winning_trades / len(today_trades)) * 100 if today_trades else 0
+    total_investment = sum(trade['amount'] * trade['buy_price'] for trade in today_trades if 'buy_price' in trade)
+    overall_pnl_percent = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
+    
+    # Generate shareable image
+    shareable_image = await generate_shareable_pnl_image(total_pnl, overall_pnl_percent, win_rate)
+    
+    # Send image with sharing encouragement
+    await update.message.reply_photo(
+        photo=shareable_image,
+        caption=(
+            "🚀 Share your trading success!\n\n"
+            "Show others what's possible with our AI-powered trading bot. "
+            "This image highlights your performance without revealing sensitive details.\n\n"
+            "Pro Tip: Post this in crypto groups with a caption like:\n"
+            "'Another profitable day with the AI Trading Bot! 🚀'\n\n"
+            "Want to try it yourself? Join: t.me/yourbottoken"
+        )
+    )
+
+
+async def get_current_price(contract_address: str) -> Optional[float]:
+    """Get current price for a token"""
+    try:
+        token = await fetch_token_by_contract(contract_address)
+        return token['price_usd'] if token else None
+    except:
+        return None
+
+async def emergency_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual emergency sell command for illiquid tokens"""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text("Please specify a token contract address: /emergency_sell <contract>")
+        return
+        
+    contract_address = context.args[0]
+    
+    user = users_collection.find_one({'user_id': user_id})
+    if not user or contract_address not in user.get('portfolio', {}):
+        await update.message.reply_text("You don't hold this token in your portfolio.")
+        return
+        
+    token_data = user['portfolio'][contract_address]
+    token = await fetch_token_by_contract(contract_address)
+    
+    if not token:
+        await update.message.reply_text("Could not fetch token data.")
+        return
+        
+    await update.message.reply_text(f"🚨 Attempting emergency sell of {token_data['name']}...")
+    
+    success = await emergency_sell_protocol(context, user_id, token, token_data)
+    
+    if success:
+        await update.message.reply_text("Emergency sell completed!")
+    else:
+        await update.message.reply_text("Emergency sell failed. Token may be completely illiquid.")                    
+    
+async def is_legitimate_token(token: Dict[str, Any]) -> bool:
+    """Check if a token appears to be legitimate"""
+    try:
+        # Check for common scam patterns
+        if token['liquidity'] < 1000:  # Very low liquidity
+            return False
+            
+        if token.get('holders', 0) < 50:  # Very few holders
+            return False
+            
+        # Check if creator burned LP tokens (not a perfect check but helpful)
+        # This would require additional on-chain analysis
+        
+        return True
+    except:
+        return False
+
+
+def calculate_technical_indicators(price_history: List[float]) -> Dict[str, Any]:
+    """
+    Calculate technical indicators using pure Python.
+    Returns an empty dict if not enough data is available.
+    """
+
+    
+    if len(price_history) < 15:  # Need at least 15 periods for meaningful indicators
+        return {}
+
+        
+    
+    try:
+
+        if not all(isinstance(price, (int, float)) for price in price_history):
+         logger.error("Invalid price values in history")
+         return {}
+        # Simple Moving Averages
+        sma_5 = sum(price_history[-5:]) / 5
+        sma_15 = sum(price_history[-15:]) / 15
+        
+        # Calculate RSI
+        gains = []
+        losses = []
+
+       
+        
+        for i in range(1, len(price_history)):
+            change = price_history[i] - price_history[i-1]
+            if change > 0:
+                gains.append(change)
+                losses.append(0)
+            else:
+                gains.append(0)
+                losses.append(abs(change))
+        
+        # Average gains and losses for RSI
+        if len(gains) >= 14:
+            avg_gain = sum(gains[-14:]) / 14
+            avg_loss = sum(losses[-14:]) / 14
+        else:
+            avg_gain = sum(gains) / len(gains) if gains else 0
+            avg_loss = sum(losses) / len(losses) if losses else 0
+        
+        # Calculate RSI
+        if avg_loss == 0:
+            rsi = 100  # Avoid division by zero
+        else:
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+        
+        # Calculate Rate of Change (ROC) as a momentum indicator
+        roc = ((price_history[-1] - price_history[-5]) / price_history[-5]) * 100 if len(price_history) >= 5 else 0
+        logger.info(f"RSI: {rsi}, SMA5: {sma_5}, SMA15: {sma_15}")
+        return {
+            'rsi': rsi,
+            'sma_5': sma_5,
+            'sma_15': sma_15,
+            'roc_5': roc,
+            'ma_crossover': sma_5 > sma_15,
+            'oversold': rsi < 30,  # RSI_OVERSOLD
+            'overbought': rsi > 70,  # RSI_OVERBOUGHT
+            'positive_momentum': roc > 5,  # 5% price increase in 5 periods
+        }
+
+         
+    except Exception as e:
+        logger.error(f"Error calculating indicators: {str(e)}")
+        return {}
+    
+async def check_token_safety(token: Dict[str, Any], user_settings: Dict[str, Any]) -> Tuple[bool, str]:
+    """Comprehensive token safety check with virtual liquidity detection"""
+    reasons = []
+    
+    # Check for virtual liquidity first and foremost
+    is_virtual, virtual_reason = await is_virtual_liquidity_token(token, user_settings)
+    if is_virtual:
+        reasons.append(virtual_reason)
+    
+    # User-Configurable Safety Limits
+    min_liquidity = user_settings.get('min_liquidity', MIN_SAFE_LIQUIDITY)
+    if token['liquidity'] < min_liquidity:
+        reasons.append(f"Liquidity (${token['liquidity']:,.2f}) < ${min_liquidity:,.2f}")
+
+    min_volume = user_settings.get('min_volume', MIN_SAFE_VOLUME)
+    if token['volume'] < min_volume:
+        reasons.append(f"Volume (${token['volume']:,.2f}) < ${min_volume:,.2f}")
+
+    # Liquidity sustainability check
+    if 'market_cap' in token and token['market_cap'] > 0:
+        liquidity_ratio = token['liquidity'] / token['market_cap']
+        if liquidity_ratio < 0.1:  # Less than 10% of MCap as liquidity
+            reasons.append(f"Low liquidity ratio ({liquidity_ratio:.2f} < 0.1)")
+    
+    # Check if liquidity is declining rapidly
+    if 'liquidity_change_24h' in token and token['liquidity_change_24h'] < -0.5:
+        reasons.append(f"Liquidity dropping rapidly ({token['liquidity_change_24h']*100:.1f}%)")
+
+    if reasons:
+        return False, " | ".join(reasons)
+    return True, "Passed all safety checks"
+
+async def fetch_holder_info(contract_address: str) -> Optional[Dict[str, Any]]:
+    """Fetches token holder information from Moralis."""
+    moralis_api_key = os.getenv('MORALIS_API_KEY')
+    if not moralis_api_key:
+        logger.warning("MORALIS_API_KEY not set. Skipping holder check.")
+        return None
+
+    url = f"https://deep-index.moralis.io/api/v2.2/erc20/{contract_address}/holders?chain=solana&limit=10"
+    headers = {"X-API-Key": moralis_api_key}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                total_holders = data.get('total', 0)
+                top_holder = data['result'][0]['balance'] if data['result'] else 0
+                total_supply = 1  # You would need to get this from elsewhere
+                top_holder_percent = (top_holder / total_supply) * 100 if total_supply > 0 else 0
+
+                return {
+                    'holders': total_holders,
+                    'top_holder_percent': top_holder_percent
+                }
+    except Exception as e:
+        logger.error(f"Failed to fetch holder info from Moralis: {str(e)}")
+    return None
+
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View and update auto-trading settings"""
+    user_id = update.effective_user.id
+    user = users_collection.find_one({'user_id': user_id})
+    
+    if not user:
+        await update.message.reply_text("❌ No user data found.")
+        return
+    
+    if context.args:
+        # Update settings if arguments provided
+        try:
+            new_max_positions = int(context.args[0])
+            if new_max_positions < 1 or new_max_positions > 20:
+                await update.message.reply_text("❌ Maximum positions should be between 1 and 20.")
+                return
+                
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {'max_positions': new_max_positions}}
+            )
+            await update.message.reply_text(f"✅ Maximum positions updated to {new_max_positions}.")
+        except ValueError:
+            await update.message.reply_text("❌ Please provide a valid number.")
+    else:
+        # Show current settings
+        current_max = user.get('max_positions', MAX_POSITIONS)
+        await update.message.reply_text(
+            f"Current maximum positions: {current_max}\n\n"
+            f"To change, use: /settings <number>\n"
+            f"Example: /settings 7"
+        )
+
+async def jupiter_api_call(url, params=None, json_data=None, method="GET"):
+    """Helper function for Jupiter API calls with retry logic"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                if method == "GET":
+                    response = await client.get(url, params=params)
+                else:
+                    response = await client.post(url, json=json_data)
+                
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 429:
+                    # Rate limited, wait and retry
+                    wait_time = (attempt + 1) * 2
+                    logger.warning(f"Rate limited, waiting {wait_time}s before retry")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Jupiter API error: {response.status_code} - {response.text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Jupiter API call failed (attempt {attempt + 1}): {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)
+    
+    return None
+
+    
+async def notify_user(context, user_id, message, action):
+    """Notify user about auto-trade activity with logging"""
+    try:
+        await context.bot.send_message(chat_id=user_id, text=message)
+        log_user_action(user_id, action, message)
+    except Exception as e:
+        logger.error(f"Failed to notify user {user_id}: {str(e)}")
+
+
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel current operation"""
     user_id = update.effective_user.id
     log_user_action(user_id, "OPERATION_CANCELLED")
     context.user_data[f'conversation_state_{user_id}'] = None
     
+    # Remove any timeout check jobs
     for job in context.job_queue.jobs():
         if job.name == f"timeout_check_{user_id}":
             job.schedule_removal()
@@ -5670,6 +6711,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors in the bot"""
     logger.error(f"Update {update} caused error {context.error}", exc_info=True)
     
     if update and update.message:
@@ -5687,61 +6729,243 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Failed to send error message: {str(e)}")
 
 def setup_handlers(application: Application):
+    """Set up all conversation handlers and command handlers"""
+    def wrap_conversation_entry(entry_handler):
+        """Wrapper for conversation entry points to handle state management"""
+        async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+            user_id = update.effective_user.id
+            context.user_data[f'conversation_state_{user_id}'] = entry_handler.__name__
+            context.user_data[f'last_activity_{user_id}'] = datetime.now()
+            
+            # Pause any token update jobs during conversation
+            for job in context.job_queue.jobs():
+                if job.name == f"token_updates_{user_id}":
+                    job.schedule_removal()
+                    logger.debug(f"Paused token_updates_{user_id} due to conversation entry")
+            
+            # Set up timeout check
+            context.job_queue.run_repeating(
+                check_conversation_timeout,
+                interval=10,
+                first=10,
+                user_id=user_id,
+                name=f"timeout_check_{user_id}",
+                data={'last_activity': datetime.now()}
+            )
+            return await entry_handler(update, context)
+        return wrapped
+
+    def wrap_conversation_state(state_handler):
+        """Wrapper for conversation states to handle activity tracking"""
+        async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+            user_id = update.effective_user.id
+            context.user_data[f'last_activity_{user_id}'] = datetime.now()
+            
+            # Update last activity in timeout check job
+            for job in context.job_queue.jobs():
+                if job.name == f"timeout_check_{user_id}":
+                    job.data['last_activity'] = datetime.now()
+            
+            result = await state_handler(update, context)
+            if result == ConversationHandler.END:
+                context.user_data[f'conversation_state_{user_id}'] = None
+                
+                # Clean up timeout check job
+                for job in context.job_queue.jobs():
+                    if job.name == f"timeout_check_{user_id}":
+                        job.schedule_removal()
+                        logger.debug(f"Removed timeout_check_{user_id} after conversation end")
+                
+                # Restart token updates if subscribed
+                if await check_subscription(user_id):
+                    await start_token_updates(context, user_id)
+            return result
+        return wrapped
+
+    # Add basic command handlers
     
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("subscribe", subscribe))
-    application.add_handler(CommandHandler("token_analysis", token_analysis))
-    application.add_handler(CommandHandler("daily_pnl", daily_pnl))
-    application.add_handler(CommandHandler("mypositions", mypositions))
-    application.add_handler(CommandHandler("share_pnl", share_pnl))
-    application.add_handler(CommandHandler("generate_wallet", generate_wallet))
-    application.add_handler(CommandHandler("set_wallet", set_wallet))
+    application.add_handler(CommandHandler("job_status", job_status))
     application.add_handler(CommandHandler("fetch_tokens", fetch_tokens_manual))
-    application.add_handler(CommandHandler("cleanup", cleanup_zero_balance))
-    application.add_handler(CommandHandler("remove_illiquid", remove_illiquid))
     application.add_handler(CommandHandler("force_fetch", force_token_fetch))
-    application.add_handler(CommandHandler("settings", settings))
-    application.add_handler(CommandHandler("reset_tokens", reset_tokens))
-    application.add_handler(CommandHandler("setmode", set_mode))
-    application.add_handler(CommandHandler("trade", trade))
-    application.add_handler(CommandHandler("balance", balance))
-    application.add_handler(CommandHandler("transfer", start_transfer))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CommandHandler("emergency_sell", emergency_sell))
     application.add_handler(CommandHandler("trade_status", trade_status))
+    application.add_handler(CommandHandler("emergency_sell", emergency_sell))
+    application.add_handler(CommandHandler("daily_pnl", daily_pnl))
+    application.add_handler(CommandHandler("share_pnl", share_pnl))
+    application.add_handler(CommandHandler("mypositions", mypositions))
+    application.add_handler(CommandHandler("settings", settings))
+    application.add_handler(CallbackQueryHandler(handle_remove_position, pattern='^remove_'))
+    application.add_handler(CallbackQueryHandler(handle_remove_position, pattern='^remove_'))
+    application.add_handler(CallbackQueryHandler(handle_remove_confirmation, pattern='^(confirm_remove|cancel_remove)_'))
+    application.add_handler(CommandHandler("remove_illiquid", remove_illiquid))
+    application.add_handler(CommandHandler("cleanup", cleanup_zero_balance))
+    # Add position actions handler
+    application.add_handler(CallbackQueryHandler(handle_position_actions, pattern='^(sellpos|buypos)_'))
+    #application.add_handler(CallbackQueryHandler(handle_token_button, pattern='^(buy|sell)_'))
+    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(CommandHandler("reset_tokens", reset_tokens))
     application.add_handler(CommandHandler("debug", debug))
-    
-    application.add_handler(CallbackQueryHandler(handle_all_buttons))
-    
     application.add_error_handler(error_handler)
-    
-    conv_handlers = [
-        ConversationHandler(
-            entry_points=[CommandHandler("subscribe", subscribe)],
-            states={
-                SUBSCRIPTION_CONFIRMATION: [
-                    CallbackQueryHandler(confirm_subscription, pattern='^(confirm_subscription|cancel_subscription)$')
-                ]
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-            per_message=False
-        ),
-        ConversationHandler(
-            entry_points=[CommandHandler("token_analysis", token_analysis)],
-            states={
-                INPUT_ANALYSIS_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, analysis_contract)]
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-            per_message=False
-        ),
-    ]
-    
-    for handler in conv_handlers:
-        application.add_handler(handler)
+
+    # Start command handler
+    start_handler = ConversationHandler(
+    entry_points=[CommandHandler("start", wrap_conversation_entry(start))],
+    states={
+        WALLET_SETUP_CHOICE: [CallbackQueryHandler(wrap_conversation_state(handle_wallet_choice), 
+                             pattern='^(generate_wallet|import_wallet)$')],
+        
+        # New states for import flow in start conversation
+        START_IMPORT_METHOD: [CallbackQueryHandler(wrap_conversation_state(start_import_method), 
+                             pattern='^(mnemonic|private_key|cancel_import)$')],
+        START_INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                            wrap_conversation_state(start_input_mnemonic))],
+        START_INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                              wrap_conversation_state(start_input_private_key))]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False
+)
+    application.add_handler(start_handler)
+
+    subscription_handler = ConversationHandler(
+    entry_points=[CommandHandler("subscribe", subscribe)],
+    states={
+        SUBSCRIPTION_CONFIRMATION: [
+            CallbackQueryHandler(confirm_subscription, pattern='^(confirm_subscription|cancel_subscription)$')
+        ]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False
+)
+    application.add_handler(subscription_handler) 
+
+
+
+    analysis_handler = ConversationHandler(
+    entry_points=[CommandHandler("token_analysis", wrap_conversation_entry(token_analysis))],
+    states={
+        INPUT_ANALYSIS_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                              wrap_conversation_state(analysis_contract))]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False
+)
+    application.add_handler(analysis_handler)
+
+    # Generate wallet handler
+    generate_wallet_handler = ConversationHandler(
+        entry_points=[CommandHandler("generatewallet", wrap_conversation_entry(generate_wallet))],
+        states={
+            CONFIRM_NEW_WALLET: [CallbackQueryHandler(wrap_conversation_state(confirm_generate_wallet), 
+                                pattern='^(confirm_new_wallet|cancel_new_wallet)$')]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False
+    )
+    application.add_handler(generate_wallet_handler)
+
+    # Set wallet handler (import)
+    set_wallet_handler = ConversationHandler(
+        entry_points=[CommandHandler("set_wallet", wrap_conversation_entry(set_wallet))],
+        states={
+            SET_WALLET_METHOD: [CallbackQueryHandler(wrap_conversation_state(set_wallet_method), 
+                               pattern='^(mnemonic|private_key|cancel_import)$')],
+            INPUT_MNEMONIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                         wrap_conversation_state(input_mnemonic))],
+            INPUT_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                            wrap_conversation_state(input_private_key))],
+            CONFIRM_SET_WALLET: [CallbackQueryHandler(wrap_conversation_state(confirm_set_wallet), 
+                                 pattern='^(confirm_set_wallet|cancel_set_wallet)$')]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False
+    )
+    application.add_handler(set_wallet_handler)
+
+    # Set mode handler
+    set_mode_handler = ConversationHandler(
+    entry_points=[CommandHandler("setmode", wrap_conversation_entry(set_mode))],
+    states={
+        SET_TRADING_MODE: [CallbackQueryHandler(wrap_conversation_state(mode_callback), 
+                       pattern='^(manual|automatic)$')],
+        SET_AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                           wrap_conversation_state(set_auto_buy_amount))],
+        SET_PROFIT_STRATEGY: [CallbackQueryHandler(wrap_conversation_state(set_profit_strategy), 
+                             pattern='^(default_strategy|custom_strategy)$')],
+        SET_CUSTOM_PROFIT_TARGETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                                 wrap_conversation_state(set_custom_profit_targets))],
+        SET_SELL_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                           wrap_conversation_state(set_sell_percentage))],
+        SET_LOSS_PERCENTAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                           wrap_conversation_state(set_loss_percentage))],
+        CONFIRM_HIGH_RISK_LOSS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                              wrap_conversation_state(confirm_high_risk_loss))],
+        SET_ANTI_MEV: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                    wrap_conversation_state(set_anti_mev))],
+        SET_LIQUIDITY_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                               wrap_conversation_state(set_liquidity_threshold))],
+        SET_MAX_POSITIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                 wrap_conversation_state(set_max_positions))],
+        SET_VOLUME_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                            wrap_conversation_state(set_volume_threshold))],
+        SET_RUG_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                     wrap_conversation_state(set_rug_check))],
+        SET_MAX_SLIPPAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                        wrap_conversation_state(set_max_slippage))],
+        SET_MAX_GAS_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                         wrap_conversation_state(set_max_gas_price))],
+        SET_TOKEN_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                     wrap_conversation_state(set_token_age))],
+        REVIEW_CONFIG: [CallbackQueryHandler(wrap_conversation_state(review_config_callback), 
+                        pattern='^(activate_auto_trading|modify_settings)$')]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False
+)
+    application.add_handler(set_mode_handler)
+
+    # Trade handler
+    # Trade handler
+    trade_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("trade", wrap_conversation_entry(trade)),
+        CallbackQueryHandler(wrap_conversation_entry(handle_token_button), pattern='^(buy|sell)_')
+    ],
+    states={
+        INPUT_CONTRACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                     wrap_conversation_state(input_contract))],
+        SELECT_TOKEN_ACTION: [CallbackQueryHandler(wrap_conversation_state(handle_token_button), 
+                              pattern='^(buy|sell)_')],
+        BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                 wrap_conversation_state(buy_amount))],
+        SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                  wrap_conversation_state(sell_amount))],
+        CONFIRM_TRADE: [CallbackQueryHandler(wrap_conversation_state(confirm_trade), 
+                        pattern='^(confirm_trade|cancel_trade)$')]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False
+)
+    application.add_handler(trade_handler)
+
+    # Transfer handler
+    transfer_handler = ConversationHandler(
+        entry_points=[CommandHandler("transfer", wrap_conversation_entry(start_transfer))],
+        states={
+            TRANSFER_TOKEN: [CallbackQueryHandler(wrap_conversation_state(transfer_token))],
+            TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                           wrap_conversation_state(transfer_amount))],
+            TRANSFER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                           wrap_conversation_state(transfer_address))]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False
+    )
+    application.add_handler(transfer_handler)
 
 application = None
 
 async def setup_bot():
+    """Initialize and configure the Telegram bot"""
     global application
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -5803,12 +7027,14 @@ async def setup_bot():
         await application.start()
         logger.info("🤖 Bot started successfully")
     
-    return application  
+    return application  # Make sure to return the application instance
 
 @app.on_event("startup")
 async def on_startup():
+    """FastAPI startup event handler"""
     logger.info("🚀 Starting bot...")
     try:
+        # Get the Telegram application instance
         telegram_app = await setup_bot()
         logger.info("✅ Bot setup complete")
 
@@ -5822,7 +7048,7 @@ async def on_startup():
         logger.info("⏳ Scheduling jobs for active subscribers...")
         active_users = users_collection.find({
             "subscription_status": "active",
-            "subscription_expiry": {"$gt": datetime.datetime.now().isoformat()}
+            "subscription_expiry": {"$gt": datetime.now().isoformat()}
         })
 
         await migrate_token_performance_data()
@@ -5831,7 +7057,7 @@ async def on_startup():
             user_id = user['user_id']
             if user.get('solana') and user['solana'].get('public_key'):
                 logger.info(f"  - Scheduling token updates for user {user_id}")
-                telegram_app.job_queue.run_repeating(  
+                telegram_app.job_queue.run_repeating(  # Use telegram_app instead of app
                     update_token_info,
                     interval=30,
                     first=5,
@@ -5841,7 +7067,8 @@ async def on_startup():
 
             if user.get('trading_mode') == 'automatic':
                 logger.info(f"  - Scheduling auto-trade for user {user_id}")
-                telegram_app.job_queue.run_repeating(  
+                # Schedule with a partial function that only passes context
+                telegram_app.job_queue.run_repeating(  # Use telegram_app instead of app
                     lambda ctx: auto_trade(ctx),
                     interval=30,
                     first=10,
@@ -5851,6 +7078,7 @@ async def on_startup():
 
 
 
+        # Schedule background jobs using the Telegram application
         telegram_app.job_queue.run_repeating(
             verify_sol_payments,
             interval=300,
@@ -5866,12 +7094,13 @@ async def on_startup():
         )
         telegram_app.job_queue.run_daily(
             send_daily_report,
-            time=datetime.time(hour=20, minute=0),  # Fixed: use datetime.time
+            time=datetime.time(hour=20, minute=0),
             name="daily_report"
         )
+        # Add portfolio liquidity monitoring job
         telegram_app.job_queue.run_repeating(
             monitor_portfolio_liquidity,
-            interval=3600,  
+            interval=3600,  # Check every hour
             first=30,
             name="portfolio_liquidity_monitoring"
         )
@@ -5881,6 +7110,7 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    """FastAPI shutdown event handler"""
     global application
     logger.info("🛑 Shutting down bot...")
     if application:
