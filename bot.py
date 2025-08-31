@@ -87,7 +87,7 @@ from textblob import TextBlob
 import matplotlib.pyplot as plt
 import io
 import seaborn as sns
-
+application = None
 
 
 # Custom filter to add user_id to logs
@@ -196,6 +196,12 @@ app = FastAPI()
 
 @app.get("/health")
 async def health_check():
+    global application
+    if application is None or not application.running:
+        return JSONResponse(
+            content={'status': 'error', 'message': 'Bot not initialized'},
+            status_code=503
+        )
     return JSONResponse(content={'status': 'ok'})
 
 @app.post("/webhook")
@@ -6961,7 +6967,7 @@ def setup_handlers(application: Application):
     )
     application.add_handler(transfer_handler)
 
-application = None
+
 
 async def setup_bot():
     """Initialize and configure the Telegram bot"""
@@ -6972,61 +6978,59 @@ async def setup_bot():
         logger.error("TELEGRAM_TOKEN or WEBHOOK_URL not found in .env file")
         raise ValueError("TELEGRAM_TOKEN or WEBHOOK_URL not found in .env file")
 
-    if application is None:
-        logger.info("🚀 Initializing NEW Telegram bot application")
-        application = (
-            Application.builder()
-            .token(TELEGRAM_TOKEN)
-            .concurrent_updates(True)
-            .build()
-        )
-        logger.info("🛠️ Setting up command handlers")
-        setup_handlers(application)
-    else:
-        logger.info("♻️ Reusing existing application instance")
+    # Always create a new application instance
+    logger.info("🚀 Initializing NEW Telegram bot application")
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
     
-    if not application.running:
-        logger.info("⚙️ Initializing application...")
-        await application.initialize()
-        
-        logger.info(f"🌐 Setting webhook to {WEBHOOK_URL}")
-        await application.bot.set_webhook(
-            url=WEBHOOK_URL,
-            allowed_updates=Update.ALL_TYPES
-        )
-        
-        logger.info("📝 Registering bot commands...")
-        commands = [
-            BotCommand("start", "Start the bot and create or view wallet"),
-            BotCommand("subscribe", "Subscribe to use trading features"),
-            BotCommand("token_analysis", "Analyze performance of a specific token"),
-            BotCommand("daily_pnl", "Check today's profit/loss summary"),
-            BotCommand("mypositions", "View your current positions and performance"),
-            BotCommand("share_pnl", "Share your trading performance in a simple format"),
-            BotCommand("generate_wallet", "Generate a new wallet"),
-            BotCommand("set_wallet", "Import an existing wallet"),
-            BotCommand("fetch_tokens", "Manually fetch new tokens (requires wallet)"),
-            BotCommand("cleanup", "cleanup zero-balance tokens from portfolio"),
-            BotCommand("remove_illiquid", "Remove illiquid tokens from portfolio"),
-            BotCommand("force_fetch", "Force fetch tokens, ignoring cooldown (admin only)"),
-            BotCommand("settings", "View or change auto-trading settings"),
-            BotCommand("reset_tokens", "Reset posted tokens list"),
-            BotCommand("setmode", "Set trading mode (manual/automatic)"),
-            BotCommand("trade", "Trade Solana tokens manually (requires wallet)"),
-            BotCommand("balance", "Check wallet balance"),
-            BotCommand("transfer", "Transfer Solana tokens"),
-            BotCommand("cancel", "Cancel current operation"),
-            BotCommand("emergencgy_sell", "Sell an illiquid token immediately"),
-            BotCommand("trade_status", "Check trade system status"),
-            BotCommand("debug", "Show debug information")
-        ]
-        await application.bot.set_my_commands(commands)
-        
-        logger.info("🚦 Starting application...")
-        await application.start()
-        logger.info("🤖 Bot started successfully")
+    logger.info("🛠️ Setting up command handlers")
+    setup_handlers(application)
     
-    return application  # Make sure to return the application instance
+    logger.info("⚙️ Initializing application...")
+    await application.initialize()
+    
+    logger.info(f"🌐 Setting webhook to {WEBHOOK_URL}")
+    await application.bot.set_webhook(
+        url=WEBHOOK_URL,
+        allowed_updates=Update.ALL_TYPES
+    )
+    
+    logger.info("📝 Registering bot commands...")
+    commands = [
+        BotCommand("start", "Start the bot and create or view wallet"),
+        BotCommand("subscribe", "Subscribe to use trading features"),
+        BotCommand("token_analysis", "Analyze performance of a specific token"),
+        BotCommand("daily_pnl", "Check today's profit/loss summary"),
+        BotCommand("mypositions", "View your current positions and performance"),
+        BotCommand("share_pnl", "Share your trading performance in a simple format"),
+        BotCommand("generate_wallet", "Generate a new wallet"),
+        BotCommand("set_wallet", "Import an existing wallet"),
+        BotCommand("fetch_tokens", "Manually fetch new tokens (requires wallet)"),
+        BotCommand("cleanup", "cleanup zero-balance tokens from portfolio"),
+        BotCommand("remove_illiquid", "Remove illiquid tokens from portfolio"),
+        BotCommand("force_fetch", "Force fetch tokens, ignoring cooldown (admin only)"),
+        BotCommand("settings", "View or change auto-trading settings"),
+        BotCommand("reset_tokens", "Reset posted tokens list"),
+        BotCommand("setmode", "Set trading mode (manual/automatic)"),
+        BotCommand("trade", "Trade Solana tokens manually (requires wallet)"),
+        BotCommand("balance", "Check wallet balance"),
+        BotCommand("transfer", "Transfer Solana tokens"),
+        BotCommand("cancel", "Cancel current operation"),
+        BotCommand("emergencgy_sell", "Sell an illiquid token immediately"),
+        BotCommand("trade_status", "Check trade system status"),
+        BotCommand("debug", "Show debug information")
+    ]
+    await application.bot.set_my_commands(commands)
+    
+    logger.info("🚦 Starting application...")
+    await application.start()
+    logger.info("🤖 Bot started successfully")
+    
+    return application
 
 @app.on_event("startup")
 async def on_startup():
