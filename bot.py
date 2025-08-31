@@ -38,7 +38,7 @@ try:
 except ImportError:
     raise ImportError("Missing 'mnemonic' package. Install it with: pip install mnemonic")
 try:
-    from pymongo import MongoClient
+    from motor.motor_asyncio import AsyncIOMotorClient
     from pymongo.errors import ConnectionFailure
 except ImportError:
     raise ImportError("Missing 'pymongo' package. Install it with: pip install pymongo")
@@ -87,6 +87,13 @@ from textblob import TextBlob
 import matplotlib.pyplot as plt
 import io
 import seaborn as sns
+from cachetools import TTLCache
+import logging.handlers
+import queue
+import async_timeout
+import time
+from telegram import Update
+from telegram.ext import BaseMiddleware
 application = None
 
 
@@ -113,6 +120,9 @@ logging.basicConfig(
 # Your module's logger
 logger = logging.getLogger(__name__)
 
+
+queue_handler = logging.handlers.QueueHandler(queue)
+
 # Example usage remains unchanged
 def log_user_action(user_id: int, action: str, details: str = "", level: str = "info"):
     extra = {'user_id': user_id}
@@ -120,31 +130,24 @@ def log_user_action(user_id: int, action: str, details: str = "", level: str = "
     log_method(f"👤 USER ACTION: {action} - {details}", extra=extra)
 
 
-class TokenCache:
-    def __init__(self, max_size=1000, ttl_seconds=300):
-        self.cache = {}
-        self.max_size = max_size
-        self.ttl = ttl_seconds
-    
-    def get(self, key):
-        if key in self.cache:
-            data, timestamp = self.cache[key]
-            if time.time() - timestamp < self.ttl:
-                return data
-            else:
-                del self.cache[key]  # Expired
-        return None
-    
-    def set(self, key, value):
-        if len(self.cache) >= self.max_size:
-            # Remove oldest item
-            oldest_key = next(iter(self.cache))
-            del self.cache[oldest_key]
-        self.cache[key] = (value, time.time())
+
 
 # Global cache instance
-token_cache = TokenCache(max_size=500, ttl_seconds=180)  # Smaller TTL for faster data
+token_cache = TTLCache(maxsize=1000, ttl=300)
 
+
+class ResponseTimeMiddleware(BaseMiddleware):
+    async def on_process_update(self, update: Update, data: dict):
+        update.start_time = time.time()
+    
+    async def on_post_process_update(self, update: Update, result, data: dict):
+        if hasattr(update, 'start_time'):
+            duration = time.time() - update.start_time
+            logger.info(f"Response time for update {update.update_id}: {duration:.2f}s")
+            
+            # Log slow responses
+            if duration > 2.0:  # 2 seconds threshold
+                logger.warning(f"Slow response detected: {duration:.2f}s for update {update.update_id}")
 
 # Load environment variables
 load_dotenv()
@@ -180,6 +183,7 @@ RPC_RETRY_DELAY = 3  # seconds between RPC retries
 MAX_RPC_RETRIES = 5  # maximum RPC retry attempts
 TWITTER_ENABLED = False  # disable Twitter until properly configured
 MIN_ACTIVE_LIQUIDITY = 500
+http_client = None
 
 
 # Bot states for conversation
@@ -253,66 +257,39 @@ if not MONGO_URI:
     raise ValueError("MONGO_URI not found in .env file")
 
 max_retries = 3
-for attempt in range(max_retries):
-    try:
-        logger.info("🔌 Connecting to MongoDB...")
-        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=30000)
-        mongo_client.admin.command('ping')
-        logger.info("✅ MongoDB connection successful")
-        db = mongo_client.get_database('trading_bot')
-        
-        # Create collections using the database object
-        if 'users' not in db.list_collection_names():
-            db.create_collection(
-                'users',
-                validator={
-                    '$jsonSchema': {
-                        'bsonType': 'object',
-                        'required': ['user_id'],
-                        'properties': {
-                            'user_id': {'bsonType': 'int'},
-                            'subscription_status': {'bsonType': 'string'},
-                            'subscription_expiry': {'bsonType': ['string', 'date']},
-                            'created_at': {'bsonType': 'string'},
-                        }
-                    }
-                },
-                validationLevel='moderate'
-            )
-            logger.info("Created users collection with validator")
-        
-        users_collection = db.users
-        users_collection.create_index('user_id', unique=True)
 
-        # Create new collection if not exists
-        if 'token_performance' not in db.list_collection_names():
-            db.create_collection('token_performance')
-            logger.info("Created token_performance collection")
+async def init_mongo():
+    global mongo_client, db, users_collection, token_performance_collection, global_posted_tokens
+    for attempt in range(max_retries):
+        try:
+            logger.info("🔌 Connecting to MongoDB with Motor...")
+            mongo_client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=30000)
+            # Test connection
+            await mongo_client.admin.command('ping')
+            logger.info("✅ MongoDB connection successful")
+            db = mongo_client.get_database('trading_bot')
+            
+            # Get collections
+            users_collection = db.users
+            token_performance_collection = db.token_performance
+            global_posted_tokens = db.global_posted_tokens
+            
+            # Create indexes (run once, can be moved to a setup script)
+            await users_collection.create_index('user_id', unique=True)
+            await token_performance_collection.create_index('contract_address')
+            await token_performance_collection.create_index('first_posted_at')
+            await global_posted_tokens.create_index('contract_address', unique=True)
+            await global_posted_tokens.create_index('timestamp', expireAfterSeconds=86400)
+            
+            break
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1} failed to connect to MongoDB: {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5)
+                continue
+            raise
 
-        token_performance_collection = db.token_performance
-        token_performance_collection.create_index('contract_address')
-        token_performance_collection.create_index('first_posted_at')
-        
-        if 'global_posted_tokens' not in db.list_collection_names():
-         db.create_collection('global_posted_tokens')
-         logger.info("Created global_posted_tokens collection")
-    
-        global_posted_tokens = db.global_posted_tokens
-        global_posted_tokens.create_index('contract_address', unique=True)
-        global_posted_tokens.create_index('timestamp', expireAfterSeconds=86400)
-        logger.info("Created indexes for global_posted_tokens")
-        
-        break
-    except ConnectionFailure as e:
-        logger.error(f"Attempt {attempt + 1} failed to connect to MongoDB Atlas: {str(e)}")
-        if attempt < max_retries - 1:
-            time.sleep(5)
-            continue
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in MongoDB setup: {str(e)}")
-        raise
-
+# You must call init_mongo() from your async entrypoint before using the database.
     
 
 # Master key for encryption
@@ -336,6 +313,7 @@ BSC_RPC = os.getenv("BSC_RPC_URL")
 if not all([SOLANA_RPC, ETH_RPC, BSC_RPC]):
     logger.error("One or more RPC URLs not found in .env file")
     raise ValueError("One or more RPC URLs not found in .env file")
+# Removed invalid async context usage at top-level
 
 solana_client = AsyncClient(SOLANA_RPC)
 solana_sync_client = Client(SOLANA_RPC)
@@ -412,55 +390,38 @@ def decrypt_data(encrypted_data: dict, key: bytes) -> str:
     padded_data = decryptor.update(ciphertext) + decryptor.finalize()
     return padded_data.rstrip(b'\0').decode()
 
+# Use async MongoDB operations throughout your code
 async def check_subscription(user_id: int) -> bool:
     """Check if user has an active subscription or trial"""
-    user = users_collection.find_one({'user_id': user_id})
+    user = await users_collection.find_one({'user_id': user_id})
     
-    # New user - create trial
     if not user:
         expiry = datetime.now() + timedelta(days=1)
-        users_collection.update_one(
+        await users_collection.update_one(
             {'user_id': user_id},
             {'$set': {
                 'subscription_status': 'trial',
                 'subscription_expiry': expiry.isoformat(),
-                'trial_used': True,  # Mark trial as used
+                'trial_used': True,
                 'created_at': datetime.now().isoformat()
             }},
             upsert=True
         )
-        log_user_action(user_id, "NEW_USER_TRIAL_STARTED")
         return True
         
-    # Existing user check
+    # Check existing subscription status
     status = user.get('subscription_status')
     expiry = user.get('subscription_expiry')
     
-    # Convert expiry to datetime if needed
     if isinstance(expiry, str):
         expiry = datetime.fromisoformat(expiry)
     
-    # Active subscription
     if status == 'active' and datetime.now() < expiry:
         return True
         
-    # Trial status check
     if status == 'trial' and datetime.now() < expiry:
         return True
         
-    # Expired trial - prevent reuse
-    if user.get('trial_used'):
-        users_collection.update_one(
-            {'user_id': user_id},
-            {'$set': {
-                'subscription_status': 'inactive',
-                'subscription_expiry': None
-            }}
-        )
-        log_user_action(user_id, "SUBSCRIPTION_EXPIRED")
-        return False
-        
-    # Should never reach here
     return False
 
 async def get_subscription_status_message(user: dict) -> str:
@@ -688,7 +649,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # THIRD: Check if wallet exists
-    user = users_collection.find_one({'user_id': user_id})
+    user = await users_collection.find_one({'user_id': user_id})
     
     if not user or not user.get('solana') or not user['solana'].get('public_key'):
 
@@ -1124,6 +1085,7 @@ async def update_token_performance(context: ContextTypes.DEFAULT_TYPE):
     })
     
     async with httpx.AsyncClient(timeout=30.0) as client:
+        
         for token in tokens:
             contract_address = token['contract_address']
             try:
@@ -3504,34 +3466,38 @@ async def input_contract(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return SELECT_TOKEN_ACTION
 
 
-async def fetch_token_by_contract(contract_address: str, include_history: bool = False) -> Optional[Dict[str, Any]]:
+async def fetch_token_by_contract(contract_address: str, include_history: bool = False):
     """Fetch token details by contract address with historical data option"""
     # Check cache first
     if contract_address in token_cache:
-        cached_data, timestamp = token_cache[contract_address]
-        if time.time() - timestamp < CACHE_DURATION:
-            return cached_data
+       return token_cache[contract_address]
+    # Remove undefined _fetch_from_api and rely on the rest of the function to fetch token data
+    # token_data = await _fetch_from_api(contract_address)
+
+    # The rest of the function will fetch token data using DexScreener and fallbacks
+    
+    
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json'
     }
     
-    # Try DexScreener first
+    # Try DexScreener first with timeout
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            logger.info(f"Fetching token by contract: {contract_address}")
-            token_url = DEXSCREENER_TOKEN_API.format(token_address=contract_address)
-            logger.debug(f"Calling DexScreener API: {token_url}")
-            response = await client.get(token_url, headers=headers)
-            
-            if response.status_code == 429:
-                logger.warning("DexScreener rate limit exceeded, trying fallback...")
-                return await fetch_token_fallback(contract_address, client)
-            
-            if response.status_code != 200:
-                logger.error(f"Token API failed: {response.status_code} - {response.text}")
-                return await fetch_token_fallback(contract_address, client)
+        async with async_timeout.timeout(10.0):  # 10 second timeout
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                logger.info(f"Fetching token by contract: {contract_address}")
+                token_url = DEXSCREENER_TOKEN_API.format(token_address=contract_address)
+                response = await http_client.get(token_url, headers=headers)
+                
+                if response.status_code == 429:
+                    logger.warning("DexScreener rate limit exceeded, trying fallback...")
+                    return await fetch_token_fallback(contract_address, client)
+                
+                if response.status_code != 200:
+                    logger.error(f"Token API failed: {response.status_code}")
+                    return await fetch_token_fallback(contract_address, client)
             
             data = response.json()
             logger.debug(f"API response: {json.dumps(data, indent=2)[:500]}...")
@@ -3600,6 +3566,9 @@ async def fetch_token_by_contract(contract_address: str, include_history: bool =
             
             return token_data
             
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout fetching token {contract_address}")
+        return await fetch_token_fallback(contract_address)
     except Exception as e:
         logger.error(f"Error fetching token by contract {contract_address}: {str(e)}")
         return await fetch_token_fallback(contract_address)
@@ -3739,7 +3708,7 @@ async def job_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show status of background jobs"""
     user_id = update.effective_user.id
     log_user_action(user_id, "JOB_STATUS_REQUEST")
-    
+    application.job_queue.max_concurrent = 5 
     if not context.job_queue:
         await update.message.reply_text("❌ Job queue not initialized")
         return
@@ -3752,8 +3721,7 @@ async def job_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not user_jobs:
         message = "ℹ️ No active jobs for your account"
-    else:
-        message = "📅 Your active jobs:\n" + "\n".join(user_jobs)
+   
     
     await update.message.reply_text(message)
 
@@ -4374,6 +4342,7 @@ async def fetch_latest_token() -> List[Dict[str, Any]]:
     }
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
+            
             logger.info("🌐 Fetching latest tokens from DexScreener")
             response = await client.get(DEXSCREENER_NEW_TOKENS_API, headers=headers)
             
@@ -6655,6 +6624,37 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Example: /settings 7"
         )
 
+
+# Create a custom async Solana client with connection pooling
+class AsyncSolanaClient:
+    def __init__(self, endpoint: str, max_connections: int = 10):
+        self.endpoint = endpoint
+        self.semaphore = asyncio.Semaphore(max_connections)
+    
+    async def _make_request(self, method: str, params: list = None):
+        async with self.semaphore:
+            async with async_timeout.timeout(30.0):
+                async with httpx.AsyncClient() as client:
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": method,
+                        "params": params or []
+                    }
+                    response = await client.post(self.endpoint, json=payload)
+                    return response.json()
+    
+    async def get_balance(self, pubkey: str):
+        return await self._make_request("getBalance", [pubkey])
+    
+    async def get_transaction(self, signature: str):
+        return await self._make_request("getTransaction", [signature, {"encoding": "json"}])
+    
+    # Add other methods as needed
+
+# Initialize the client
+solana_async_client = AsyncSolanaClient(SOLANA_RPC)
+
 async def jupiter_api_call(url, params=None, json_data=None, method="GET"):
     """Helper function for Jupiter API calls with retry logic"""
     max_retries = 3
@@ -6809,6 +6809,7 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("reset_tokens", reset_tokens))
     application.add_handler(CommandHandler("debug", debug))
+    application.add_handler(ResponseTimeMiddleware())
     application.add_error_handler(error_handler)
 
     # Start command handler
@@ -6973,6 +6974,7 @@ async def setup_bot():
     """Initialize and configure the Telegram bot"""
     global application
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    application.job_queue.max_concurrent = 5 
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     if not TELEGRAM_TOKEN or not WEBHOOK_URL:
         logger.error("TELEGRAM_TOKEN or WEBHOOK_URL not found in .env file")
@@ -7034,8 +7036,12 @@ async def setup_bot():
 
 @app.on_event("startup")
 async def on_startup():
-    """FastAPI startup event handler"""
-    logger.info("🚀 Starting bot...")
+    global http_client
+    http_client = httpx.AsyncClient(
+        timeout=30.0,
+        limits=httpx.Limits(max_keepalive_connections=10, max_connections=100),
+        transport=httpx.AsyncHTTPTransport(retries=2)
+    )
     try:
         # Get the Telegram application instance
         telegram_app = await setup_bot()
@@ -7113,7 +7119,8 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    """FastAPI shutdown event handler"""
+    if http_client:
+        await http_client.aclose()
     global application
     logger.info("🛑 Shutting down bot...")
     if application:
