@@ -105,7 +105,7 @@ file_handler.addFilter(UserFilter())
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - User:%(user_id)s - %(message)s',
     handlers=[stream_handler, file_handler]
 )
@@ -709,7 +709,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         welcome_message = (
-            "👋 *Welcome to the Multi-Chain Trading Bot!*\n\n"
+            "👋 *Welcome to GainInfinity, the Multi-Chain Trading Bot!*\n\n"
             "🔹 You have a *1-day free trial* to test all features\n"
             "🔹 Trade Solana tokens with ease\n"
             "🔹 Get alerts for new tokens automatically\n\n"
